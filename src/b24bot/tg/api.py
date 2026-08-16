@@ -106,6 +106,21 @@ async def get_webhook_info(token: str, *, proxy_base: str | None = None) -> dict
     return info
 
 
+async def set_chat_menu_button(token: str, url: str, *, text: str = "Задачи",
+                               proxy_base: str | None = None) -> bool:
+    """Кнопка меню бота открывает мини-апп во всех личных чатах.
+
+    Единственная часть регистрации мини-аппа, доступная через Bot API: короткое имя
+    приложения (`/newapp`) заводится только в BotFather вручную. Поэтому кнопку
+    ставим сами при подключении бота — человеку не нужно ничего настраивать, чтобы
+    мини-апп открылся в личке.
+    """
+    ok: bool = await call(token, "setChatMenuButton", {
+        "menu_button": {"type": "web_app", "text": text[:16], "web_app": {"url": url}},
+    }, proxy_base=proxy_base)
+    return ok
+
+
 async def send_message(token: str, chat_id: int, text: str, *,
                        thread_id: int | None = None,
                        reply_markup: dict[str, Any] | None = None,

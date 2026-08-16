@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     # Telegram сам стучится на наш публичный домен.
     tg_proxy_url: str = ""
 
+    # Короткое имя мини-аппа из BotFather (`/newapp`). Ссылка вида
+    # t.me/<бот>/<имя>?startapp=… — единственный способ открыть мини-апп из группы:
+    # кнопки web_app в инлайн-клавиатуре Telegram разрешает только в личке.
+    # Значение общее для всех ботов теннантов; отдельное имя у теннанта хранится
+    # в tg_bots.miniapp_short_name и имеет приоритет.
+    miniapp_short_name: str = ""
+    # Куда собран фронтенд. В образе это /app/web/miniapp, локально — пусто.
+    miniapp_dist: str = "/app/web/miniapp"
+
     spike_log_payloads: bool = False
     log_level: str = "INFO"
 

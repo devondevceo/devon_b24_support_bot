@@ -19,6 +19,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -195,6 +196,66 @@ async def test_disabled_binding_closes_the_door(db: object) -> None:
 
     assert await authorize_task_for_chat(w["tenant_a"], w["chat_a"], 500,
                                          group_id_hint=33) is None
+
+
+async def test_miniapp_context_stays_in_its_tenant(db: object) -> None:
+    """Мини-апп: ссылка из чужого чата не открывает чужой теннант.
+
+    Подпись `startapp` подтверждает только то, что ссылку выдали мы. Теннанта же
+    задаёт подпись Telegram — то есть бот, через которого приложение открыли.
+    Расхождение этих двух означает попытку зайти в соседний теннант по его чату.
+    """
+    from b24bot.domain import miniapp
+    from b24bot.domain.context import load_chat_context_by_ref
+    from b24bot.tg.initdata import InitData
+
+    w = await _fixture_world(db)
+
+    own = await load_chat_context_by_ref(w["chat_a"])
+    assert own is not None and own.tenant_id == w["tenant_a"]
+    assert own.projects and own.projects[0].id == w["project_a"]
+
+    actor = miniapp.Actor(
+        tenant_id=w["tenant_a"], tg_user_id=42, b24_user_id=7,
+        bot_username="devon_sd_bot",
+        init=InitData(user_id=42, username="ivanov", full_name="Иван",
+                      start_param=miniapp.pack_context(w["chat_b"]),
+                      auth_date=datetime.now(UTC),
+                      chat_type=None, chat_instance=None))
+
+    with pytest.raises(miniapp.Forbidden):
+        await miniapp.resolve_context(actor)
+
+    # Тот же чат, но своего теннанта, открывается штатно.
+    own_actor = miniapp.Actor(
+        tenant_id=w["tenant_a"], tg_user_id=42, b24_user_id=7,
+        bot_username="devon_sd_bot",
+        init=InitData(user_id=42, username="ivanov", full_name="Иван",
+                      start_param=miniapp.pack_context(w["chat_a"]),
+                      auth_date=datetime.now(UTC),
+                      chat_type=None, chat_instance=None))
+    ctx = await miniapp.resolve_context(own_actor)
+    assert ctx is not None and ctx.chat_ref == w["chat_a"] and ctx.pinned
+
+
+async def test_miniapp_context_list_is_tenant_scoped(db: object) -> None:
+    """Список чатов для выбора в личке не должен показывать соседний теннант."""
+    from b24bot.domain import miniapp
+    from b24bot.tg.initdata import InitData
+
+    w = await _fixture_world(db)
+    actor = miniapp.Actor(
+        tenant_id=w["tenant_a"], tg_user_id=42, b24_user_id=7,
+        bot_username="devon_sd_bot",
+        init=InitData(user_id=42, username="ivanov", full_name="Иван",
+                      start_param=None,
+                      auth_date=datetime.now(UTC),
+                      chat_type=None, chat_instance=None))
+
+    items = await miniapp.contexts_for(actor, None)
+    refs = {item["chat_ref"] for item in items}
+    assert w["chat_a"] in refs
+    assert w["chat_b"] not in refs, "в списке чатов виден чат чужого теннанта"
 
 
 async def test_every_domain_table_carries_tenant_id(db: object) -> None:

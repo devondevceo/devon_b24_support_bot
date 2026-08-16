@@ -29,6 +29,10 @@ log = logging.getLogger(__name__)
 NOT_OURS_TTL = timedelta(days=7)
 ECHO_TTL = timedelta(seconds=60)
 
+# «Поле не передавали» и «поле сбросили в пустое» — разные вещи: снятый срок это
+# осмысленное значение None, и None как признак отсутствия здесь не годится.
+_UNSET: Any = object()
+
 DEFAULTS = {
     "task.created": False,
     "task.status_changed": True,
@@ -80,6 +84,27 @@ async def suppress_echo(tenant_id: int, task_id: int, field: str, new_value: Any
             "SET expires_at = EXCLUDED.expires_at, used_at = NULL",
             tenant_id, task_id, fingerprint(field, new_value, b24_user_id),
             _now() + ECHO_TTL)
+
+
+async def suppress_task_echo(tenant_id: int, task_id: int, b24_user_id: int, *,
+                             status: int | None = None, stage: int | None = None,
+                             responsible: int | None = None,
+                             deadline: Any = _UNSET) -> None:
+    """Пометить своё редактирование задачи сразу по нескольким полям.
+
+    Нормализация значений обязана совпадать с той, по которой считает `_diff`:
+    отпечаток берётся от значения, а не от его написания. Срок в `_diff` приводится
+    к datetime, поэтому строку ISO из формы надо привести здесь же — иначе гашение
+    молча не сработает и человек получит уведомление о собственном действии.
+    """
+    if status is not None:
+        await suppress_echo(tenant_id, task_id, "STATUS", status, b24_user_id)
+    if stage is not None:
+        await suppress_echo(tenant_id, task_id, "STAGE", stage, b24_user_id)
+    if responsible is not None:
+        await suppress_echo(tenant_id, task_id, "RESPONSIBLE", responsible, b24_user_id)
+    if deadline is not _UNSET:
+        await suppress_echo(tenant_id, task_id, "DEADLINE", _dt(deadline), b24_user_id)
 
 
 async def _is_echo(tenant_id: int, task_id: int, field: str, new_value: Any,

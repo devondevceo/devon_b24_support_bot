@@ -32,13 +32,29 @@ def url_button(text: str, url: str) -> Button:
     return {"text": text, "url": url}
 
 
+def web_app_button(text: str, url: str) -> dict[str, Any]:
+    """Кнопка, открывающая мини-апп прямо в клиенте. ТОЛЬКО в личных чатах.
+
+    В группе Telegram такую кнопку не принимает — там работает ссылка `t.me/…`.
+    """
+    return {"text": text, "web_app": {"url": url}}
+
+
 # ------------------------------------------------------- постоянная клавиатура
-def persistent_private() -> dict[str, Any]:
-    """Клавиатура снизу в личке с ботом. Не исчезает после нажатия."""
+def persistent_private(app_url: str | None = None) -> dict[str, Any]:
+    """Клавиатура снизу в личке с ботом. Не исчезает после нажатия.
+
+    Кнопка `web_app` разрешена Telegram только в личке — и именно поэтому здесь она
+    несёт сам адрес мини-аппа, без короткого имени из BotFather. В группе так нельзя,
+    там работает только ссылка `t.me/<бот>/<имя>?startapp=`.
+    """
+    app_row: list[dict[str, Any]] = (
+        [{"text": "🧩 Приложение", "web_app": {"url": app_url}}] if app_url else [])
     return {
         "keyboard": [
             [{"text": "📊 Мои задачи"}, {"text": "🔥 Просроченные"}],
             [{"text": "🔗 Мои чаты"}, {"text": "❓ Помощь"}],
+            *([app_row] if app_row else []),
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -55,7 +71,7 @@ PRIVATE_LABELS = {
 
 
 # ------------------------------------------------------------ меню для группы
-def help_menu(tokens: dict[str, str]) -> dict[str, Any]:
+def help_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, Any]:
     """Кнопки под сообщением /help. Это сообщение закрепляют в чате."""
     rows: Rows = [
         [cb("m", tokens["status"], "📊 Сводка"),
@@ -64,6 +80,8 @@ def help_menu(tokens: dict[str, str]) -> dict[str, Any]:
          cb("m", tokens["all"], "📋 Все задачи")],
         [cb("m", tokens["new"], "➕ Создать задачу")],
     ]
+    if app_url:
+        rows.append([url_button("🧩 Приложение", app_url)])
     return inline(rows)
 
 
@@ -83,7 +101,8 @@ def task_list(numbers: list[tuple[str, str]], nav: list[Button] | None = None) -
     return inline(rows)
 
 
-def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str) -> dict[str, Any]:
+def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str,
+              app_url: str | None = None) -> dict[str, Any]:
     """Действия в карточке задачи.
 
     Набор строится по блоку `action` из ответа Битрикса: того, чего этому человеку
@@ -100,10 +119,66 @@ def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str) -> 
     rows: Rows = []
     if first:
         rows.append(first)
-    rows.append([cb("a", tokens["refresh"], "🔄 Обновить"),
-                 url_button("🔗 Открыть в Б24", portal_url)])
+    second: list[Button] = [cb("a", tokens["refresh"], "🔄 Обновить")]
+    if "edit" in allowed and "edit" in tokens:
+        second.insert(0, cb("e", tokens["edit"], "✏️ Изменить"))
+    rows.append(second)
+    links: list[Button] = [url_button("🔗 Открыть в Б24", portal_url)]
+    if app_url:
+        links.append(url_button("🧩 Приложение", app_url))
+    rows.append(links)
     if "back" in tokens:
         rows.append([cb("m", tokens["back"], "◀️ К списку")])
+    return inline(rows)
+
+
+# ------------------------------------------------------- меню редактирования
+def edit_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, Any]:
+    """Что можно поменять кнопками. Всё остальное — в приложении.
+
+    Свободного ввода тут нет намеренно: в группе бот не может «ждать ответа» от
+    одного человека, не перехватывая чужие реплики. Произвольная дата, чек-лист и
+    прочее живут в мини-аппе, где для этого есть форма.
+    """
+    rows: Rows = [
+        [cb("e", tokens["deadline_menu"], "⏰ Срок")],
+        [cb("e", tokens["assignee_menu"], "👤 Ответственный")],
+        [cb("e", tokens["priority_menu"], "⚡ Приоритет")],
+    ]
+    if app_url:
+        rows.append([url_button("🧩 Изменить в приложении", app_url)])
+    rows.append([cb("e", tokens["back"], "◀️ К карточке")])
+    return inline(rows)
+
+
+def deadline_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, Any]:
+    rows: Rows = [
+        [cb("e", tokens["today"], "Сегодня"), cb("e", tokens["tomorrow"], "Завтра")],
+        [cb("e", tokens["in3"], "Через 3 дня"), cb("e", tokens["week"], "Через неделю")],
+        [cb("e", tokens["clear"], "🚫 Снять срок")],
+    ]
+    if app_url:
+        rows.append([url_button("📅 Другая дата — в приложении", app_url)])
+    rows.append([cb("e", tokens["back"], "◀️ Назад")])
+    return inline(rows)
+
+
+def priority_menu(tokens: dict[str, str]) -> dict[str, Any]:
+    return inline([
+        [cb("e", tokens["p2"], "🔴 Высокий")],
+        [cb("e", tokens["p1"], "🟡 Средний")],
+        [cb("e", tokens["p0"], "⚪️ Низкий")],
+        [cb("e", tokens["back"], "◀️ Назад")],
+    ])
+
+
+def people_menu(people: list[tuple[str, str]], back_token: str,
+                app_url: str | None = None) -> dict[str, Any]:
+    """Список людей по одному в ряд: имена длинные, в два столбца не читаются."""
+    rows: Rows = [[cb("e", token, label[:60])] for token, label in people]
+    if app_url:
+        rows.append([url_button("🧩 Весь список — в приложении", app_url)])
+    rows.append([cb("e", back_token, "◀️ Назад")])
     return inline(rows)
 
 

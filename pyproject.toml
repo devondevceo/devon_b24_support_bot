@@ -51,3 +51,10 @@ disallow_untyped_decorators = false
 [[tool.mypy.overrides]]
 module = ["tests.*", "migrations.*"]
 ignore_errors = true
+
+# asyncpg не поставляет py.typed (PEP 561), поэтому строгий режим ругается на сам
+# импорт в трёх модулях. Записи в базу это не типизирует ни в одну сторону —
+# Record и так возвращает Any, — зато держит `mypy --strict` действительно чистым.
+[[tool.mypy.overrides]]
+module = ["asyncpg.*"]
+ignore_missing_imports = true

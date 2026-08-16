@@ -12,8 +12,9 @@ from b24bot.bot import comments, keyboards, survey, task_create, texts, views
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access
+from b24bot.domain import access, miniapp
 from b24bot.domain import events as b24_events
+from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
     ChatContext,
     ProjectRef,
@@ -21,6 +22,7 @@ from b24bot.domain.context import (
     consume_token,
     issue_token,
     load_chat_context,
+    load_chat_context_by_ref,
     remember_task,
 )
 from b24bot.tg import files as tg_files
@@ -465,9 +467,13 @@ async def _help_reply(ctx: ChatContext, tg_user_id: int) -> Reply:
         return Reply(texts.MSG_HELP if ctx.is_active else texts.MSG_START_GROUP)
     tokens = await _menu_tokens(ctx, tg_user_id)
     projects = ", ".join(esc_html(p.name) for p in ctx.projects)
+    app_url = await miniapp.link_for_chat(ctx.tenant_id or 0, ctx.chat_ref,
+                                          thread_id=ctx.thread_id)
     text = (f"{texts.MSG_HELP}\n\n<b>Проекты этого чата:</b> {projects}\n"
             f"<i>Закрепите это сообщение — кнопки будут всегда под рукой.</i>")
-    return Reply(text, markup=keyboards.help_menu(tokens))
+    if app_url:
+        text += texts.MSG_APP_HINT
+    return Reply(text, markup=keyboards.help_menu(tokens, app_url))
 
 
 async def _open_summary(ctx: ChatContext, tg_user_id: int, action: str) -> Reply:
@@ -490,10 +496,12 @@ async def _open_summary(ctx: ChatContext, tg_user_id: int, action: str) -> Reply
         log.warning("не удалось получить задачи: %s", exc)
         return Reply(texts.MSG_B24_UNAVAILABLE)
 
+    app_url = await miniapp.link_for_chat(ctx.tenant_id, ctx.chat_ref,
+                                          thread_id=ctx.thread_id)
     if action == "status":
         text = await views.render_summary(ctx.tenant_id, ctx.projects, tasks)
         tokens = await _menu_tokens(ctx, tg_user_id)
-        return Reply(text, markup=keyboards.help_menu(tokens), edit=True)
+        return Reply(text, markup=keyboards.help_menu(tokens, app_url), edit=True)
 
     if action == "overdue":
         tasks = [t for t in tasks if views.is_overdue(t)]
@@ -516,6 +524,8 @@ async def _open_summary(ctx: ChatContext, tg_user_id: int, action: str) -> Reply
                              payload={"action": "status"}, single_use=False,
                              ttl=timedelta(days=7))
     nav = [{"text": "◀️ Назад", "callback_data": f"m:{back}"}]
+    if app_url:
+        nav.append(keyboards.url_button("🧩 Приложение", app_url))
     return Reply(views.render_list(tasks, title=title),
                  markup=keyboards.task_list(numbers, nav), edit=True)
 
@@ -549,6 +559,19 @@ async def _open_card(ctx: ChatContext, tg_user_id: int, task_id: int) -> Reply:
         group_id_hint=mapping.as_int(task.get("groupId")))
     if project is None:
         return Reply(texts.MSG_TASK_NOT_FOUND)
+    return await _render_card(ctx, tg_user_id, b24_user_id, task, project)
+
+
+async def _render_card(ctx: ChatContext, tg_user_id: int, b24_user_id: int,
+                       task: dict[str, Any], project: ProjectRef,
+                       note: str = "") -> Reply:
+    """Отрисовка карточки по УЖЕ прочитанной задаче.
+
+    Отдельно от чтения, потому что после изменения задача уже перечитана: лишний
+    `tasks.task.get` стоит и частотного лимита, и `operating`.
+    """
+    assert ctx.tenant_id is not None
+    task_id = mapping.as_int(task.get("id")) or 0
     await remember_task(ctx.tenant_id, project, task)
 
     allowed = mapping.allowed_actions(task)
@@ -559,15 +582,20 @@ async def _open_card(ctx: ChatContext, tg_user_id: int, task_id: int) -> Reply:
             "action", tenant_id=ctx.tenant_id, owner_tg_id=tg_user_id,
             chat_ref=ctx.chat_ref, payload={"task_id": task_id, "act": act},
             single_use=(act != "refresh"), ttl=timedelta(hours=12))
+    tokens["edit"] = await _edit_token(ctx, tg_user_id, task_id, "menu")
     tokens["back"] = await issue_token(
         "menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
         payload={"action": "all"}, single_use=False, ttl=timedelta(days=7))
 
     domain = await _tenant_domain(ctx.tenant_id)
-    return Reply(views.render_card(task, project),
+    app_url = await miniapp.link_for_chat(ctx.tenant_id, ctx.chat_ref,
+                                          thread_id=ctx.thread_id, task_id=task_id)
+    text = views.render_card(task, project)
+    return Reply(f"{note}\n\n{text}" if note else text,
                  markup=keyboards.task_card(
                      tokens, allowed=allowed,
-                     portal_url=views.portal_task_url(domain, task_id, b24_user_id)),
+                     portal_url=views.portal_task_url(domain, task_id, b24_user_id),
+                     app_url=app_url),
                  edit=True)
 
 
@@ -619,11 +647,203 @@ async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
     return await _open_card(ctx, tg_user_id, task_id)
 
 
+# ------------------------------------------------------------- редактирование
+PRIORITY_LABELS = {0: "низкий", 1: "средний", 2: "высокий"}
+DEADLINE_LABELS = {"today": "сегодня", "tomorrow": "завтра", "in3": "через 3 дня",
+                   "week": "через неделю", "clear": "снят"}
+ASSIGNEE_PAGE = 12  # больше кнопок в один экран телефона всё равно не влезает
+
+
+async def _edit_token(ctx: ChatContext, tg_user_id: int, task_id: int, act: str,
+                      value: Any = None) -> str:
+    """Токен кнопки редактирования.
+
+    Меню можно жать сколько угодно, а само изменение — одноразовое: два нажатия
+    подряд по «завтра» безобидны, но одноразовость здесь стоит дёшево и снимает
+    целый класс вопросов «почему сработало дважды».
+    """
+    payload: dict[str, Any] = {"task_id": task_id, "act": act}
+    if value is not None:
+        payload["value"] = value
+    return await issue_token("edit", tenant_id=ctx.tenant_id, owner_tg_id=tg_user_id,
+                             chat_ref=ctx.chat_ref, payload=payload,
+                             single_use=act.startswith("set_"),
+                             ttl=timedelta(hours=12))
+
+
+async def _edit(ctx: ChatContext, tg_user_id: int, payload: dict[str, Any]) -> Reply:
+    """Изменение срока, ответственного и приоритета кнопками.
+
+    Свободного ввода в группе нет: бот не может ждать ответа от одного человека,
+    не перехватывая чужие реплики (той же причиной живёт правило опросника —
+    отвечать реплаем). Произвольная дата и остальные поля — в мини-аппе.
+    """
+    task_id = int(payload["task_id"])
+    act = str(payload.get("act") or "menu")
+    if act == "back":
+        return await _open_card(ctx, tg_user_id, task_id)
+
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    patch: dict[str, Any] = {}
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            task = await task_service.read(client, task_id)
+            project = await authorize_task_for_chat(
+                ctx.tenant_id, ctx.chat_ref, task_id,
+                group_id_hint=mapping.as_int(task.get("groupId")))
+            if project is None:
+                return Reply(texts.MSG_TASK_NOT_FOUND)
+
+            if act in ("menu", "deadline_menu", "priority_menu"):
+                return await _edit_menu(ctx, tg_user_id, task_id, act, task)
+            if act == "assignee_menu":
+                members = await task_service.group_members(client,
+                                                           project.b24_group_id)
+                return await _assignee_menu(ctx, tg_user_id, task_id, members)
+
+            built = _edit_patch(act, payload.get("value"), task)
+            if built is None:
+                return Reply(texts.MSG_DIALOG_EXPIRED)
+            patch = built
+            fresh, missed = await task_service.apply_patch(
+                client, ctx.tenant_id, task_id, patch,
+                actor_b24_user_id=b24_user_id)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied as exc:
+        return Reply(texts.MSG_NO_RIGHTS_B24.format(reason=esc_html(exc.description)))
+    except task_service.Invalid as exc:
+        return Reply(esc_html(exc.message))
+    except errors.B24Error as exc:
+        log.warning("правка задачи %s не удалась: %s", task_id, exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    note = texts.MSG_EDIT_DONE.format(what=esc_html(_edit_summary(act, payload, patch)))
+    if missed:
+        note += texts.MSG_EDIT_NOT_APPLIED.format(fields=esc_html(", ".join(missed)))
+    return await _render_card(ctx, tg_user_id, b24_user_id, fresh, project, note)
+
+
+def _edit_patch(act: str, value: Any, task: dict[str, Any]) -> dict[str, Any] | None:
+    """Что именно менять. Срок считается в часовом поясе портала, а не сервера."""
+    if act == "set_deadline":
+        offset = task_service.offset_of(task.get("createdDate"),
+                                        task.get("changedDate"),
+                                        task.get("deadline"))
+        return {"deadline": task_service.preset_deadline(str(value), offset)}
+    if act == "set_priority":
+        return task_service.validate_patch({"priority": value})
+    if act == "set_responsible":
+        return task_service.validate_patch({"responsible_id": value})
+    return None
+
+
+def _edit_summary(act: str, payload: dict[str, Any], patch: dict[str, Any]) -> str:
+    if act == "set_deadline":
+        return f"срок — {DEADLINE_LABELS.get(str(payload.get('value')), 'изменён')}"
+    if act == "set_priority":
+        return f"приоритет — {PRIORITY_LABELS.get(int(patch['priority']), '?')}"
+    return "ответственный"
+
+
+async def _edit_menu(ctx: ChatContext, tg_user_id: int, task_id: int, act: str,
+                     task: dict[str, Any]) -> Reply:
+    app_url = await miniapp.link_for_chat(ctx.tenant_id or 0, ctx.chat_ref,
+                                          thread_id=ctx.thread_id, task_id=task_id)
+    if act == "menu":
+        tokens = {name: await _edit_token(ctx, tg_user_id, task_id, name)
+                  for name in ("deadline_menu", "assignee_menu", "priority_menu",
+                               "back")}
+        return Reply(texts.MSG_EDIT_MENU.format(task_id=task_id),
+                     markup=keyboards.edit_menu(tokens, app_url), edit=True)
+
+    if act == "deadline_menu":
+        tokens = {kind: await _edit_token(ctx, tg_user_id, task_id, "set_deadline",
+                                          kind)
+                  for kind in ("today", "tomorrow", "in3", "week", "clear")}
+        tokens["back"] = await _edit_token(ctx, tg_user_id, task_id, "menu")
+        current = views.fmt_date(task.get("deadline")) if task.get("deadline") else "нет"
+        return Reply(texts.MSG_EDIT_DEADLINE.format(task_id=task_id)
+                     + f"\nСейчас: {esc_html(current)}",
+                     markup=keyboards.deadline_menu(tokens, app_url), edit=True)
+
+    tokens = {f"p{value}": await _edit_token(ctx, tg_user_id, task_id, "set_priority",
+                                             value)
+              for value in (0, 1, 2)}
+    tokens["back"] = await _edit_token(ctx, tg_user_id, task_id, "menu")
+    now = mapping.PRIORITY_TITLES.get(mapping.as_int(task.get("priority")) or 0, "—")
+    return Reply(texts.MSG_EDIT_PRIORITY.format(task_id=task_id)
+                 + f"\nСейчас: {esc_html(now)}",
+                 markup=keyboards.priority_menu(tokens), edit=True)
+
+
+async def _assignee_menu(ctx: ChatContext, tg_user_id: int, task_id: int,
+                         members: list[dict[str, Any]]) -> Reply:
+    if not members:
+        return Reply(texts.MSG_EDIT_NO_MEMBERS)
+
+    shown = members[:ASSIGNEE_PAGE]
+    people = []
+    for m in shown:
+        token = await _edit_token(ctx, tg_user_id, task_id, "set_responsible", m["id"])
+        label = m["name"] + (f" · {m['position']}" if m["position"] else "")
+        people.append((token, label))
+    back = await _edit_token(ctx, tg_user_id, task_id, "menu")
+
+    text = texts.MSG_EDIT_ASSIGNEE.format(task_id=task_id)
+    if len(members) > len(shown):
+        # Молчаливое усечение читается как баг продукта — говорим числом.
+        text += texts.MSG_EDIT_TRUNCATED.format(shown=len(shown), total=len(members))
+    app_url = await miniapp.link_for_chat(ctx.tenant_id or 0, ctx.chat_ref,
+                                          thread_id=ctx.thread_id, task_id=task_id)
+    return Reply(text, markup=keyboards.people_menu(people, back, app_url), edit=True)
+
+
 async def _tenant_domain(tenant_id: int) -> str:
     async with pool().acquire() as conn:
         value = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
                                     tenant_id)
     return str(value or "")
+
+
+def _private_kb() -> dict[str, Any]:
+    """Нижняя клавиатура лички. Кнопка мини-аппа появляется, когда он развёрнут."""
+    return keyboards.persistent_private(miniapp.web_app_url())
+
+
+async def _open_app(packed: str, tg_user_id: int) -> Reply:
+    """Открыть мини-апп в контексте чата, из которого пришли по ссылке.
+
+    Так работает переход из группы, когда у бота не заведено короткое имя
+    приложения: кнопку `web_app` Telegram разрешает только в личке, поэтому
+    ссылка из группы ведёт сюда, а кнопку с контекстом мы даём уже здесь.
+    """
+    packed_ctx = miniapp.unpack_context(packed)
+    if packed_ctx is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED, markup=_private_kb())
+
+    ctx = await load_chat_context_by_ref(packed_ctx.chat_ref, packed_ctx.thread_id)
+    if ctx is None or ctx.tenant_id is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED, markup=_private_kb())
+    if await access.linked_b24_user(ctx.tenant_id, tg_user_id) is None:
+        return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
+
+    url = miniapp.web_app_url_for(packed)
+    if url is None:
+        return Reply(texts.MSG_APP_UNAVAILABLE, markup=_private_kb())
+
+    title = esc_html(ctx.title or "чат")
+    return Reply(
+        f"Задачи чата «{title}».\nОткройте приложение — там фильтры, срок, "
+        f"ответственный и комментарии.",
+        markup=keyboards.inline([[keyboards.web_app_button("🧩 Открыть задачи", url)]]))
 
 
 async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
@@ -635,17 +855,19 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
         action = keyboards.PRIVATE_LABELS.get(text.strip())
         if action:
             return await _private_action(action, tg_user_id)
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(texts.MSG_HELP, markup=_private_kb())
     name, arg = cmd
 
     if name == "start" and arg.startswith("b"):
         reply = await _link_account(arg[1:], tg_user_id, user)
-        return Reply(reply.text, markup=keyboards.persistent_private())
+        return Reply(reply.text, markup=_private_kb())
+    if name == "start" and arg.startswith(miniapp.START_PREFIX) and len(arg) > 1:
+        return await _open_app(arg[1:], tg_user_id)
     if name in ("start", "help"):
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(texts.MSG_HELP, markup=_private_kb())
     if name == "whoami":
         return await _whoami(tg_user_id)
-    return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+    return Reply(texts.MSG_HELP, markup=_private_kb())
 
 
 async def _private_action(action: str, tg_user_id: int) -> Reply:
@@ -656,14 +878,14 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
     ходим его личным токеном.
     """
     if action == "help":
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(texts.MSG_HELP, markup=_private_kb())
 
     tenant_id = await access.tenant_of_user(tg_user_id)
     if tenant_id is None:
-        return Reply(texts.MSG_NOT_LINKED, markup=keyboards.persistent_private())
+        return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
     b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
     if b24_user_id is None:
-        return Reply(texts.MSG_NOT_LINKED, markup=keyboards.persistent_private())
+        return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
 
     if action == "mychats":
         async with pool().acquire() as conn:
@@ -679,12 +901,12 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
                 """, tenant_id)
         if not rows:
             return Reply("Пока ни один чат не привязан к проекту.",
-                         markup=keyboards.persistent_private())
+                         markup=_private_kb())
         lines = ["<b>Привязанные чаты</b>", ""]
         for r in rows:
             lines.append(f"• {esc_html(r['title'] or 'без названия')}")
             lines.append(f"    {esc_html(r['client'])} · {esc_html(r['project'])}")
-        return Reply("\n".join(lines), markup=keyboards.persistent_private())
+        return Reply("\n".join(lines), markup=_private_kb())
 
     async with pool().acquire() as conn:
         groups = await conn.fetch(
@@ -693,7 +915,7 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
             "WHERE b.tenant_id = $1 AND b.status = 'active'", tenant_id)
     group_ids = [int(g["b24_group_id"]) for g in groups]
     if not group_ids:
-        return Reply(texts.MSG_NO_PROJECT, markup=keyboards.persistent_private())
+        return Reply(texts.MSG_NO_PROJECT, markup=_private_kb())
 
     try:
         client = await access.client_for_user(tenant_id, b24_user_id,
@@ -701,9 +923,9 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
         async with client:
             tasks = await views.fetch_open(client, group_ids)
     except NeedsReauth:
-        return Reply(texts.MSG_NEEDS_REAUTH, markup=keyboards.persistent_private())
+        return Reply(texts.MSG_NEEDS_REAUTH, markup=_private_kb())
     except errors.B24Error:
-        return Reply(texts.MSG_B24_UNAVAILABLE, markup=keyboards.persistent_private())
+        return Reply(texts.MSG_B24_UNAVAILABLE, markup=_private_kb())
 
     if action == "overdue":
         tasks = [t for t in tasks if views.is_overdue(t)]
@@ -712,7 +934,7 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
         tasks = [t for t in tasks if str(t.get("responsibleId")) == str(b24_user_id)]
         title = "📊 Мои задачи"
     return Reply(views.render_list(tasks, title=title),
-                 markup=keyboards.persistent_private())
+                 markup=_private_kb())
 
 
 async def _link_account(token: str, tg_user_id: int, user: dict[str, Any]) -> Reply:
@@ -1056,6 +1278,8 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
     if ns == "a":
         return await _task_action(ctx, tg_user_id, int(payload["task_id"]),
                                   str(payload.get("act") or "refresh"))
+    if ns == "e":
+        return await _edit(ctx, tg_user_id, payload)
     if ns == "b":
         return await _apply_bind(ctx, tenant_id, payload, tg_user_id)
     if ns == "p":

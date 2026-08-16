@@ -55,10 +55,26 @@ async def load_chat_context(chat_id: int, thread_id: int | None = None) -> ChatC
     Привязка на топик имеет приоритет над привязкой на весь чат: если для этого
     топика есть свои проекты, берутся они.
     """
+    return await _context("chat_id", chat_id, thread_id)
+
+
+async def load_chat_context_by_ref(chat_ref: int,
+                                   thread_id: int | None = None) -> ChatContext | None:
+    """То же самое, но по нашему идентификатору чата.
+
+    Мини-апп не получает `chat_id` Telegram: контекст приезжает подписанным токеном
+    из `startapp`, а в нём лежит `chat_ref`. Наружу `chat_id` не отдаётся вовсе —
+    по нему нельзя ни писать в чат, ни подсмотреть чужую привязку.
+    """
+    return await _context("id", chat_ref, thread_id)
+
+
+async def _context(column: str, value: int, thread_id: int | None) -> ChatContext | None:
+    # Имя колонки — литерал из двух вариантов выше, а не пользовательский ввод.
     async with pool().acquire() as conn:
         chat = await conn.fetchrow(
-            "SELECT id, chat_id, title, status, tenant_id, is_forum "
-            "FROM tg_chats WHERE chat_id = $1 AND status <> 'migrated'", chat_id)
+            "SELECT id, chat_id, title, status, tenant_id, is_forum "  # noqa: S608
+            f"FROM tg_chats WHERE {column} = $1 AND status <> 'migrated'", value)
         if chat is None:
             return None
 

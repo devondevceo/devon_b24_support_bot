@@ -35,8 +35,13 @@ async def add(client: B24Client, task_id: int, text: str, *, author: str,
     return int(result) if isinstance(result, int | str) and str(result).isdigit() else None
 
 
-async def read_discussion(client: B24Client, task_id: int) -> list[dict[str, Any]]:
-    """Обсуждение задачи. Системные сообщения отбрасываются."""
+async def read_discussion(client: B24Client, task_id: int, *,
+                          limit: int = DISCUSSION_LIMIT) -> list[dict[str, Any]]:
+    """Обсуждение задачи. Системные сообщения отбрасываются.
+
+    `limit` — сколько последних сообщений вернуть: в чате хватает десятка, в
+    мини-аппе экран пролистывается и уместно больше.
+    """
     res = await client.call("tasks.task.get", {
         "taskId": task_id, "select": ["ID", "CHAT_ID"]})
     task = res.get("task", res) if isinstance(res, dict) else {}
@@ -46,7 +51,8 @@ async def read_discussion(client: B24Client, task_id: int) -> list[dict[str, Any
 
     try:
         dialog = await client.call("im.dialog.messages.get",
-                                   {"DIALOG_ID": f"chat{chat_id}", "LIMIT": 50})
+                                   {"DIALOG_ID": f"chat{chat_id}",
+                                    "LIMIT": max(limit, DISCUSSION_LIMIT)})
     except errors.B24Error as exc:
         log.info("не удалось прочитать чат задачи %s: %s", task_id, exc)
         return []
@@ -67,7 +73,7 @@ async def read_discussion(client: B24Client, task_id: int) -> list[dict[str, Any
             "text": str(m.get("text") or ""),
             "date": m.get("date"),
         })
-    return out[-DISCUSSION_LIMIT:]
+    return out[-limit:]
 
 
 def render_discussion(task_id: int, items: list[dict[str, Any]]) -> str:

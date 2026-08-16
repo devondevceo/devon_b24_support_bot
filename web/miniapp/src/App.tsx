@@ -1,0 +1,131 @@
+/**
+ * Навигация мини-аппа. Роутера нет намеренно: экранов четыре, а адресная строка
+ * внутри Telegram не видна и не сохраняется — маршруты некуда и незачем писать.
+ */
+import { useCallback, useEffect, useState } from 'react'
+import { api, ApiError } from './api'
+import { Empty, Failure, Loading } from './components/States'
+import { ContextPicker } from './screens/ContextPicker'
+import { CreateTask } from './screens/CreateTask'
+import { TaskCardScreen } from './screens/TaskCardScreen'
+import { TaskList } from './screens/TaskList'
+import { tg } from './telegram'
+import type { Bootstrap, Context } from './types'
+
+type Screen =
+  | { name: 'list' }
+  | { name: 'card'; taskId: number }
+  | { name: 'create' }
+  | { name: 'pick' }
+
+export function App() {
+  const [boot, setBoot] = useState<Bootstrap | null>(null)
+  const [error, setError] = useState<unknown>(null)
+  const [context, setContext] = useState<Context | null>(null)
+  const [screen, setScreen] = useState<Screen>({ name: 'list' })
+  const [reload, setReload] = useState(0)
+
+  useEffect(() => {
+    if (!tg.available) {
+      setError(
+        new ApiError(401, 'unauthenticated', 'Эта страница работает только внутри Telegram.'),
+      )
+      return
+    }
+    setError(null)
+    api
+      .bootstrap()
+      .then((data) => {
+        setBoot(data)
+        if (data.state === 'ok') {
+          setContext(data.context)
+          // Из карточки задачи в чате ссылка ведёт сразу в эту задачу.
+          setScreen(
+            data.context?.task_id
+              ? { name: 'card', taskId: data.context.task_id }
+              : data.context
+                ? { name: 'list' }
+                : { name: 'pick' },
+          )
+        }
+      })
+      .catch(setError)
+  }, [reload])
+
+  const pick = useCallback(async (chatRef: number) => {
+    try {
+      const res = await api.tasks(chatRef, 'all', '')
+      setContext(res.context)
+      setScreen({ name: 'list' })
+    } catch (err) {
+      tg.fail()
+      tg.alert(err instanceof ApiError ? err.message : 'Чат не открылся.')
+    }
+  }, [])
+
+  const backToList = useCallback(() => setScreen({ name: 'list' }), [])
+
+  if (error) return <Shell><Failure error={error} onRetry={() => setReload((n) => n + 1)} /></Shell>
+  if (!boot) return <Shell><Loading title="Проверяем доступ…" /></Shell>
+
+  if (boot.state === 'not_linked') {
+    return (
+      <Shell>
+        <Empty
+          title="Telegram не привязан к Битрикс24"
+          hint="Откройте в Битрикс24 приложение «Поддержка в Telegram» и нажмите «Привязать Telegram». Это одна кнопка и полминуты."
+          action={
+            <button className="btn sec" onClick={() => setReload((n) => n + 1)}>
+              Я привязал, проверить
+            </button>
+          }
+        />
+      </Shell>
+    )
+  }
+
+  if (screen.name === 'pick' || !context) {
+    return (
+      <Shell>
+        <ContextPicker onPick={pick} onBack={context ? backToList : null} />
+      </Shell>
+    )
+  }
+
+  if (screen.name === 'card') {
+    return (
+      <Shell>
+        <TaskCardScreen context={context} taskId={screen.taskId} onBack={backToList} />
+      </Shell>
+    )
+  }
+
+  if (screen.name === 'create') {
+    return (
+      <Shell>
+        <CreateTask
+          context={context}
+          onCreated={(taskId) => setScreen({ name: 'card', taskId })}
+          onCancel={backToList}
+        />
+      </Shell>
+    )
+  }
+
+  return (
+    <Shell>
+      <TaskList
+        context={context}
+        onOpen={(taskId) => setScreen({ name: 'card', taskId })}
+        onCreate={() => setScreen({ name: 'create' })}
+        // Чат, пришедший ссылкой из группы, менять нельзя: кнопка в чате одного
+        // клиента не должна открывать задачи другого.
+        onSwitchChat={context.pinned ? null : () => setScreen({ name: 'pick' })}
+      />
+    </Shell>
+  )
+}
+
+function Shell({ children }: { children: React.ReactNode }) {
+  return <div className="app">{children}</div>
+}

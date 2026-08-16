@@ -1,0 +1,32 @@
+# Секреты в образ не едут ни при каких обстоятельствах.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# node_modules весит больше самого образа и всё равно ставится заново через npm ci.
+web/miniapp/node_modules/
+web/miniapp/dist/
+
+.git/
+.github/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage*
+
+backups/
+*.dump
+*.sql.gz
+
+docs/
+tests/
+.idea/
+.vscode/
+.DS_Store

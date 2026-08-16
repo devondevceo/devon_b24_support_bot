@@ -32,6 +32,14 @@ class Draft:
     description: str
     idem_key: str
     source_message_id: int | None
+    # Поля полной формы мини-аппа. В чате их не спрашивают — там задача создаётся
+    # одним движением, и всё, кроме заголовка, берётся по умолчанию.
+    responsible_id: int | None = None
+    deadline: str | None = None
+    priority: int | None = None
+    stage_id: int | None = None
+    accomplices: list[int] | None = None
+    auditors: list[int] | None = None
 
 
 def extract(text: str, *, author: str, chat_title: str,
@@ -101,14 +109,28 @@ async def create(client: B24Client, tenant_id: int, project: ProjectRef, draft: 
         log.info("задача по ключу %s уже существует: #%s", draft.idem_key, existing.get("id"))
         return existing, False
 
-    created = await client.call("tasks.task.add", {"fields": {
+    fields: dict[str, Any] = {
         "TITLE": draft.title,
         "DESCRIPTION": draft.description,
         "DESCRIPTION_IN_BBCODE": "Y",
-        "RESPONSIBLE_ID": responsible_id,
+        "RESPONSIBLE_ID": draft.responsible_id or responsible_id,
         "GROUP_ID": project.b24_group_id,
         "TAGS": [draft.idem_key],
-    }})
+    }
+    # Всё это портал принимает прямо при создании — проверено записью (§9.1).
+    # Пустые значения не шлём вовсе: пустой DEADLINE трактуется как «снять срок».
+    if draft.deadline:
+        fields["DEADLINE"] = draft.deadline
+    if draft.priority is not None:
+        fields["PRIORITY"] = draft.priority
+    if draft.stage_id:
+        fields["STAGE_ID"] = draft.stage_id
+    if draft.accomplices:
+        fields["ACCOMPLICES"] = draft.accomplices
+    if draft.auditors:
+        fields["AUDITORS"] = draft.auditors
+
+    created = await client.call("tasks.task.add", {"fields": fields})
     task = created["task"] if isinstance(created, dict) and "task" in created else created
 
     async with pool().acquire() as conn:
