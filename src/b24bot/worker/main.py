@@ -16,7 +16,7 @@ from b24bot.core.config import get_settings
 from b24bot.core.logging import setup as log_setup
 from b24bot.crypto import box
 from b24bot.db.pool import close_pool, init_pool, pool
-from b24bot.domain import events
+from b24bot.domain import events, sync
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -26,6 +26,9 @@ SEND_BATCH = 10
 MAX_ATTEMPTS = 5
 CHAT_LIMIT_PER_MIN = 15   # потолок Telegram — 20 сообщений в минуту на группу
 RETENTION = timedelta(days=14)
+# Как часто заглядывать, не пора ли обновить стадии. Сам справочник живёт сутки
+# (sync.STAGE_TTL); проход обычно упирается в один запрос к базе и ничего не делает.
+STAGE_PASS = timedelta(minutes=15)
 
 
 async def process_events() -> int:
@@ -118,6 +121,7 @@ async def main() -> None:
     log.info("воркер запущен")
 
     tick = 0
+    next_stage_pass = datetime.now(UTC)
     try:
         while True:
             tick += 1
@@ -125,6 +129,11 @@ async def main() -> None:
                 done = await process_events()
                 sent = await send_outbox()
                 heartbeat.beat("worker")
+                if datetime.now(UTC) >= next_stage_pass:
+                    # Отметка сдвигается ДО прохода: отказавший портал не должен
+                    # превращать суточную синхронизацию в непрерывную.
+                    next_stage_pass = datetime.now(UTC) + STAGE_PASS
+                    await sync.sync_stages_due()
                 if tick % 100 == 0:
                     await cleanup()
                 if not done and not sent:

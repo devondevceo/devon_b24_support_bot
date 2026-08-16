@@ -20,6 +20,7 @@ from b24bot.b24.mapping import (
 )
 from b24bot.core.text import esc_html
 from b24bot.db.pool import pool
+from b24bot.domain import sync
 from b24bot.domain.context import ProjectRef
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,13 @@ async def stages_of(tenant_id: int, project_id: int) -> list[tuple[int, str]]:
     return [(int(r["b24_stage_id"]), r["title"]) for r in rows]
 
 
+def _unknown_stages(tasks: list[dict[str, Any]], stages: list[tuple[int, str]]) -> set[int]:
+    """Стадии задач, которых нет в нашем справочнике. Ноль не считается: это «вне канбана»."""
+    known = {stage_id for stage_id, _ in stages}
+    seen = {as_int(t.get("stageId")) or 0 for t in tasks}
+    return {s for s in seen if s and s not in known}
+
+
 async def render_summary(tenant_id: int, projects: list[ProjectRef],
                          tasks: list[dict[str, Any]]) -> str:
     """Сводка: сколько задач на каждой стадии проекта плюс просроченные."""
@@ -95,16 +103,30 @@ async def render_summary(tenant_id: int, projects: list[ProjectRef],
                      f"{esc_html(project.name)}</b>")
         lines.append(f"Открытых: {len(mine)}")
 
+        # Незнакомая стадия почти всегда означает одно: колонку завели в Битриксе
+        # после нашей последней синхронизации. Ждать суточного прохода нельзя —
+        # человек смотрит на сводку сейчас, и её задачи числились бы «вне канбана».
+        if _unknown_stages(mine, stages) and await sync.ensure_fresh(
+                tenant_id, project.id, project.b24_group_id):
+            stages = await stages_of(tenant_id, project.id)
+
         counted = 0
         for stage_id, title in stages:
             n = sum(1 for t in mine if as_int(t.get("stageId")) == stage_id)
             counted += n
             if n:
                 lines.append(f"  {esc_html(title)} — {n}")
-        outside = len(mine) - counted
+
+        # Две разные вещи, и путать их нельзя. STAGE_ID=0 — задача действительно не
+        # разложена по канбану, это нормальное состояние. Стадия, которой нет в
+        # справочнике даже после обновления, — уже наш разлад с порталом, и молчать
+        # о нём значит показывать неверную сводку с уверенным видом.
+        outside = sum(1 for t in mine if not as_int(t.get("stageId")))
         if outside:
-            # Задачи вне канбана: STAGE_ID=0. Показываем честно, а не прячем.
             lines.append(f"  Вне канбана — {outside}")
+        unresolved = len(mine) - counted - outside
+        if unresolved:
+            lines.append(f"  Стадия не опознана — {unresolved}")
 
         overdue = sum(1 for t in mine if is_overdue(t))
         if overdue:
