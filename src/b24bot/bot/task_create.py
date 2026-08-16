@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any
 
 from b24bot.b24 import errors
@@ -32,6 +33,9 @@ class Draft:
     description: str
     idem_key: str
     source_message_id: int | None
+    fields: dict[str, Any] = dc_field(default_factory=dict)
+    """Поля задачи из привязанных вопросов опросника. Наши обязательные поля
+    (заголовок, проект, тег идемпотентности) перекрывают их всегда."""
 
 
 def extract(text: str, *, author: str, chat_title: str,
@@ -101,14 +105,19 @@ async def create(client: B24Client, tenant_id: int, project: ProjectRef, draft: 
         log.info("задача по ключу %s уже существует: #%s", draft.idem_key, existing.get("id"))
         return existing, False
 
-    created = await client.call("tasks.task.add", {"fields": {
+    # Поля опросника кладём первыми: наши обязательные их перекрывают, а не
+    # наоборот. Иначе вопрос, привязанный к GROUP_ID, унёс бы задачу в чужой проект.
+    fields: dict[str, Any] = dict(draft.fields)
+    fields.update({
         "TITLE": draft.title,
         "DESCRIPTION": draft.description,
         "DESCRIPTION_IN_BBCODE": "Y",
         "RESPONSIBLE_ID": responsible_id,
         "GROUP_ID": project.b24_group_id,
-        "TAGS": [draft.idem_key],
-    }})
+        # Тег идемпотентности обязан уцелеть рядом с тегами из ответов (И-10).
+        "TAGS": [draft.idem_key, *(draft.fields.get("TAGS") or [])],
+    })
+    created = await client.call("tasks.task.add", {"fields": fields})
     task = created["task"] if isinstance(created, dict) and "task" in created else created
 
     async with pool().acquire() as conn:
