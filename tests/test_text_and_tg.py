@@ -119,3 +119,32 @@ def test_long_poll_gets_longer_http_timeout() -> None:
     assert tg.http_timeout_for("getUpdates", {"timeout": 25}) > 25
     assert tg.http_timeout_for("getMe", None) == tg.TIMEOUT
     assert tg.http_timeout_for("getUpdates", {}) == tg.TIMEOUT
+
+
+# ------------------------------------------------------------------- BBCode
+def test_bbcode_to_text_strips_markup() -> None:
+    """Портал хранит описания и комментарии в BBCode. Человеку нужен текст."""
+    from b24bot.core.text import bbcode_to_text
+
+    raw = ("[b]— Источник —[/b]\nTelegram: чат «Поддержка»\n"
+           "[i]— из Telegram, Иван[/i]")
+    out = bbcode_to_text(raw)
+    assert "[b]" not in out and "[/i]" not in out
+    assert "— Источник —" in out
+    assert "чат «Поддержка»" in out
+
+
+def test_bbcode_keeps_link_address() -> None:
+    """Выкинуть адрес вместе с тегом — значит потерять содержимое."""
+    from b24bot.core.text import bbcode_to_text
+
+    out = bbcode_to_text("см. [url=https://t.me/c/1/2]сообщение[/url]")
+    assert out == "см. сообщение (https://t.me/c/1/2)"
+
+
+def test_bbcode_does_not_touch_escaped_brackets() -> None:
+    """Экранированные esc_bbcode скобки — уже не разметка, а текст человека."""
+    from b24bot.core.text import bbcode_to_text, esc_bbcode
+
+    text = esc_bbcode("смотри [b]тут[/b]")
+    assert bbcode_to_text(text) == text

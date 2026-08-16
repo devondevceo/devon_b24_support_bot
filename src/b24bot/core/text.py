@@ -42,6 +42,27 @@ def esc_bbcode(value: object) -> str:
     return text.replace("[", "［").replace("]", "］")
 
 
+_BBCODE_SIMPLE = re.compile(r"\[/?(?:b|i|u|s|list|\*|quote|code|table|tr|td|p|left|"
+                            r"right|center|justify|color=[^\]]*|size=[^\]]*|"
+                            r"font=[^\]]*|user=[^\]]*|disk file id=[^\]]*)\]",
+                            re.IGNORECASE)
+_BBCODE_URL = re.compile(r"\[url=([^\]]+)\](.*?)\[/url\]", re.IGNORECASE | re.DOTALL)
+_BBCODE_IMG = re.compile(r"\[img\].*?\[/img\]", re.IGNORECASE | re.DOTALL)
+
+
+def bbcode_to_text(value: object) -> str:
+    """Убрать разметку Битрикса из текста, который показываем человеку.
+
+    Описания и комментарии портал хранит в BBCode, и `[i]— из Telegram[/i]` в
+    интерфейсе читается как мусор, а не как курсив: рисовать разметку мы всё равно
+    не будем — ни в Telegram, ни в мини-аппе (там HTML из данных не собирается вовсе).
+    Ссылка сохраняется рядом с текстом: выкинуть адрес значит потерять содержимое.
+    """
+    text = _BBCODE_URL.sub(lambda m: f"{m.group(2)} ({m.group(1)})", str(value))
+    text = _BBCODE_IMG.sub("", text)
+    return _BBCODE_SIMPLE.sub("", text).strip()
+
+
 def safe_filename(name: object, limit: int = 100) -> str:
     """Имя файла из недоверенного источника: без bidi, без переводов строк, обрезанное."""
     text = _BIDI_RE.sub("", str(name))

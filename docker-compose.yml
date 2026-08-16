@@ -89,12 +89,20 @@ services:
       - "traefik.enable=${TRAEFIK_ENABLE:-true}"
       - "traefik.docker.network=traefik-public"
 
-      # --- Маршрут 1: страницы, открываемые Битриксом В IFRAME -------------
+      # --- Маршрут 1: страницы, открываемые В IFRAME -----------------------
       # security-headers@file СЮДА НЕ ПОДКЛЮЧАТЬ: в нём frameDeny: true,
       # то есть X-Frame-Options: DENY, и портал не сможет открыть страницу.
       # Заголовок Content-Security-Policy: frame-ancestors выставляет само
       # приложение, динамически под домен проверенного портала.
-      - "traefik.http.routers.b24sdbot-frame.rule=Host(`${DOMAIN}`) && (PathPrefix(`/b24/placement`) || PathPrefix(`/app`))"
+      #
+      # Мини-апп сюда же: Telegram Desktop и веб-клиент открывают его В IFRAME,
+      # и X-Frame-Options: DENY даёт там пустое окно без единого сообщения.
+      # Живёт по пути /miniapp того же домена — отдельный поддомен потребовал бы
+      # своей A-записи и своего сертификата на ровном месте.
+      #
+      # `/b24/app` добавлен вместе с ними: экран настроек приложения тоже живёт
+      # в iframe портала, а под правило `/app` он никогда не подпадал.
+      - "traefik.http.routers.b24sdbot-frame.rule=Host(`${DOMAIN}`) && (PathPrefix(`/b24/placement`) || PathPrefix(`/b24/app`) || PathPrefix(`/miniapp`) || PathPrefix(`/api/miniapp`) || PathPrefix(`/app`))"
       - "traefik.http.routers.b24sdbot-frame.entrypoints=websecure"
       - "traefik.http.routers.b24sdbot-frame.tls=true"
       - "traefik.http.routers.b24sdbot-frame.tls.certresolver=letsencrypt"

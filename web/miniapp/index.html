@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+    <title>Задачи Битрикс24</title>
+    <!--
+      Официальный SDK Telegram. Только отсюда: window.Telegram.WebApp создаёт
+      именно этот скрипт, без него мини-апп не получает ни initData, ни темы.
+      Поэтому в CSP страницы telegram.org разрешён явно и поимённо (api/main.py).
+    -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

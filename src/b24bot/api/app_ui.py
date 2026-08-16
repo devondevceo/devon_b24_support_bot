@@ -27,7 +27,7 @@ from b24bot.core.config import get_settings, is_trusted_portal_domain
 from b24bot.core.text import esc_attr, esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access, audit, context
+from b24bot.domain import access, audit, context, miniapp
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -188,7 +188,8 @@ async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
     async with pool().acquire() as conn:
         bot = await conn.fetchrow(
             "SELECT bot_id, username, status, mode, privacy_mode_off, last_check_at, "
-            "last_error FROM tg_bots WHERE tenant_id = $1", tenant["id"])
+            "last_error, miniapp_short_name FROM tg_bots WHERE tenant_id = $1",
+            tenant["id"])
         counts = await conn.fetchrow(
             "SELECT (SELECT count(*) FROM clients WHERE tenant_id = $1) AS clients, "
             "       (SELECT count(*) FROM projects WHERE tenant_id = $1 "
@@ -301,7 +302,10 @@ async def _manager_screen(tenant: asyncpg.Record, b24_user_id: int, is_admin: bo
     overview = await _overview_panel(tenant, counts, bot, kind, title, detail,
                                      is_admin, session, active)
     chats = await _chats_block(tenant, b24_user_id, is_admin, session, active)
-    bot_panel = _bot_panel(bot, is_admin, session, active)
+    # Мини-апп — это витрина того же бота, поэтому живёт на его вкладке,
+    # а не отдельной: настраивать там нечего, кнопка меню ставится сама.
+    bot_panel = (_bot_panel(bot, is_admin, session, active)
+                 + _miniapp_block(bot, is_admin, session, active))
     team = await _team_panel(tenant, b24_user_id, is_admin, session, bot, linked, active)
 
     body = (_panel_html("overview", active, (flash if active == "overview" else "") + overview)
@@ -378,6 +382,98 @@ async def _overview_panel(tenant: asyncpg.Record, counts: asyncpg.Record,
     return (ui.panel("Состояние", health, icon_name="info")
             + ui.panel("Охват", tiles, icon_name="folder")
             + ui.panel("Портал", portal, icon_name="shield"))
+
+
+def _miniapp_block(bot: asyncpg.Record | None, is_admin: bool, session: str,
+                   active: str = "bot") -> str:
+    """Состояние мини-аппа. Настраивать здесь почти нечего — и это осознанно.
+
+    Кнопка меню бота ставится сама при подключении и при проверке. Единственное
+    ручное действие во всей цепочке — `/newapp` в BotFather, и оно НЕ обязательно:
+    без него из группы открывается на касание длиннее, через личку бота.
+    """
+    if bot is None:
+        return ""
+    url = miniapp.web_app_url()
+    if url is None:
+        return ui.panel(
+            "Приложение в Telegram",
+            ui.empty("Приложение отключено",
+                     "Публичный адрес сервиса не по https, а Telegram открывает "
+                     "мини-апп только по https.", icon_name="alert"),
+            icon_name="send")
+
+    short = str(bot["miniapp_short_name"] or "")
+    rows = (
+        ui.field("Адрес", f"<code>{esc_html(url)}</code>")
+        + ui.field("Кнопка меню бота", ui.badge("ставится автоматически", "ok"))
+        + ui.field("Открытие из группы",
+                   ui.badge("в одно касание", "ok") if short
+                   else ui.badge("через личку бота", "warn"))
+    )
+
+    if not is_admin:
+        return ui.panel("Приложение в Telegram", rows, icon_name="send")
+
+    form = (
+        f'<form method="post" action="/b24/app/miniapp">'
+        f'<input type="hidden" name="session" value="{esc_attr(session)}">'
+        f'<input type="hidden" name="tab" value="{esc_attr(active)}">'
+        f'<div class="f-group">'
+        f'<label class="f-l" for="mini-short">Короткое имя приложения '
+        f"из BotFather</label>"
+        f'<input class="input mono" type="text" id="mini-short" name="short_name" '
+        f'value="{esc_attr(short)}" placeholder="например tasks" '
+        f'autocomplete="off" spellcheck="false" aria-describedby="mini-short-h">'
+        f'<p class="hint" id="mini-short-h">Необязательно. Если в BotFather '
+        f"выполнить <code>/newapp</code> и указать адрес выше, кнопка в групповом "
+        f"чате откроет приложение сразу. Без этого она сначала ведёт в личку "
+        f"бота — работает так же, просто на касание больше.</p></div>"
+        f'<div class="btn-row"><button class="btn sec" type="submit">'
+        f'{ui.icon("check", 15)}Сохранить имя</button></div></form>')
+    return ui.panel("Приложение в Telegram", rows + '<div class="divider"></div>' + form,
+                    icon_name="send")
+
+
+@router.post("/miniapp")
+async def save_miniapp(session: str = Form(...), short_name: str = Form(""),
+                       tab: str = Form("bot")) -> HTMLResponse:
+    sess = await load_session(session)
+    if sess is None:
+        return expired_page()
+
+    tab = safe_tab(tab)
+    async with pool().acquire() as conn:
+        tenant = await conn.fetchrow(
+            "SELECT id, b24_domain, install_state, granted_scope FROM tenants WHERE id = $1",
+            sess["tenant_id"])
+
+    if not sess["is_portal_admin"]:
+        body = await render_home(tenant, sess["b24_user_id"], False, session,
+                                 message="Настраивать приложение может только "
+                                         "администратор портала.",
+                                 message_kind="err", active_tab=tab)
+        return page(body, tenant["b24_domain"])
+
+    value = short_name.strip()
+    if value and not miniapp.SHORT_NAME_RE.match(value):
+        message, kind = ("Имя приложения из BotFather: латиница, цифры и знак "
+                         "подчёркивания, от 3 до 30 символов.", "err")
+    else:
+        async with pool().acquire() as conn:
+            await conn.execute(
+                "UPDATE tg_bots SET miniapp_short_name = $2, updated_at = now() "
+                "WHERE tenant_id = $1", tenant["id"], value or None)
+        message, kind = (("Имя приложения сохранено — из групп будет открываться "
+                          "сразу.", "ok") if value else
+                         ("Имя приложения убрано: из групп приложение открывается "
+                          "через личку бота.", "ok"))
+
+    async with pool().acquire() as conn:
+        fresh = await issue_session(conn, tenant["id"], sess["b24_user_id"], True)
+    body = await render_home(tenant, sess["b24_user_id"], True, fresh,
+                             message=message, message_kind=kind, active_tab=tab)
+    return page(body, tenant["b24_domain"])
 
 
 async def _portal_projects(tenant_id: int, b24_user_id: int
@@ -994,12 +1090,13 @@ async def _connect_bot(tenant: asyncpg.Record, token: str) -> tuple[str, str]:
                 f"api.telegram.org с сервера.", "warn")
 
     privacy = await _probe_privacy(token)
+    app_note = await _register_miniapp(token)
     async with pool().acquire() as conn:
         await conn.execute(
             "UPDATE tg_bots SET status='active', privacy_mode_off=$2, last_check_at=now(), "
             "last_error=NULL WHERE tenant_id=$1", tenant["id"], privacy)
 
-    tail = ("" if privacy is not False else
+    tail = app_note + ("" if privacy is not False else
             " <b>Но privacy mode включён</b> — выполните <code>/setprivacy</code> → "
             "Disable в BotFather, иначе бот не увидит сообщения в группах.")
     return (f"Бот <b>@{esc_html(username)}</b> подключён, вебхук установлен.{tail}",
@@ -1048,6 +1145,7 @@ async def _recheck_bot(tenant: asyncpg.Record) -> tuple[str, str]:
                 "к третьим лицам — перевыпустите его в BotFather.", "err")
 
     privacy = await _probe_privacy(token)
+    app_note = await _register_miniapp(token)
     async with pool().acquire() as conn:
         await conn.execute(
             "UPDATE tg_bots SET status='active', privacy_mode_off=$2, last_check_at=now(), "
@@ -1055,7 +1153,27 @@ async def _recheck_bot(tenant: asyncpg.Record) -> tuple[str, str]:
 
     last_err = info.get("last_error_message")
     extra = f" Последняя ошибка доставки: {esc_html(last_err)}." if last_err else ""
-    return (f"Подключение в порядке. Необработанных обновлений: {pending}.{extra}", "ok")
+    return (f"Подключение в порядке. Необработанных обновлений: {pending}."
+            f"{extra}{app_note}", "ok")
+
+
+async def _register_miniapp(token: str) -> str:
+    """Повесить мини-апп на кнопку меню бота. Делается за теннанта, а не им.
+
+    Единственный шаг регистрации, доступный через Bot API: короткое имя приложения
+    (`/newapp`) заводится только руками в BotFather и нужно лишь для открытия
+    в одно касание из группы. Без него всё работает — на касание длиннее.
+    """
+    url = miniapp.web_app_url()
+    if url is None:
+        return ""
+    try:
+        await tg.set_chat_menu_button(token, url)
+    except tg.TelegramError as exc:
+        log.warning("кнопка меню не установлена: %s", exc)
+        return (" Кнопку приложения в меню бота поставить не удалось — "
+                "проверьте связь с Telegram.")
+    return " Приложение подключено к кнопке меню бота."
 
 
 async def _suspend(tenant_id: int, bot_id: int, reason: str) -> None:

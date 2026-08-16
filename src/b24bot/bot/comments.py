@@ -16,7 +16,12 @@ from typing import Any
 
 from b24bot.b24 import disk, errors
 from b24bot.b24.client import B24Client
-from b24bot.core.text import esc_bbcode, esc_html, safe_filename
+from b24bot.core.text import (
+    bbcode_to_text,
+    esc_bbcode,
+    esc_html,
+    safe_filename,
+)
 from b24bot.db.pool import pool
 from b24bot.tg import files as tg_files
 
@@ -35,8 +40,13 @@ async def add(client: B24Client, task_id: int, text: str, *, author: str,
     return int(result) if isinstance(result, int | str) and str(result).isdigit() else None
 
 
-async def read_discussion(client: B24Client, task_id: int) -> list[dict[str, Any]]:
-    """Обсуждение задачи. Системные сообщения отбрасываются."""
+async def read_discussion(client: B24Client, task_id: int, *,
+                          limit: int = DISCUSSION_LIMIT) -> list[dict[str, Any]]:
+    """Обсуждение задачи. Системные сообщения отбрасываются.
+
+    `limit` — сколько последних сообщений вернуть: в чате хватает десятка, в
+    мини-аппе экран пролистывается и уместно больше.
+    """
     res = await client.call("tasks.task.get", {
         "taskId": task_id, "select": ["ID", "CHAT_ID"]})
     task = res.get("task", res) if isinstance(res, dict) else {}
@@ -46,7 +56,8 @@ async def read_discussion(client: B24Client, task_id: int) -> list[dict[str, Any
 
     try:
         dialog = await client.call("im.dialog.messages.get",
-                                   {"DIALOG_ID": f"chat{chat_id}", "LIMIT": 50})
+                                   {"DIALOG_ID": f"chat{chat_id}",
+                                    "LIMIT": max(limit, DISCUSSION_LIMIT)})
     except errors.B24Error as exc:
         log.info("не удалось прочитать чат задачи %s: %s", task_id, exc)
         return []
@@ -64,10 +75,12 @@ async def read_discussion(client: B24Client, task_id: int) -> list[dict[str, Any
         out.append({
             "id": m.get("id"),
             "author": user.get("name") or f"пользователь {author_id}",
-            "text": str(m.get("text") or ""),
+            # Портал хранит комментарии в BBCode; показывать `[i]…[/i]` человеку
+            # незачем — рисовать разметку мы всё равно не собираемся.
+            "text": bbcode_to_text(m.get("text") or ""),
             "date": m.get("date"),
         })
-    return out[-DISCUSSION_LIMIT:]
+    return out[-limit:]
 
 
 def render_discussion(task_id: int, items: list[dict[str, Any]]) -> str:

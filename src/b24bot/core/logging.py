@@ -21,6 +21,10 @@ _B24_AUTH = re.compile(r"(auth=)[A-Za-z0-9._\-]{16,}")
 _TOKEN_KV = re.compile(
     r"((?:access_token|refresh_token|client_secret|secret_token|application_token)"
     r"['\"]?\s*[:=]\s*['\"]?)([A-Za-z0-9._\-]{12,})")
+# initData мини-аппа. Подпись действительна сутки и заменяет собой вход, то есть
+# это такой же секрет, как токен: `hash=<64 hex>` и заголовок `Authorization: tma …`.
+_TMA_HASH = re.compile(r"((?:^|[?&\s])hash=)[0-9a-fA-F]{64}")
+_TMA_HEADER = re.compile(r"((?:^|\s)tma\s+)[^\s\"']{20,}")
 # Телефоны с разделителями: наивная \+?\d{10,15} не ловит «8 999 123-45-67»,
 # то есть ровно ту форму, в которой человек пишет номер в чат.
 _PHONE = re.compile(r"(?<![\w.])(?:\+?\d[\s\-()]{0,2}){10,15}(?![\w.])")
@@ -31,6 +35,8 @@ def scrub(text: str) -> str:
     text = _TG_TOKEN.sub(r"/bot\1:<СКРЫТО>", text)
     text = _B24_AUTH.sub(r"\1<СКРЫТО>", text)
     text = _TOKEN_KV.sub(r"\1<СКРЫТО>", text)
+    text = _TMA_HASH.sub(r"\1<СКРЫТО>", text)
+    text = _TMA_HEADER.sub(r"\1<СКРЫТО>", text)
     text = _PHONE.sub("<ТЕЛЕФОН>", text)
     return _EMAIL.sub("<EMAIL>", text)
 

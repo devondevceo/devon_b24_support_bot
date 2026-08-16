@@ -119,6 +119,11 @@ CREATE TABLE tg_bots (
                     CHECK (status IN ('pending','active','error','suspended')),
   last_check_at   TIMESTAMPTZ,
   last_error      TEXT,
+  -- короткое имя мини-аппа из BotFather (`/newapp`), миграция 0010.
+  -- NULL = не заведено: из группы мини-апп открывается через личку бота.
+  miniapp_short_name TEXT
+                    CHECK (miniapp_short_name IS NULL
+                           OR miniapp_short_name ~ '^[A-Za-z][A-Za-z0-9_]{2,29}$'),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX ux_tg_bots__bot_id ON tg_bots (bot_id);

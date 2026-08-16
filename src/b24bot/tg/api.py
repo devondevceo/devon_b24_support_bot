@@ -130,6 +130,29 @@ async def get_my_commands(token: str, *, scope: str | None = None,
     return list(result or [])
 
 
+async def set_chat_menu_button(token: str, url: str, *, text: str = "Задачи",
+                               chat_id: int | None = None,
+                               proxy_base: str | None = None) -> bool:
+    """Кнопка меню бота открывает мини-апп в личных чатах.
+
+    Единственная часть регистрации мини-аппа, доступная через Bot API: короткое имя
+    приложения (`/newapp`) заводится только в BotFather вручную. Поэтому кнопку
+    ставим сами — человеку не нужно ничего настраивать, чтобы мини-апп открылся.
+
+    **Без `chat_id` Telegram принимает вызов, но кнопку не показывает**, если у бота
+    настроено меню команд: `getChatMenuButton` продолжает отвечать `commands`.
+    Проверено на живом боте 16.08.2026. Поэтому кнопка ставится ещё и адресно —
+    на `/start` и при завершении привязки, когда личный чат уже известен.
+    """
+    params: dict[str, Any] = {
+        "menu_button": {"type": "web_app", "text": text[:16], "web_app": {"url": url}},
+    }
+    if chat_id is not None:
+        params["chat_id"] = chat_id
+    ok: bool = await call(token, "setChatMenuButton", params, proxy_base=proxy_base)
+    return ok
+
+
 async def send_message(token: str, chat_id: int, text: str, *,
                        thread_id: int | None = None,
                        reply_markup: dict[str, Any] | None = None,
