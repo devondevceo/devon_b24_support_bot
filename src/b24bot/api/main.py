@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from b24bot.api.app_survey import router as survey_router
 from b24bot.api.app_ui import router as app_router
 from b24bot.api.b24 import router as b24_router
 from b24bot.api.tg_webhook import router as tg_router
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="devon b24 support bot", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.include_router(b24_router)
 app.include_router(app_router)
+app.include_router(survey_router)
 app.include_router(tg_router)
 
 

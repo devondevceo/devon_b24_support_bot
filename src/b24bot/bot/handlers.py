@@ -8,7 +8,15 @@ from typing import Any
 
 from b24bot.b24 import errors, mapping
 from b24bot.b24.tokens import NeedsReauth
-from b24bot.bot import comments, keyboards, survey, task_create, texts, views
+from b24bot.bot import (
+    commands,
+    comments,
+    keyboards,
+    survey,
+    task_create,
+    texts,
+    views,
+)
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
@@ -27,7 +35,15 @@ from b24bot.tg import files as tg_files
 
 log = logging.getLogger(__name__)
 
-BIND_PAGE = 40   # сколько проектов портала помещается в одну клавиатуру
+BIND_PAGE = 40    # сколько проектов портала помещается в одну клавиатуру
+
+
+MAX_OPTIONS = 20  # вариантов ответа на один вопрос; больше не влезает в экран
+
+
+def _help_text(*, private: bool) -> str:
+    """Помощь строится из реестра команд: список в меню Telegram и в /help — один."""
+    return texts.MSG_HELP_HEAD + "\n\n" + commands.render_help(private=private)
 
 
 class Reply:
@@ -325,6 +341,18 @@ async def _survey_begin(ctx: ChatContext, tg_user_id: int, template_id: int) -> 
 
 async def _survey_kb(ctx: ChatContext, tg_user_id: int, session_id: int,
                      q: survey.Question) -> dict[str, Any]:
+    rows: list[list[dict[str, str]]] = []
+
+    # Выпадающий список в чате — это кнопки под вопросом. По одной в ряд:
+    # варианты бывают длинными, а Telegram режет подпись без предупреждения.
+    for i, option in enumerate(q.options[:MAX_OPTIONS] if q.kind == "choice" else []):
+        token = await issue_token("survey_pick", tenant_id=ctx.tenant_id,
+                                  owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                                  payload={"session_id": session_id, "index": i},
+                                  ttl=timedelta(minutes=30))
+        label = str(option.get("label") or option.get("value") or "—")
+        rows.append([{"text": label[:60], "callback_data": f"p:{token}"}])
+
     row = []
     if not q.required:
         token = await issue_token("survey_skip", tenant_id=ctx.tenant_id,
@@ -337,7 +365,8 @@ async def _survey_kb(ctx: ChatContext, tg_user_id: int, session_id: int,
                                payload={"session_id": session_id},
                                ttl=timedelta(minutes=30))
     row.append({"text": "❌ Отменить", "callback_data": f"x:{cancel}"})
-    return {"inline_keyboard": [row]}
+    rows.append(row)
+    return {"inline_keyboard": rows}
 
 
 async def _survey_answer(ctx: ChatContext, msg: dict[str, Any],
@@ -360,7 +389,20 @@ async def _survey_answer(ctx: ChatContext, msg: dict[str, Any],
     items = await survey.questions(ctx.tenant_id, session.template_id)
     if session.step >= len(items):
         return None
-    await survey.record(session, items[session.step].code, text)
+
+    q = items[session.step]
+    if q.kind == "choice" and q.options:
+        # Человек напечатал вместо нажатия. Принимаем, если это в точности одна
+        # из подписей: иначе в поле Битрикса уедет текст вместо значения.
+        match = next((o for o in q.options
+                      if str(o.get("label", "")).strip().lower() == text.lower()), None)
+        if match is None:
+            return Reply(texts.MSG_SURVEY_PICK_BUTTON,
+                         markup=await _survey_kb(ctx, tg_user_id, session.id, q),
+                         remember_for_survey=session.id)
+        text = str(match.get("value") or match.get("label") or "")
+
+    await survey.record(session, q.code, text)
     return await _survey_next(ctx, session, items, tg_user_id)
 
 
@@ -375,7 +417,8 @@ async def _survey_next(ctx: ChatContext, session: survey.Session,
     # Вопросы кончились — показываем черновик и ждём подтверждения.
     # Описание собирается заново в момент создания: между превью и нажатием
     # человек мог ответить ещё раз.
-    title, _ = survey.assemble(items, session.answers)
+    built = survey.assemble(items, session.answers)
+    title = built.title
     project = next((p for p in ctx.projects if p.id == session.project_id),
                    ctx.projects[0] if ctx.projects else None)
     if project is None:
@@ -414,15 +457,16 @@ async def _survey_create(ctx: ChatContext, tg_user_id: int, session_id: int,
     answers = row["answers"]
     answers = json.loads(answers) if isinstance(answers, str) else dict(answers or {})
     items = await survey.questions(ctx.tenant_id, int(row["template_id"]))
-    title, description = survey.assemble(items, answers)
+    built = survey.assemble(items, answers)
 
     project = next((p for p in ctx.projects if p.id == project_id), None)
     if project is None:
         return Reply(texts.MSG_NO_PROJECT)
 
     draft = task_create.Draft(
-        title=title, description=description,
-        idem_key=f"survey-{session_id}", source_message_id=None)
+        title=built.title, description=built.description,
+        idem_key=f"survey-{session_id}", source_message_id=None,
+        fields=built.fields)
 
     try:
         client = await access.client_for_user(ctx.tenant_id, b24_user_id,
@@ -462,10 +506,12 @@ async def _menu_tokens(ctx: ChatContext, tg_user_id: int) -> dict[str, str]:
 
 async def _help_reply(ctx: ChatContext, tg_user_id: int) -> Reply:
     if not ctx.is_active or not ctx.has_binding:
-        return Reply(texts.MSG_HELP if ctx.is_active else texts.MSG_START_GROUP)
+        return Reply(_help_text(private=False) if ctx.is_active
+                     else texts.MSG_START_GROUP)
     tokens = await _menu_tokens(ctx, tg_user_id)
     projects = ", ".join(esc_html(p.name) for p in ctx.projects)
-    text = (f"{texts.MSG_HELP}\n\n<b>Проекты этого чата:</b> {projects}\n"
+    text = (f"{_help_text(private=False)}\n\n"
+            f"<b>Проекты этого чата:</b> {projects}\n"
             f"<i>Закрепите это сообщение — кнопки будут всегда под рукой.</i>")
     return Reply(text, markup=keyboards.help_menu(tokens))
 
@@ -635,17 +681,25 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
         action = keyboards.PRIVATE_LABELS.get(text.strip())
         if action:
             return await _private_action(action, tg_user_id)
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(_help_text(private=True), markup=keyboards.persistent_private())
     name, arg = cmd
 
     if name == "start" and arg.startswith("b"):
         reply = await _link_account(arg[1:], tg_user_id, user)
         return Reply(reply.text, markup=keyboards.persistent_private())
     if name in ("start", "help"):
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(_help_text(private=True), markup=keyboards.persistent_private())
     if name == "whoami":
         return await _whoami(tg_user_id)
-    return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+    if name == "link":
+        return Reply(texts.MSG_NOT_LINKED, markup=keyboards.persistent_private())
+    # Те же действия, что на постоянной клавиатуре: человек, привыкший к слешам,
+    # не должен искать кнопку, а пришедший из меню Telegram — знать про кнопки.
+    slash_actions = {"status": "mine", "list": "mine",
+                     "overdue": "overdue", "mychats": "mychats"}
+    if name in slash_actions:
+        return await _private_action(slash_actions[name], tg_user_id)
+    return Reply(_help_text(private=True), markup=keyboards.persistent_private())
 
 
 async def _private_action(action: str, tg_user_id: int) -> Reply:
@@ -656,7 +710,7 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
     ходим его личным токеном.
     """
     if action == "help":
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(_help_text(private=True), markup=keyboards.persistent_private())
 
     tenant_id = await access.tenant_of_user(tg_user_id)
     if tenant_id is None:
@@ -1045,6 +1099,23 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
             return Reply(texts.MSG_DIALOG_EXPIRED)
         items = await survey.questions(tenant_id, session.template_id)
         await survey.skip(session)
+        return await _survey_next(ctx, session, items, tg_user_id)
+    if ns == "p":
+        session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
+                                          tg_user_id)
+        if session is None:
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        items = await survey.questions(tenant_id, session.template_id)
+        if session.step >= len(items):
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        q = items[session.step]
+        index = int(payload.get("index", -1))
+        if not (0 <= index < len(q.options)):
+            # Набор правили, пока человек думал над кнопкой.
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        option = q.options[index]
+        await survey.record(session, q.code,
+                            str(option.get("value") or option.get("label") or ""))
         return await _survey_next(ctx, session, items, tg_user_id)
     if ns == "x":
         await survey.finish(int(payload["session_id"]), "cancelled")

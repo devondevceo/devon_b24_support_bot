@@ -60,7 +60,7 @@ async def load_session(token: str) -> asyncpg.Record | None:
 
 
 # ---------------------------------------------------------------------- вёрстка
-TABS = ("overview", "chats", "bot", "team")
+TABS = ("overview", "chats", "bot", "survey", "team")
 
 
 def safe_tab(value: str) -> str:
@@ -287,10 +287,14 @@ async def _manager_screen(tenant: asyncpg.Record, b24_user_id: int, is_admin: bo
             "создавать и комментировать задачи из чатов вы пока не можете — "
             "привязка находится во вкладке «Команда».", "warn")
 
+    can_roles = await can_manage_admins(int(tenant["id"]), b24_user_id, is_admin)
+    survey = await _survey_block(int(tenant["id"]), can_roles, session, active)
+
     tabs = _tabs_html(active, [
         ("overview", "Обзор", "info", 0),
         ("chats", "Чаты", "chat", chats_n),
         ("bot", "Бот", "send", 0),
+        ("survey", "Опросник", "inbox", 0),
         ("team", "Команда", "users", int(counts["members"])),
     ])
 
@@ -303,6 +307,7 @@ async def _manager_screen(tenant: asyncpg.Record, b24_user_id: int, is_admin: bo
     body = (_panel_html("overview", active, (flash if active == "overview" else "") + overview)
             + _panel_html("chats", active, (flash if active == "chats" else "") + chats)
             + _panel_html("bot", active, (flash if active == "bot" else "") + bot_panel)
+            + _panel_html("survey", active, (flash if active == "survey" else "") + survey)
             + _panel_html("team", active, (flash if active == "team" else "") + team))
 
     return head + warn_link + tabs + body
@@ -1301,3 +1306,83 @@ async def _apply_role(tenant_id: int, actor_b24_id: int, action: str,
 
     return ((f"{esc_html(who)} — теперь администратор теннанта." if action == "grant"
              else f"С {esc_html(who)} сняты права администратора."), "ok")
+
+
+# -------------------------------------------------------------------- опросник
+async def _survey_block(tenant_id: int, can_manage: bool, session: str,
+                        active: str) -> str:
+    """Сводка по наборам вопросов плюс вход в конструктор.
+
+    Сам конструктор — отдельная страница: там своя навигация по наборам и своя
+    форма вопроса, во вкладку это не помещается. Здесь только состав наборов
+    и кнопка входа.
+    """
+    from b24bot.api import app_survey
+
+    templates = await app_survey.templates_of(tenant_id)
+    own = sum(1 for t in templates if t["tenant_id"] is not None)
+
+    if not templates:
+        return ui.panel(
+            "Опросник",
+            ui.empty("Ни одного набора вопросов нет",
+                     "Опросник — это то, что бот спросит в чате перед созданием "
+                     "задачи. Без набора он создаст задачу из одного сообщения.",
+                     icon_name="inbox"),
+            icon_name="inbox")
+
+    rows = [
+        ui.item(esc_html(t["title"]),
+                sub_html=f'вопросов: <span class="tnum">{esc_html(t["questions"])}</span>',
+                actions_html=(ui.badge("свой", "ok") if t["tenant_id"] is not None
+                              else ui.badge("системный", "neutral")))
+        for t in templates]
+    body = f'<ul class="list">{"".join(rows)}</ul>'
+
+    if not can_manage:
+        return ui.panel("Опросник", body, icon_name="inbox", flush=True,
+                        footer_html=ui.hint("Настраивать опросник может "
+                                            "администратор теннанта."))
+
+    open_form = (
+        '<form method="post" action="/b24/app/survey" class="inline">'
+        f'<input type="hidden" name="session" value="{esc_attr(session)}">'
+        '<input type="hidden" name="action" value="open">'
+        f'<input type="hidden" name="tab" value="{esc_attr(active)}">'
+        f'<input type="hidden" name="template_id" value="{templates[0]["id"]}">'
+        f'<button class="btn" type="submit">{ui.icon("settings", 15)}'
+        "Настроить опросник</button></form>")
+
+    tail = ui.hint(
+        "Ответы на вопросы, связанные с полями задачи, уходят в эти поля. "
+        "Остальные — в тело задачи. "
+        + (f"Своих наборов: {own}." if own else
+           "Пока все наборы системные: первое изменение скопирует набор вам."))
+
+    return ui.panel("Опросник", body, icon_name="inbox", flush=True,
+                    actions_html=open_form, footer_html=tail)
+
+
+@router.post("/back")
+async def back_to_home(session: str = Form(...),
+                       tab: str = Form("survey")) -> HTMLResponse:
+    """Возврат из конструктора опросника на главный экран.
+
+    Отдельный маршрут, а не ссылка: сессия страницы живёт в теле POST — в
+    GET-параметре она попадала бы в логи, историю браузера и Referer.
+    """
+    sess = await load_session(session)
+    if sess is None:
+        return expired_page()
+
+    async with pool().acquire() as conn:
+        tenant = await conn.fetchrow(
+            "SELECT id, b24_domain, install_state, granted_scope FROM tenants "
+            "WHERE id = $1", sess["tenant_id"])
+        fresh = await issue_session(conn, tenant["id"], sess["b24_user_id"],
+                                    bool(sess["is_portal_admin"]))
+
+    body = await render_home(tenant, sess["b24_user_id"],
+                             bool(sess["is_portal_admin"]), fresh,
+                             active_tab=safe_tab(tab))
+    return page(body, tenant["b24_domain"])

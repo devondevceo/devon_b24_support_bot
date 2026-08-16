@@ -200,7 +200,7 @@ form.inline{display:inline-flex;margin:0}
 .f-group:last-child{margin-bottom:0}
 label.f-l{display:block;font-size:13px;font-weight:500;color:var(--text-2);
           margin:0 0 6px}
-.input,select.input{
+.input,select.input,textarea.input{
   width:100%;min-height:42px;padding:9px 12px;
   border:1px solid var(--border-strong);border-radius:var(--r2);
   background:var(--surface);color:var(--text);
@@ -215,6 +215,7 @@ label.f-l{display:block;font-size:13px;font-weight:500;color:var(--text-2);
              box-shadow:0 0 0 3px rgba(37,99,235,.15)}
 .input.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
             font-size:16px}
+textarea.input{resize:vertical;line-height:1.5;min-height:96px}
 /* Стрелка списка нарисована инлайном: внешних картинок на странице нет вообще.
    Обратные слэши — перенос строки в Python, в CSS уезжает одна длинная строка. */
 select.input{appearance:none;padding-right:34px;cursor:pointer;
@@ -361,6 +362,9 @@ _PATHS: dict[str, str] = {
                 "H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z",
     "inbox": "M22 12h-6l-2 3h-4l-2-3H2 M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6"
              "l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z",
+    "arrow-up": "M12 19V5 M5 12l7-7 7 7",
+    "arrow-down": "M12 5v14 M19 12l-7 7-7-7",
+    "arrow-left": "M19 12H5 M12 19l-7-7 7-7",
 }
 
 

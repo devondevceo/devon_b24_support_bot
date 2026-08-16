@@ -158,9 +158,15 @@ def test_bind_form_reports_when_nothing_left_to_bind() -> None:
 
 
 # --------------------------------------------------------------------- вкладки
-@pytest.mark.parametrize("raw", ["overview", "chats", "bot", "team"])
+@pytest.mark.parametrize("raw", ["overview", "chats", "bot", "survey", "team"])
 def test_safe_tab_allows_known(raw: str) -> None:
     assert app_ui.safe_tab(raw) == raw
+
+
+def test_every_tab_has_a_panel() -> None:
+    """Вкладка без панели — кнопка, которая ничего не открывает."""
+    for key in app_ui.TABS:
+        assert f'id="panel-{key}"' in app_ui._panel_html(key, key, "тело")
 
 
 @pytest.mark.parametrize("raw", ["", "../etc", "<script>", "OVERVIEW", "team ", "9"])
