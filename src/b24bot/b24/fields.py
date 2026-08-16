@@ -55,10 +55,34 @@ class FieldRef:
         return bool(self.values)
 
 
+async def user_fields(client: Any) -> dict[str, dict[str, Any]]:
+    """UF-поля задач по имени. Только здесь видно допустимые значения списка.
+
+    `tasks.task.getFields` для UF-поля типа `enumeration` отдаёт лишь
+    `{"title": ..., "type": "enumeration"}` — без единого варианта. Варианты с их
+    ID лежат в `task.item.userfield.getlist` -> `LIST`. Знать их обязательно:
+    запись подписи вместо ID молча кладёт в поле `0` (docs/00-portal-facts.md §14).
+    """
+    try:
+        rows = await client.call("task.item.userfield.getlist", {})
+    except Exception as exc:
+        log.warning("не удалось прочитать UF-поля задач: %s", str(exc)[:150])
+        return {}
+    return {str(r["FIELD_NAME"]): r for r in (rows or [])
+            if isinstance(r, dict) and r.get("FIELD_NAME")}
+
+
+def enum_items(meta: dict[str, Any]) -> dict[str, str]:
+    """Варианты UF-списка: подпись -> ID элемента."""
+    return {str(i.get("VALUE")): str(i.get("ID"))
+            for i in (meta.get("LIST") or []) if isinstance(i, dict)}
+
+
 async def available(client: Any) -> list[FieldRef]:
     """Поля портала, пригодные для привязки. Отсортированы по подписи."""
     raw = await client.call("tasks.task.getFields", {})
     fields = raw.get("fields", raw) if isinstance(raw, dict) else {}
+    uf = await user_fields(client)
 
     out: list[FieldRef] = []
     for name, meta in (fields or {}).items():
@@ -73,10 +97,125 @@ async def available(client: Any) -> list[FieldRef]:
             kind = str(meta.get("type") or "string")
             if kind not in UF_ALLOWED_TYPES and kind != "string":
                 continue
+            if kind == "enumeration" and name in uf:
+                # ID элемента -> подпись: в поле уходит ID, человек видит подпись.
+                values = {v: k for k, v in enum_items(uf[name]).items()}
             out.append(FieldRef(name, title, UF_TYPE_MAP.get(kind, kind), values))
 
     out.sort(key=lambda f: (f.name.startswith("UF_"), f.title.lower()))
     return out
+
+
+# ------------------------------------------------------ создание своего поля
+TRANSLIT = {
+    "а": "A", "б": "B", "в": "V", "г": "G", "д": "D", "е": "E", "ё": "E",
+    "ж": "ZH", "з": "Z", "и": "I", "й": "Y", "к": "K", "л": "L", "м": "M",
+    "н": "N", "о": "O", "п": "P", "р": "R", "с": "S", "т": "T", "у": "U",
+    "ф": "F", "х": "H", "ц": "C", "ч": "CH", "ш": "SH", "щ": "SCH", "ъ": "",
+    "ы": "Y", "ь": "", "э": "E", "ю": "YU", "я": "YA",
+}
+NAME_PREFIX = "UF_SD_"     # SD — support desk; сразу видно, чьё это поле
+NAME_MAX = 20
+
+
+def field_name_for(label: str, taken: set[str]) -> str:
+    """Имя поля из подписи. Битрикс принимает только `[A-Z0-9_]`, а подпись русская."""
+    slug = "".join(TRANSLIT.get(ch, ch) for ch in label.lower())
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", slug).strip("_").upper()[:NAME_MAX] or "FIELD"
+    name = f"{NAME_PREFIX}{slug}"
+    if name not in taken:
+        return name
+    for i in range(2, 100):
+        candidate = f"{name}_{i}"
+        if candidate not in taken:
+            return candidate
+    return f"{name}_{len(taken) + 1}"
+
+
+class FieldCreateError(RuntimeError):
+    """Поле создать не удалось. Текст — то, что покажем настройщику."""
+
+
+async def create_user_field(client: Any, label: str, *, as_list: bool,
+                            options: list[dict[str, str]] | None = None
+                            ) -> tuple[str, str, list[dict[str, str]]]:
+    """Создать поле задачи на портале.
+
+    Возвращает `(имя поля, наш тип, варианты с ID элементов)`.
+
+    Поле создаётся для **всех задач портала** (`ENTITY_ID=TASKS_TASK`), а не для
+    одного проекта: у задач Битрикса пользовательские поля общие. Настройщик
+    обязан это видеть до нажатия — иначе он думает, что меняет один проект.
+    """
+    clean = label.strip()[:60]
+    if not clean:
+        raise FieldCreateError("Название нового поля пустое.")
+
+    existing = await user_fields(client)
+    name = field_name_for(clean, set(existing))
+    kind = "enumeration" if as_list else "string"
+
+    params: dict[str, Any] = {
+        "FIELD_NAME": name,
+        "USER_TYPE_ID": kind,
+        "EDIT_FORM_LABEL": {"ru": clean, "en": clean},
+        "LIST_COLUMN_LABEL": {"ru": clean, "en": clean},
+    }
+    if as_list:
+        params["LIST"] = [{"VALUE": o["label"]} for o in (options or [])]
+
+    try:
+        await client.call("task.item.userfield.add", {"PARAMS": params})
+    except Exception as exc:
+        raise FieldCreateError(
+            f"Битрикс24 отказался создавать поле: {str(exc)[:200]}") from exc
+
+    if not as_list:
+        return name, "string", []
+
+    # Значения списка — ID элементов, а не подписи: подписью Битрикс молча пишет 0.
+    fresh = await user_fields(client)
+    items = enum_items(fresh.get(name, {}))
+    mapped = [{"label": o["label"], "value": items.get(o["label"], o["label"])}
+              for o in (options or [])]
+    return name, "enum", mapped
+
+
+async def sync_enum_options(client: Any, field_name: str,
+                            options: list[dict[str, str]]
+                            ) -> tuple[list[dict[str, str]], str]:
+    """Досоздать в UF-списке недостающие варианты и вернуть их с ID элементов.
+
+    Нужно на каждом сохранении вопроса: настройщик мог дописать вариант, которого
+    в поле нет, — и ответ ушёл бы в `0` без единого сообщения об ошибке.
+    """
+    meta = (await user_fields(client)).get(field_name)
+    if meta is None or meta.get("USER_TYPE_ID") != "enumeration":
+        return options, ""
+
+    items = enum_items(meta)
+    missing = [o["label"] for o in options if o["label"] not in items]
+    if missing:
+        payload: list[dict[str, str]] = [{"ID": i, "VALUE": v}
+                                         for v, i in items.items()]
+        payload += [{"VALUE": v} for v in missing]
+        try:
+            await client.call("task.item.userfield.update",
+                              {"ID": meta["ID"], "PARAMS": {"LIST": payload}})
+            items = enum_items((await user_fields(client)).get(field_name, {}))
+        except Exception as exc:
+            log.warning("не удалось досоздать варианты поля %s: %s",
+                        field_name, str(exc)[:150])
+            return options, ("Битрикс24 не принял новые варианты списка — "
+                             "проверьте поле на портале.")
+
+    mapped = [{"label": o["label"], "value": items.get(o["label"], o["value"])}
+              for o in options]
+    unknown = [o["label"] for o in mapped if not str(o["value"]).isdigit()]
+    if unknown:
+        return mapped, ("В поле нет вариантов: " + ", ".join(unknown[:5])
+                        + ". Ответы по ним не сохранятся.")
+    return mapped, ""
 
 
 def _values_of(raw: Any) -> dict[str, str]:

@@ -171,3 +171,32 @@ def test_choice_question_asks_for_a_button_not_a_reply() -> None:
                 options=[{"label": "Горит", "value": "2"}])
     assert "кнопкой ниже" in question_text(choice, 0, 3)
     assert "Ответьте на это сообщение" in question_text(_q("x", "Что случилось?"), 0, 3)
+
+
+# ------------------------------------------------------- создание своего поля
+def test_field_name_is_transliterated_and_prefixed() -> None:
+    """Битрикс принимает только [A-Z0-9_], а подпись поля человек пишет по-русски."""
+    from b24bot.b24.fields import field_name_for
+
+    assert field_name_for("Срочность", set()) == "UF_SD_SROCHNOST"
+    assert field_name_for("Тип обращения!", set()) == "UF_SD_TIP_OBRASCHENIYA"
+    assert field_name_for("", set()) == "UF_SD_FIELD"
+
+
+def test_field_name_does_not_collide() -> None:
+    """Имя занято — берём следующее, а не падаем: Битрикс на дубль отвечает ERROR_CORE."""
+    from b24bot.b24.fields import field_name_for
+
+    assert field_name_for("Срочность", {"UF_SD_SROCHNOST"}) == "UF_SD_SROCHNOST_2"
+    assert field_name_for(
+        "Срочность", {"UF_SD_SROCHNOST", "UF_SD_SROCHNOST_2"}) == "UF_SD_SROCHNOST_3"
+
+
+def test_enum_items_maps_label_to_element_id() -> None:
+    """В enum-поле уходит ID элемента. Подписью Битрикс молча пишет 0."""
+    from b24bot.b24.fields import enum_items
+
+    meta = {"LIST": [{"ID": "325", "VALUE": "Горит"},
+                     {"ID": "327", "VALUE": "Обычное"}]}
+    assert enum_items(meta) == {"Горит": "325", "Обычное": "327"}
+    assert enum_items({}) == {}
