@@ -25,6 +25,7 @@ from b24bot.domain.context import (
     load_chat_context_by_ref,
     remember_task,
 )
+from b24bot.tg import api as tg_api
 from b24bot.tg import files as tg_files
 
 log = logging.getLogger(__name__)
@@ -887,6 +888,23 @@ async def _open_app(packed: str, tg_user_id: int) -> Reply:
         markup=keyboards.inline([[keyboards.web_app_button("🧩 Открыть задачи", url)]]))
 
 
+async def _ensure_menu_button(bot: dict[str, Any], tg_user_id: int) -> None:
+    """Повесить мини-апп на кнопку меню В ЭТОЙ личке.
+
+    Умолчание для всех чатов Telegram принимает, но не показывает, если у бота
+    настроено меню команд (проверено на живом боте). Адресная установка работает,
+    стоит один вызов и делается там, где человек и так пришёл в личку.
+    """
+    url = miniapp.web_app_url()
+    if url is None:
+        return
+    try:
+        await tg_api.set_chat_menu_button(bot["token"], url, chat_id=tg_user_id)
+    except tg_api.TelegramError as exc:
+        # Кнопка — удобство, а не условие работы: молча продолжаем.
+        log.info("кнопка меню не поставлена для %s: %s", tg_user_id, exc)
+
+
 async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
                    tg_user_id: int, user: dict[str, Any],
                    text: str = "") -> Reply | None:
@@ -901,10 +919,13 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
 
     if name == "start" and arg.startswith("b"):
         reply = await _link_account(arg[1:], tg_user_id, user)
+        await _ensure_menu_button(bot, tg_user_id)
         return Reply(reply.text, markup=_private_kb())
     if name == "start" and arg.startswith(miniapp.START_PREFIX) and len(arg) > 1:
+        await _ensure_menu_button(bot, tg_user_id)
         return await _open_app(arg[1:], tg_user_id)
     if name in ("start", "help"):
+        await _ensure_menu_button(bot, tg_user_id)
         return Reply(texts.MSG_HELP, markup=_private_kb())
     if name == "whoami":
         return await _whoami(tg_user_id)
