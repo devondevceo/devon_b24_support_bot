@@ -104,7 +104,10 @@ svg{flex:none;display:block}
 
 /* ------------------------------------------------------------------ панели */
 .panel{background:var(--surface);border:1px solid var(--border);
-       border-radius:var(--r3);box-shadow:var(--shadow);margin:0 0 var(--s4)}
+       border-radius:var(--r3);box-shadow:var(--shadow);margin:0 0 var(--s4);
+       /* Дети с фоном (шапки чатов) не должны торчать из скруглённых углов. */
+       overflow:hidden}
+.panel-note{color:var(--text-3);font-size:12.5px}
 .panel:last-child{margin-bottom:0}
 .panel-h{display:flex;align-items:center;gap:var(--s3);justify-content:space-between;
          padding:var(--s4) var(--s5);border-bottom:1px solid var(--border);flex-wrap:wrap}
@@ -156,15 +159,39 @@ svg{flex:none;display:block}
    «Назначить админом», и на 375px они втроём не помещаются — без переноса
    кнопка уезжала за правый край и тянула горизонтальный скролл всей страницы. */
 .item-a{display:flex;gap:var(--s2);align-items:center;flex:none;flex-wrap:wrap}
-/* Вложенный уровень: проекты внутри чата. Отступ + линия вместо голого списка. */
-.sub{margin:0;padding:0 var(--s5) var(--s3) calc(var(--s5) + var(--s6));list-style:none}
-.sub-i{display:flex;gap:var(--s3);align-items:center;justify-content:space-between;
-       padding:7px var(--s3);border-left:2px solid var(--border);
-       padding-left:var(--s3);flex-wrap:wrap;border-radius:0 var(--r1) var(--r1) 0}
-.sub-i + .sub-i{margin-top:2px}
-.sub-i:hover{background:var(--surface-2)}
+/* Чат — раздел списка: шапка на подложке, под ней проекты и свёрнутая форма.
+   Раньше вложенность объяснялась линией слева, а форма была раскрыта всегда —
+   вместе это читалось как каша из строк без границ. */
 .chat-block{border-bottom:1px solid var(--border)}
 .chat-block:last-child{border-bottom:0}
+.chat-h{display:flex;gap:var(--s2) var(--s3);align-items:center;
+        justify-content:space-between;flex-wrap:wrap;
+        padding:10px var(--s5);background:var(--surface-2)}
+.chat-meta{display:flex;flex-direction:column;gap:1px;min-width:0}
+.chat-name{font-weight:600;overflow-wrap:anywhere}
+.chat-id{color:var(--text-3);font-size:11.5px;
+         font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}
+.chat-body{padding:var(--s2) var(--s5) var(--s4)}
+.proj{display:flex;gap:var(--s3);align-items:center;justify-content:space-between;
+      padding:9px 0;flex-wrap:wrap}
+.proj + .proj{border-top:1px solid var(--border)}
+.proj-m{display:flex;gap:10px;align-items:flex-start;min-width:0;flex:1 1 240px}
+.proj-ico{color:var(--text-3);flex:none;margin-top:2px}
+.proj-t{font-weight:500;overflow-wrap:anywhere}
+.proj-s{color:var(--text-3);font-size:12.5px;margin-top:1px}
+.proj-none{color:var(--text-3);font-size:13px;padding:9px 0}
+
+/* Форма привязки за <details>: раскрытая на каждом чате, она заслоняла чаты. */
+details.bind{margin-top:var(--s2)}
+details.bind>summary{list-style:none;cursor:pointer;user-select:none;
+  display:inline-flex;align-items:center;gap:7px;min-height:38px;padding:0 14px;
+  border:1px dashed var(--border-strong);border-radius:var(--r2);
+  color:var(--text-2);font-size:13.5px;font-weight:500;
+  transition:background-color .15s ease,color .15s ease,border-color .15s ease}
+details.bind>summary::-webkit-details-marker{display:none}
+details.bind>summary:hover{background:var(--surface-2);color:var(--text)}
+details.bind[open]>summary{border-style:solid;background:var(--surface-2);
+  color:var(--text);margin-bottom:var(--s4)}
 
 /* ------------------------------------------------------------------- кнопки */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;
@@ -299,7 +326,7 @@ stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
 @media (max-width:640px){
   body{padding:var(--s3) var(--s3) var(--s6);font-size:15px}
   .panel-b,.panel-h,.item,.step{padding-left:var(--s4);padding-right:var(--s4)}
-  .sub{padding-left:var(--s6);padding-right:var(--s4)}
+  .chat-h,.chat-body{padding-left:var(--s4);padding-right:var(--s4)}
   .field{flex-direction:column;align-items:flex-start;gap:2px}
   .field-v{text-align:left}
   .item-a{width:100%;justify-content:flex-start}
@@ -313,6 +340,7 @@ stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
   .btn.ghost,.btn.danger{padding:0 12px}
   .tab{min-height:44px}
   .input,select.input{min-height:44px}
+  details.bind>summary{min-height:44px}
 }
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms !important;

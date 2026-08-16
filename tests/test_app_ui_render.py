@@ -157,6 +157,42 @@ def test_bind_form_reports_when_nothing_left_to_bind() -> None:
     assert "<select" not in html
 
 
+def test_bind_form_expanded_only_for_unbound_chat() -> None:
+    """У чата без привязок форма раскрыта: привязка и есть следующий шаг.
+    У чата с привязками — свёрнута, иначе вкладка превращается в простыню."""
+    projects = [{"id": 12, "name": "Проект", "role": "A", "extranet": False},
+                {"id": 15, "name": "Другой", "role": "A", "extranet": False}]
+    unbound = app_ui._bind_form(_chat(), [], projects, set(), [], "sess", "chats")
+    assert '<details class="bind" open>' in unbound
+    bound = app_ui._bind_form(
+        _chat(), [{"b24_group_id": 12, "client_id": 3, "client": "Линия Жизни"}],
+        projects, set(), [], "sess", "chats")
+    assert '<details class="bind">' in bound
+
+
+def test_bind_form_locks_client_when_chat_already_has_one() -> None:
+    """Один чат — один клиент: селект предлагал бы выбор между «правильно»
+    и «ошибка сервера». После первой привязки клиент фиксирован."""
+    html = app_ui._bind_form(
+        _chat(), [{"b24_group_id": 12, "client_id": 3, "client": "Линия Жизни"}],
+        [{"id": 12, "name": "Проект", "role": "A", "extranet": False},
+         {"id": 15, "name": "Другой", "role": "A", "extranet": False}],
+        set(), [{"id": 3, "name": "Линия Жизни"}, {"id": 4, "name": "Ромашка"}],
+        "sess", "chats")
+    assert 'name="client_id" value="3"' in html      # клиент едет скрытым полем
+    assert html.count("<select") == 1                # выбирается только проект
+    assert "Линия Жизни" in html                     # и назван человеку текстом
+    assert "Ромашка" not in html                     # чужие клиенты не предлагаются
+
+
+def test_project_row_title_and_client_are_separate_blocks() -> None:
+    """Спаны здесь однажды склеились в «Devon SD BOTклиент Devon SD BOT»."""
+    html = app_ui._project_row(EVIL, EVIL)
+    assert '<div class="proj-t">' in html
+    assert '<div class="proj-s">' in html
+    assert_no_injection(html)
+
+
 # --------------------------------------------------------------------- вкладки
 @pytest.mark.parametrize("raw", ["overview", "chats", "bot", "survey", "team"])
 def test_safe_tab_allows_known(raw: str) -> None:

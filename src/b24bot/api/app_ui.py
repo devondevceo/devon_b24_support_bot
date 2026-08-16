@@ -575,10 +575,10 @@ async def _chats_block(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
         label, kind = state.get(ch["status"], (str(ch["status"]), "neutral"))
         chat_name = ch["title"] or f"чат {ch['chat_id']}"
         forum = " · форум" if ch["is_forum"] else ""
-        head = ui.row(
-            esc_html(chat_name),
-            sub_html=f'<span class="tnum">{esc_html(ch["chat_id"])}</span>{esc_html(forum)}',
-            actions_html=ui.badge(label, kind))
+        head = (f'<div class="chat-h"><div class="chat-meta">'
+                f'<span class="chat-name">{esc_html(chat_name)}</span>'
+                f'<span class="chat-id tnum">{esc_html(ch["chat_id"])}'
+                f"{esc_html(forum)}</span></div>{ui.badge(label, kind)}</div>")
 
         linked = by_chat.get(ch["id"], [])
         rows = []
@@ -593,30 +593,39 @@ async def _chats_block(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
                     confirm=f"Отвязать проект «{b['project']}» от чата "
                             f"«{chat_name}»?\n\nЗадачи из этого чата больше не будут "
                             f"попадать в проект.")
-            rows.append(
-                f'<li class="sub-i"><span class="item-m">'
-                f'<span class="item-t">{esc_html(b["project"])}</span>'
-                f'<span class="item-s">клиент {esc_html(b["client"])}</span></span>'
-                f'<span class="item-a">{btn}</span></li>')
-
-        if linked:
-            body = f'<ul class="sub">{"".join(rows)}</ul>'
-        else:
-            body = ('<div class="sub"><div class="sub-i muted">'
-                    "Проектов пока нет — задачи из этого чата создать нельзя"
-                    "</div></div>")
+            rows.append(_project_row(str(b["project"]), str(b["client"]), btn))
+        if not linked:
+            rows.append('<div class="proj-none">Проектов пока нет — задачи из '
+                        "этого чата создать нельзя</div>")
 
         form = ""
         if is_admin and ch["status"] != "left":
             form = _bind_form(ch, linked, portal, known_ids, clients, session, active)
 
-        out.append(f'<div class="chat-block">{head}{body}{form}</div>')
+        out.append(f'<div class="chat-block">{head}'
+                   f'<div class="chat-body">{"".join(rows)}{form}</div></div>')
 
     err = ui.banner(esc_html(portal_error), "warn") if portal_error else ""
     tail = ("" if is_admin else
             ui.hint("Управлять привязками может администратор портала."))
+    note = (f'<span class="panel-note tnum">чатов: {len(chats)} · '
+            f"привязок: {len(bindings)}</span>")
     return err + ui.panel("Чаты и проекты", "".join(out), icon_name="chat",
-                          flush=True, footer_html=tail)
+                          flush=True, actions_html=note, footer_html=tail)
+
+
+def _project_row(project: str, client: str, actions_html: str = "") -> str:
+    """Строка проекта под чатом.
+
+    Название и клиент — блочными элементами, а не спанами: спаны здесь однажды
+    склеились в «Devon SD BOTклиент Devon SD BOT» без единого пробела, потому
+    что стили писались под блоки, а разметка была инлайновой.
+    """
+    act = f'<div class="item-a">{actions_html}</div>' if actions_html else ""
+    return (f'<div class="proj"><div class="proj-m">'
+            f'<span class="proj-ico">{ui.icon("folder", 15)}</span>'
+            f'<div><div class="proj-t">{esc_html(project)}</div>'
+            f'<div class="proj-s">клиент {esc_html(client)}</div></div></div>{act}</div>')
 
 
 def _bind_form(chat: asyncpg.Record, linked: list[asyncpg.Record],
@@ -624,52 +633,67 @@ def _bind_form(chat: asyncpg.Record, linked: list[asyncpg.Record],
                clients: list[asyncpg.Record], session: str, active: str) -> str:
     """Привязка чата к проекту портала.
 
-    Клиент выбирается ЯВНО и всегда. Раньше он подставлялся из существующих привязок
-    чата, из-за чего новый проект молча уезжал под чужого клиента.
+    Свёрнута за `<details>`: постоянно раскрытая на каждом чате, форма занимала
+    больше места, чем сами чаты, и вкладка читалась как простыня из селектов.
+    У чата без привязок форма раскрыта сразу — привязка и есть следующий шаг.
 
-    Форма была строкой из двух узких `select` и кнопки, сжимавшейся в кашу на
-    любой ширине меньше десктопной. Теперь это сетка с настоящими подписями:
-    подпись над полем, а не плейсхолдер внутри, — иначе выбранное значение
-    стирает вопрос, на который отвечает.
+    Клиент выбирается только у чата БЕЗ привязок. Дальше он фиксирован: один
+    чат обслуживает одного клиента, и селект предлагал бы выбор между
+    «правильно» и «ошибка сервера». Явность выбора при этом сохранена — просто
+    выбор делается один раз, первой привязкой.
     """
     bound = {int(b["b24_group_id"]) for b in linked if b["b24_group_id"]}
     available = [g for g in portal if g["id"] not in bound]
     if not available:
-        return (f'<div class="panel-b">'
-                f"{ui.hint('Все доступные вам проекты портала уже привязаны к этому чату.')}"
-                f"</div>")
+        return ui.hint("Все доступные вам проекты портала уже привязаны "
+                       "к этому чату.")
 
     options = "".join(
         f'<option value="{esc_attr(g["id"])}">{esc_html(g["name"])}'
         f'{"" if g["id"] in known_ids else " — новый"}</option>'
         for g in available)
-    client_opts = "".join(
-        f'<option value="{esc_attr(c["id"])}">{esc_html(c["name"])}</option>'
-        for c in clients)
     cid = esc_attr(chat["id"])
-    note = ui.hint("Один чат обслуживает одного клиента: все проекты этого чата "
-                   "должны принадлежать ему.")
+
+    project_field = (
+        f'<div class="f-group">'
+        f'<label class="f-l" for="proj-{cid}">Проект портала</label>'
+        f'<select class="input" id="proj-{cid}" name="b24_group_id">{options}</select>'
+        f"</div>")
+
+    if linked:
+        fixed = linked[0]
+        client_ctl = (f'<input type="hidden" name="client_id" '
+                      f'value="{esc_attr(fixed["client_id"])}">')
+        fields = project_field
+        note = ui.hint(f"Проект привяжется к клиенту «{fixed['client']}»: он у "
+                       f"этого чата уже есть, а второго быть не может.")
+    else:
+        client_opts = "".join(
+            f'<option value="{esc_attr(c["id"])}">{esc_html(c["name"])}</option>'
+            for c in clients)
+        client_ctl = ""
+        fields = (
+            f'<div class="grid2">{project_field}'
+            f'<div class="f-group">'
+            f'<label class="f-l" for="cl-{cid}">Клиент</label>'
+            f'<select class="input" id="cl-{cid}" name="client_id">'
+            f'<option value="0">Создать по названию проекта</option>{client_opts}</select>'
+            f"</div></div>")
+        note = ui.hint("Один чат обслуживает одного клиента: все проекты этого "
+                       "чата должны принадлежать ему.")
 
     return (
-        f'<div class="panel-b" style="border-top:1px solid var(--border)">'
+        f'<details class="bind"{"" if linked else " open"}>'
+        f'<summary>{ui.icon("plus", 15)}Привязать проект</summary>'
         f'<form method="post" action="/b24/app/chat">'
         f'<input type="hidden" name="session" value="{esc_attr(session)}">'
         f'<input type="hidden" name="action" value="bind">'
         f'<input type="hidden" name="tab" value="{esc_attr(active)}">'
         f'<input type="hidden" name="chat_ref" value="{cid}">'
-        f'<div class="grid2">'
-        f'<div class="f-group">'
-        f'<label class="f-l" for="proj-{cid}">Проект портала</label>'
-        f'<select class="input" id="proj-{cid}" name="b24_group_id">{options}</select>'
-        f"</div>"
-        f'<div class="f-group">'
-        f'<label class="f-l" for="cl-{cid}">Клиент</label>'
-        f'<select class="input" id="cl-{cid}" name="client_id">'
-        f'<option value="0">Создать по названию проекта</option>{client_opts}</select>'
-        f"</div></div>"
+        f"{client_ctl}{fields}"
         f'<div class="btn-row" style="margin-top:4px">'
-        f'<button class="btn" type="submit">{ui.icon("plus", 15)}Привязать чат</button>'
-        f"</div></form>{note}</div>")
+        f'<button class="btn" type="submit">Привязать</button></div>'
+        f"</form>{note}</details>")
 
 
 async def _link_state(tenant_id: int, b24_user_id: int) -> asyncpg.Record | None:
@@ -816,8 +840,8 @@ def _bot_panel(bot: asyncpg.Record | None, is_admin: bool, session: str,
     replace = ""
     if is_admin:
         replace = (
-            f'<details><summary class="hint" style="cursor:pointer">'
-            f"Заменить бота другим</summary>"
+            f'<details class="bind">'
+            f'<summary>{ui.icon("refresh", 15)}Заменить бота другим</summary>'
             f'<form method="post" action="/b24/app/bot" style="margin-top:12px">'
             f'<input type="hidden" name="session" value="{esc_attr(session)}">'
             f'<input type="hidden" name="action" value="save">'
