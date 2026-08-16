@@ -161,9 +161,13 @@ def parse_options(text: str) -> list[dict[str, str]]:
     return out
 
 
+NEW_FIELD = "__new__"
+
+
 def _field_select(fields: list[b24_fields.FieldRef], current: str | None,
                   name: str = "b24_field") -> str:
-    opts = ["<option value=''>— в тело задачи —</option>"]
+    opts = ["<option value=''>— в тело задачи —</option>",
+            f"<option value='{NEW_FIELD}'>➕ создать новое поле в Битрикс24</option>"]
     for f in fields:
         sel = " selected" if f.name == current else ""
         mark = " (свой)" if f.name.startswith("UF_") else ""
@@ -214,6 +218,9 @@ def _question_form(session: str, template_id: int, q: asyncpg.Record | None,
         f"<option value='choice'{' selected' if kind == 'choice' else ''}>"
         f"выпадающий список</option></select></label>"
         f"<label>Поле задачи{_field_select(fields, b24_field)}</label>"
+        f"<label>Название нового поля"
+        f"<input type='text' name='new_field_title' maxlength='60' "
+        f"placeholder='заполняется только для «создать новое»'></label>"
         f"<label>Обязательный<select name='required'>"
         f"<option value='0'{'' if required else ' selected'}>нет</option>"
         f"<option value='1'{' selected' if required else ''}>да</option>"
@@ -225,6 +232,10 @@ def _question_form(session: str, template_id: int, q: asyncpg.Record | None,
         f"{_values_hint(fields, b24_field)}"
         f"<div class='hint'>Варианты нужны только для выпадающего списка. "
         f"В чате каждый вариант станет кнопкой под вопросом.</div>"
+        f"<div class='hint'>«Создать новое поле» заводит поле на портале: "
+        f"для выпадающего списка — список с этими же вариантами, для текста — "
+        f"строку. <b>Поле появится у всех задач портала</b>, а не только "
+        f"в этом проекте: у задач Битрикс24 пользовательские поля общие.</div>"
         f"<button type='submit'>{'Сохранить' if qid else 'Добавить вопрос'}</button>"
         f"</form>")
 
@@ -340,6 +351,7 @@ async def survey_action(session: str = Form(...), action: str = Form("open"),
                         text: str = Form(""), answer_kind: str = Form("text"),
                         options: str = Form(""), required: str = Form("0"),
                         b24_field: str = Form(""), title: str = Form(""),
+                        new_field_title: str = Form(""),
                         direction: str = Form("up")) -> HTMLResponse:
     from b24bot.api import app_ui
 
@@ -369,7 +381,7 @@ async def survey_action(session: str = Form(...), action: str = Form("open"),
             tenant_id, actor, action, template_id, question_id,
             text=text, answer_kind=answer_kind, options=options,
             required=required == "1", b24_field=b24_field.strip(),
-            title=title, direction=direction)
+            new_field_title=new_field_title, title=title, direction=direction)
     except PermissionError:
         message, kind = "Этот набор принадлежит другому теннанту.", "err"
     except LookupError:
@@ -386,6 +398,7 @@ async def survey_action(session: str = Form(...), action: str = Form("open"),
 async def _apply(tenant_id: int, actor: int, action: str, template_id: int,
                  question_id: int, *, text: str, answer_kind: str, options: str,
                  required: bool, b24_field: str, title: str,
+                 new_field_title: str = "",
                  direction: str) -> tuple[int, int, str, str]:
     """Возвращает (набор, редактируемый вопрос, сообщение, вид сообщения)."""
     if action == "open":
@@ -418,7 +431,7 @@ async def _apply(tenant_id: int, actor: int, action: str, template_id: int,
         message, kind = await _save_question(
             tenant_id, actor, editable, question_id, text=text,
             answer_kind=answer_kind, options=options, required=required,
-            b24_field=b24_field)
+            b24_field=b24_field, new_field_title=new_field_title)
         if forked:
             message += " Набор скопирован вам — системный не тронут."
         return editable, 0, message, kind
@@ -455,8 +468,8 @@ async def _twin(conn: asyncpg.Connection, question_id: int, new_template: int) -
 
 async def _save_question(tenant_id: int, actor: int, template_id: int,
                          question_id: int, *, text: str, answer_kind: str,
-                         options: str, required: bool,
-                         b24_field: str) -> tuple[str, str]:
+                         options: str, required: bool, b24_field: str,
+                         new_field_title: str = "") -> tuple[str, str]:
     clean = text.strip()
     if not clean:
         return "Текст вопроса пустой.", "err"
@@ -467,13 +480,25 @@ async def _save_question(tenant_id: int, actor: int, template_id: int,
         return ("Для выпадающего списка нужен хотя бы один вариант — "
                 "иначе в чате не будет ни одной кнопки."), "err"
 
-    field_type = None
-    if b24_field:
+    field_type: str | None = None
+    note, warning = "", ""
+
+    if b24_field == NEW_FIELD:
+        b24_field, field_type, parsed, note, failure = await _create_field(
+            tenant_id, actor, new_field_title or clean, as_list=kind == "choice",
+            options=parsed)
+        if failure:
+            return failure, "err"
+    elif b24_field:
         fields, error = await portal_fields(tenant_id, actor)
         ref = next((f for f in fields if f.name == b24_field), None)
         if ref is None:
             return (error or f"Поле {esc_html(b24_field)} недоступно для привязки."), "err"
         field_type = ref.type
+        if kind == "choice" and b24_field.startswith("UF_"):
+            # Настройщик мог дописать вариант, которого в поле нет. Без сверки
+            # ответ по нему ушёл бы в 0 — Битрикс принимает подпись молча.
+            parsed, warning = await _sync_options(tenant_id, actor, b24_field, parsed)
 
     async with pool().acquire() as conn, conn.transaction():
         if question_id:
@@ -505,7 +530,9 @@ async def _save_question(tenant_id: int, actor: int, template_id: int,
                                "тип": kind})
     where = (f" Ответ уйдёт в поле {esc_html(b24_field)}." if b24_field
              else " Ответ уйдёт в тело задачи.")
-    return f"Вопрос {what}.{where}", "ok"
+    # Создание поля — не предупреждение, а результат: сообщение остаётся зелёным.
+    # Жёлтым помечается только сверка вариантов, которая нашла расхождение.
+    return f"Вопрос {what}.{where}{note}{warning}", ("warn" if warning else "ok")
 
 
 async def _free_code(conn: asyncpg.Connection, template_id: int, text: str) -> str:
@@ -540,3 +567,49 @@ async def _move(conn: asyncpg.Connection, tenant_id: int, template_id: int,
     for position, qid in enumerate(ids):
         await conn.execute(
             "UPDATE survey_questions SET sort = $2 WHERE id = $1", qid, position * 10)
+
+
+async def _create_field(tenant_id: int, actor: int, label: str, *, as_list: bool,
+                        options: list[dict[str, str]]
+                        ) -> tuple[str, str | None, list[dict[str, str]], str, str]:
+    """Завести поле на портале и привязать к нему вопрос.
+
+    Возвращает `(имя, тип, варианты, примечание, отказ)`. Непустой отказ означает,
+    что сохранять вопрос нельзя: привязать его не к чему.
+    """
+    try:
+        client = await access.client_for_user(tenant_id, actor)
+        async with client:
+            name, field_type, mapped = await b24_fields.create_user_field(
+                client, label, as_list=as_list, options=options)
+    except b24_fields.FieldCreateError as exc:
+        return "", None, options, "", str(exc)
+    except errors.B24AccessDenied:
+        return "", None, options, "", ("Битрикс24 не разрешил создавать поля задач "
+                                       "под вашей учётной записью.")
+    except Exception as exc:
+        log.warning("создание поля не удалось: %s", str(exc)[:200])
+        return "", None, options, "", "Не удалось создать поле в Битрикс24."
+
+    await audit.record(tenant_id, "b24.userfield.create", actor_id=actor,
+                       target=f"task_field:{name}",
+                       detail={"название": label, "тип": field_type,
+                               "вариантов": len(mapped)})
+    note = (f" Создано поле «{esc_html(label)}» ({esc_html(name)}) — "
+            f"оно появилось у всех задач портала.")
+    return name, field_type, mapped or options, note, ""
+
+
+async def _sync_options(tenant_id: int, actor: int, field_name: str,
+                        options: list[dict[str, str]]
+                        ) -> tuple[list[dict[str, str]], str]:
+    try:
+        client = await access.client_for_user(tenant_id, actor)
+        async with client:
+            mapped, warning = await b24_fields.sync_enum_options(
+                client, field_name, options)
+    except Exception as exc:
+        log.warning("сверка вариантов поля %s не удалась: %s",
+                    field_name, str(exc)[:150])
+        return options, " Варианты списка не сверены с полем на портале."
+    return mapped, (f" {warning}" if warning else "")
