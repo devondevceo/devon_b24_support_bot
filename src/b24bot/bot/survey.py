@@ -16,16 +16,18 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from b24bot.core.text import esc_html
+from b24bot.b24 import fields as b24_fields
+from b24bot.core.text import esc_bbcode, esc_html
 from b24bot.db.pool import pool
 
 log = logging.getLogger(__name__)
 
 TTL = timedelta(minutes=30)
+TITLE_MAX = 200   # Битрикс режет молча, лучше обрезать самим
 
 
 @dataclass
@@ -33,6 +35,18 @@ class Question:
     code: str
     text: str
     required: bool
+    kind: str = "text"                       # text | choice
+    options: list[dict[str, str]] = field(default_factory=list)
+    b24_field: str | None = None             # None -> ответ уходит в тело задачи
+    b24_field_type: str | None = None
+
+    def label_for(self, value: str) -> str:
+        """Подпись варианта. В тело задачи и в превью идёт то, что видел человек,
+        а не служебное значение поля Битрикса."""
+        for o in self.options:
+            if o.get("value") == value:
+                return str(o.get("label") or value)
+        return value
 
 
 @dataclass
@@ -81,10 +95,21 @@ async def questions(tenant_id: int, template_id: int) -> list[Question]:
     """
     async with pool().acquire() as conn:
         rows = await conn.fetch(
-            "SELECT code, text, required FROM survey_questions "
+            "SELECT code, text, required, answer_kind, options, b24_field, "
+            "b24_field_type FROM survey_questions "
             "WHERE template_id = $1 AND (tenant_id = $2 OR tenant_id IS NULL) "
-            "ORDER BY sort", template_id, tenant_id)
-    return [Question(r["code"], r["text"], r["required"]) for r in rows]
+            "ORDER BY sort, id", template_id, tenant_id)
+    return [_question(r) for r in rows]
+
+
+def _question(row: Any) -> Question:
+    raw = row["options"]
+    options = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    return Question(
+        row["code"], row["text"], row["required"],
+        kind=row["answer_kind"] or "text",
+        options=[o for o in options if isinstance(o, dict)],
+        b24_field=row["b24_field"], b24_field_type=row["b24_field_type"])
 
 
 async def start(tenant_id: int, chat_ref: int, thread_id: int | None,
@@ -166,21 +191,83 @@ async def expire_stale() -> int:
     return len(rows)
 
 
-def assemble(items: list[Question], answers: dict[str, str]) -> tuple[str, str]:
-    """Собрать заголовок и описание из ответов.
+@dataclass
+class Assembled:
+    title: str
+    description: str
+    fields: dict[str, Any]
+    """Поля задачи, собранные из привязанных вопросов."""
+    rejected: list[str]
+    """Ответы, которые поле не приняло. Они ушли в тело — терять нельзя."""
 
-    Заголовок — ответ на первый вопрос: он же и есть суть обращения. Описание —
-    пары «вопрос → ответ», так исполнителю видно, что именно спрашивали.
+
+def assemble(items: list[Question], answers: dict[str, str], *,
+             tz_offset_hours: int = 3) -> Assembled:
+    """Разложить ответы: привязанные — в поля задачи, остальные — в тело.
+
+    Заголовок — ответ на первый непустой вопрос без привязки: он и есть суть
+    обращения. Если вопрос привязан к `TITLE`, заголовок берётся оттуда.
+
+    Ответ, который поле не приняло (человек написал «когда-нибудь» в поле срока),
+    **не теряется**: он уходит в тело задачи, а в конце описания появляется
+    честная строка о том, что именно не удалось разложить по полям. Молча
+    выбросить написанное человеком нельзя — он считает, что его услышали.
     """
-    first = next((answers.get(q.code) for q in items if answers.get(q.code)), "")
-    title = first.strip().splitlines()[0] if first else "Обращение из Telegram"
+    fields: dict[str, Any] = {}
+    rejected: list[str] = []
+    body: list[Question] = []
+    title = ""
+
+    for q in items:
+        raw = (answers.get(q.code) or "").strip()
+        # Пробелы — это не ответ. Без этой проверки пустая строка попадала в тело
+        # пустым заголовком раздела, а `splitlines()[0]` падал на ней с IndexError.
+        if not raw:
+            continue
+        if not q.b24_field:
+            body.append(q)
+            continue
+
+        try:
+            value = b24_fields.to_b24(q.b24_field_type or "string", raw,
+                                      tz_offset_hours=tz_offset_hours)
+        except b24_fields.ConversionError as exc:
+            log.info("ответ на «%s» не лёг в поле %s: %s", q.code, q.b24_field, exc)
+            rejected.append(f"{q.text}: {exc}")
+            body.append(q)
+            continue
+
+        if q.b24_field == "TITLE":
+            title = str(value).strip().splitlines()[0]
+            continue
+        if q.b24_field == "TAGS":
+            tags = fields.setdefault("TAGS", [])
+            tags += value if isinstance(value, list) else [value]
+            continue
+        fields[q.b24_field] = value
+        # Значение поля дублируем в тело, только когда человек видел подпись:
+        # «Высокий» в описании полезен, «2» — мусор.
+        if q.kind == "choice" and q.label_for(raw) != str(value):
+            body.append(q)
+
+    if not title:
+        first = next((answers[q.code].strip() for q in body
+                      if (answers.get(q.code) or "").strip()), "")
+        lines = first.splitlines()
+        title = lines[0] if lines else "Обращение из Telegram"
+    # И-6 без исключений: заголовок тоже подстановка, и квадратные скобки в нём
+    # Битрикс съедает так же, как в описании.
+    title = esc_bbcode(title)[:TITLE_MAX]
 
     lines = []
-    for q in items:
-        value = answers.get(q.code)
-        if value:
-            lines.append(f"[b]{q.text}[/b]\n{value}")
-    return title, "\n\n".join(lines)
+    for q in body:
+        raw = (answers.get(q.code) or "").strip()
+        shown = q.label_for(raw) if q.kind == "choice" else raw
+        lines.append(f"[b]{esc_bbcode(q.text)}[/b]\n{esc_bbcode(shown)}")
+    if rejected:
+        lines.append("[b]Не удалось разобрать как поле задачи[/b]\n"
+                     + "\n".join(esc_bbcode(r) for r in rejected))
+    return Assembled(title, "\n\n".join(lines), fields, rejected)
 
 
 def render_preview(title: str, items: list[Question], answers: dict[str, str],
@@ -202,8 +289,12 @@ def progress(step: int, total: int) -> str:
 
 def question_text(q: Question, step: int, total: int) -> str:
     tail = "" if q.required else "\n<i>Можно пропустить.</i>"
+    # У выпадающего списка ответ — это кнопка. Просить реплай там незачем
+    # и вредно: человек начнёт печатать вариант руками и промахнётся по подписи.
+    how = ("Выберите вариант кнопкой ниже." if q.kind == "choice"
+           else "Ответьте на это сообщение.")
     return (f"{progress(step, total)}\n\n<b>{esc_html(q.text)}</b>{tail}\n\n"
-            f"<i>Ответьте на это сообщение.</i>")
+            f"<i>{how}</i>")
 
 
 def answers_as_dict(session: Session) -> dict[str, Any]:

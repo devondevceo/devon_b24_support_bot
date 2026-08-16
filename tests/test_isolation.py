@@ -342,3 +342,104 @@ async def test_audit_of_one_tenant_is_invisible_to_another(db: object) -> None:
     await audit.record(w["tenant_b"], "role.grant", actor_id=7, target="member:7")
     assert await audit.recent(w["tenant_a"]) == []
     assert len(await audit.recent(w["tenant_b"])) == 1
+
+
+# ------------------------------------------------------- конструктор опросника
+async def _template(conn: object, tenant_id: int | None, code: str,
+                    questions: int = 2) -> int:
+    tid = await conn.fetchval(  # type: ignore[attr-defined]
+        "INSERT INTO survey_templates (tenant_id, code, title, sort, is_active) "
+        "VALUES ($1,$2,$3,10,true) RETURNING id", tenant_id, code, f"Набор {code}")
+    for i in range(questions):
+        await conn.execute(  # type: ignore[attr-defined]
+            "INSERT INTO survey_questions (tenant_id, template_id, sort, code, text) "
+            "VALUES ($1,$2,$3,$4,$5)",
+            tenant_id, tid, i * 10, f"q{i}", f"Вопрос {i}")
+    return int(tid)
+
+
+async def test_system_template_is_forked_not_edited(db: object) -> None:
+    """Системный набор общий на всю инсталляцию.
+
+    Правка одного теннанта меняла бы опросник всем остальным — поэтому первое
+    изменение копирует набор себе вместе с вопросами.
+    """
+    from b24bot.api.app_survey import fork_if_system, questions_of
+
+    w = await _fixture_world(db)
+    system = await _template(db, None, f"sys_{uuid.uuid4().hex[:6]}", questions=3)
+
+    mine = await fork_if_system(w["tenant_a"], system)
+    assert mine != system
+
+    owner = await db.fetchval(  # type: ignore[attr-defined]
+        "SELECT tenant_id FROM survey_templates WHERE id = $1", mine)
+    assert owner == w["tenant_a"]
+    assert len(await questions_of(w["tenant_a"], mine)) == 3
+    # Системный остался нетронутым — им пользуются остальные теннанты.
+    assert await db.fetchval(  # type: ignore[attr-defined]
+        "SELECT tenant_id FROM survey_templates WHERE id = $1", system) is None
+
+
+async def test_fork_is_idempotent(db: object) -> None:
+    """Второе нажатие «изменить» не должно плодить копии одного набора."""
+    from b24bot.api.app_survey import fork_if_system
+
+    w = await _fixture_world(db)
+    system = await _template(db, None, f"sys_{uuid.uuid4().hex[:6]}")
+    first = await fork_if_system(w["tenant_a"], system)
+    assert await fork_if_system(w["tenant_a"], system) == first
+    assert await fork_if_system(w["tenant_a"], first) == first
+
+
+async def test_foreign_template_cannot_be_edited(db: object) -> None:
+    """Номер набора в форме подставляется руками — проверка обязана быть на сервере."""
+    from b24bot.api.app_survey import fork_if_system
+
+    w = await _fixture_world(db)
+    theirs = await _template(db, w["tenant_b"], "chuzhoy")
+
+    with pytest.raises(PermissionError):
+        await fork_if_system(w["tenant_a"], theirs)
+
+
+async def test_questions_of_does_not_leak_across_tenants(db: object) -> None:
+    from b24bot.api.app_survey import questions_of
+
+    w = await _fixture_world(db)
+    theirs = await _template(db, w["tenant_b"], "chuzhoy", questions=4)
+
+    assert await questions_of(w["tenant_a"], theirs) == []
+    assert len(await questions_of(w["tenant_b"], theirs)) == 4
+
+
+async def test_bot_prefers_own_template_over_the_system_one(db: object) -> None:
+    """Ради этого форк и сохраняет `code`: копия сразу перекрывает системный набор."""
+    from b24bot.api.app_survey import fork_if_system
+    from b24bot.bot.survey import categories
+
+    w = await _fixture_world(db)
+    code = f"sys_{uuid.uuid4().hex[:6]}"
+    system = await _template(db, None, code)
+    mine = await fork_if_system(w["tenant_a"], system)
+
+    ids_a = [i for i, _ in await categories(w["tenant_a"])]
+    ids_b = [i for i, _ in await categories(w["tenant_b"])]
+    assert mine in ids_a and system not in ids_a
+    assert system in ids_b and mine not in ids_b
+
+
+async def test_question_order_is_repaired_on_move(db: object) -> None:
+    """У скопированных вопросов позиции могут совпасть — обмен двух одинаковых
+    значений не менял бы ничего, поэтому порядок пересчитывается целиком."""
+    from b24bot.api.app_survey import _move, questions_of
+
+    w = await _fixture_world(db)
+    tid = await _template(db, w["tenant_a"], "poryadok", questions=3)
+    await db.execute(  # type: ignore[attr-defined]
+        "UPDATE survey_questions SET sort = 0 WHERE template_id = $1", tid)
+
+    before = [q["id"] for q in await questions_of(w["tenant_a"], tid)]
+    await _move(db, w["tenant_a"], tid, before[2], "up")
+    after = [q["id"] for q in await questions_of(w["tenant_a"], tid)]
+    assert after == [before[0], before[2], before[1]]

@@ -90,6 +90,21 @@ STYLE = """
  .bind select{padding:7px 9px;border:1px solid #d5d7db;border-radius:6px;font-size:13px;
               max-width:260px}
  .bind button{margin:0;padding:8px 16px}
+ .tabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+ .tab{background:#eaecef;color:#1a1a1a;border:0;border-radius:6px;padding:6px 12px;
+      font-size:13px;cursor:pointer;margin:0}
+ .tab.on{background:#2066b0;color:#fff;display:inline-block}
+ .q{padding:9px 0;border-bottom:1px solid #f2f3f5} .q:last-of-type{border-bottom:0}
+ .qrow{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+ .tools{display:flex;gap:8px;white-space:nowrap;padding-top:2px}
+ .opts{font-size:12px;margin-top:3px}
+ .qform label{display:block;font-size:12px;color:#828b95;margin:0 0 10px}
+ .qform .bind label{display:flex}
+ .qhead{font-weight:600;font-size:14px;margin:0 0 12px}
+ textarea{width:100%;padding:9px 11px;border:1px solid #d5d7db;border-radius:6px;
+          font:13px/1.45 monospace;box-sizing:border-box;resize:vertical}
+ select{padding:7px 9px;border:1px solid #d5d7db;border-radius:6px;font-size:13px;
+        max-width:100%}
 """
 
 
@@ -202,6 +217,7 @@ async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
     can_roles = await can_manage_admins(int(tenant["id"]), b24_user_id, is_admin)
     my_role = await access.role_of_b24_user(int(tenant["id"]), b24_user_id)
     admins_block = await _admins_block(tenant, b24_user_id, can_roles, session)
+    survey_block = await _survey_block(int(tenant["id"]), can_roles, session)
 
     admin_note = "" if is_admin else (
         "<div class='hint'>Вы вошли как обычный пользователь. Настройки доступны "
@@ -217,6 +233,7 @@ async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
         f"<div class='card'><h2>Telegram-бот</h2>{bot_form}</div>"
         f"<div class='card'><h2>Чаты</h2>{chats_block}</div>"
         f"<div class='card'><h2>Администраторы</h2>{admins_block}</div>"
+        f"<div class='card'><h2>Опросник</h2>{survey_block}</div>"
         f"<div class='card'><h2>Вы</h2>"
         f"{_row('Пользователь Битрикс24', f'<code>{b24_user_id}</code>')}"
         f"{_row('Права', rights)}"
@@ -954,3 +971,37 @@ async def _apply_role(tenant_id: int, actor_b24_id: int, action: str,
 
     return ((f"{esc_html(who)} — теперь администратор теннанта." if action == "grant"
              else f"С {esc_html(who)} сняты права администратора."), "ok")
+
+
+async def _survey_block(tenant_id: int, can_manage: bool, session: str) -> str:
+    """Короткая сводка по наборам вопросов плюс вход в конструктор."""
+    from b24bot.api import app_survey
+
+    templates = await app_survey.templates_of(tenant_id)
+    own = sum(1 for t in templates if t["tenant_id"] is not None)
+
+    rows = []
+    for t in templates:
+        mark = ("<span class='ok'>свой</span>" if t["tenant_id"] is not None
+                else "<span class='muted'>системный</span>")
+        rows.append(f"<div class='proj'><span><b>{esc_html(t['title'])}</b>"
+                    f"<span class='muted'> · вопросов: {t['questions']}</span></span>"
+                    f"{mark}</div>")
+
+    if not can_manage:
+        return "".join(rows) + ("<div class='hint'>Настраивать опросник может "
+                                "администратор теннанта.</div>")
+
+    open_form = (
+        "<form method='post' action='/b24/app/survey'>"
+        f"<input type='hidden' name='session' value='{esc_attr(session)}'>"
+        "<input type='hidden' name='action' value='open'>"
+        f"<input type='hidden' name='template_id' "
+        f"value='{templates[0]['id'] if templates else 0}'>"
+        "<button type='submit'>Настроить опросник</button></form>")
+    hint = ("<div class='hint'>Ответы на вопросы, связанные с полями задачи, "
+            "уходят в эти поля. Остальные — в тело задачи. "
+            + (f"Своих наборов: {own}." if own else
+               "Пока все наборы системные: первое изменение скопирует набор вам.")
+            + "</div>")
+    return "".join(rows) + open_form + hint
