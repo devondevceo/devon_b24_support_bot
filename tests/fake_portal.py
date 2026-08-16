@@ -43,6 +43,22 @@ def task(task_id: int, *, status: int = 2, group_id: int = 33, stage_id: int = 3
     }
 
 
+def kanban_stages(*items: tuple[int, str], group_id: int = 33) -> dict[str, dict[str, str]]:
+    """Ответ `task.stages.get`: объект, ключ — id стадии (docs/00-portal-facts.md §3.2).
+
+    Умолчание — те самые три колонки живого портала, на которых снят факт-файл.
+    """
+    items = items or ((333, "Новые"), (335, "Выполняются"), (337, "Сделаны"))
+    out: dict[str, dict[str, str]] = {}
+    for i, (stage_id, title) in enumerate(items):
+        out[str(stage_id)] = {
+            "ID": str(stage_id), "TITLE": title, "SORT": str(100 + i * 100),
+            "SYSTEM_TYPE": "NEW" if i == 0 else "",
+            "COLOR": "00C4FB", "ENTITY_ID": str(group_id), "ENTITY_TYPE": "G",
+        }
+    return out
+
+
 class FakePortal:
     """Подставляется в B24Client как httpx-транспорт.
 
@@ -53,8 +69,11 @@ class FakePortal:
 
     def __init__(self, *, tasks: int = 0, fail_times: int = 0,
                  fail_code: str = "QUERY_LIMIT_EXCEEDED", fail_status: int = 503,
-                 operating: float = 0.0) -> None:
+                 operating: float = 0.0, stages: Any = None) -> None:
         self.calls: list[tuple[str, dict]] = []
+        # Публичное поле: колонки канбана меняет владелец проекта, и тесты
+        # синхронизации меняют их между вызовами ровно так же.
+        self.stages: Any = kanban_stages() if stages is None else stages
         self._tasks = [task(100 + i * 2) for i in range(tasks)]
         self._fail_left = fail_times
         self._fail_code = fail_code
@@ -90,6 +109,8 @@ class FakePortal:
         if method == "tasks.task.get":
             tid = int(params.get("taskId", 0))
             return self._ok({"task": task(tid)})
+        if method == "task.stages.get":
+            return self._ok(self.stages)
         if method == "user.current":
             return self._ok({"ID": "1", "NAME": "Сергей", "LAST_NAME": "Крищунс"})
         return self._ok({"ok": True, "method": method})
