@@ -564,7 +564,7 @@ async def _ensure_project(tenant_id: int, b24_user_id: int, b24_group_id: int,
     если у него нет доступа к группе, импорт не состоится, и это правильно.
     """
     from b24bot.b24 import errors
-    from b24bot.domain import access
+    from b24bot.domain import access, sync
 
     async with pool().acquire() as conn:
         row = await conn.fetchrow(
@@ -579,7 +579,7 @@ async def _ensure_project(tenant_id: int, b24_user_id: int, b24_group_id: int,
         async with client:
             groups = await client.call("sonet_group.get",
                                        {"FILTER": {"ID": b24_group_id}})
-            stages = await client.call("task.stages.get", {"entityId": b24_group_id})
+            raw_stages = await client.call("task.stages.get", {"entityId": b24_group_id})
     except errors.B24Error as exc:
         return 0, "", "", f"Битрикс24 отказал: {exc.description or exc.code}"
     except Exception as exc:
@@ -618,14 +618,8 @@ async def _ensure_project(tenant_id: int, b24_user_id: int, b24_group_id: int,
             group.get("IS_EXTRANET") == "Y",
             int(group.get("OWNER_ID") or 0) or None)
 
-        for st in (stages or {}).values():
-            await conn.execute(
-                "INSERT INTO project_stages (tenant_id, project_id, b24_stage_id, title, "
-                "sort, system_type, color) VALUES ($1,$2,$3,$4,$5,$6,$7) "
-                "ON CONFLICT (tenant_id, project_id, b24_stage_id) DO UPDATE "
-                "SET title = EXCLUDED.title, synced_at = now()",
-                tenant_id, pid, int(st["ID"]), st["TITLE"], int(st.get("SORT") or 0),
-                st.get("SYSTEM_TYPE"), st.get("COLOR"))
+        await sync.apply_stages(conn, tenant_id, int(pid),
+                                sync.parse_stages(raw_stages, b24_group_id))
 
     log.info("импортирован проект %s «%s» для теннанта %s", b24_group_id, name, tenant_id)
     return int(pid), name, client_row["name"], ""

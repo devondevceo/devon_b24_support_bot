@@ -20,7 +20,7 @@ from b24bot.bot import (
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access, audit
+from b24bot.domain import access, audit, sync
 from b24bot.domain import events as b24_events
 from b24bot.domain.context import (
     ChatContext,
@@ -159,7 +159,7 @@ async def _import_project(tenant_id: int, b24_user_id: int, b24_group_id: int,
         return int(existing)
 
     name = fallback_name
-    stages: dict[str, Any] = {}
+    stages: list[sync.Stage] = []
     try:
         client = await access.client_for_user(tenant_id, b24_user_id)
         async with client:
@@ -167,8 +167,8 @@ async def _import_project(tenant_id: int, b24_user_id: int, b24_group_id: int,
                                        {"FILTER": {"ID": b24_group_id}})
             if groups:
                 name = str(groups[0].get("NAME") or name)
-            stages = await client.call("task.stages.get",
-                                       {"entityId": b24_group_id}) or {}
+            raw = await client.call("task.stages.get", {"entityId": b24_group_id})
+            stages = sync.parse_stages(raw, b24_group_id)
     except (NeedsReauth, errors.B24Error) as exc:
         log.warning("импорт проекта %s: %s", b24_group_id, exc)
         if not name:
@@ -185,14 +185,7 @@ async def _import_project(tenant_id: int, b24_user_id: int, b24_group_id: int,
             "ON CONFLICT (tenant_id, b24_group_id) DO UPDATE "
             "SET name = EXCLUDED.name, status = 'active' RETURNING id",
             tenant_id, client_row["id"], b24_group_id, name)
-        for st in stages.values():
-            await conn.execute(
-                "INSERT INTO project_stages (tenant_id, project_id, b24_stage_id, "
-                "title, sort, system_type, color) VALUES ($1,$2,$3,$4,$5,$6,$7) "
-                "ON CONFLICT (tenant_id, project_id, b24_stage_id) DO UPDATE "
-                "SET title = EXCLUDED.title, synced_at = now()",
-                tenant_id, pid, int(st["ID"]), st["TITLE"], int(st.get("SORT") or 0),
-                st.get("SYSTEM_TYPE"), st.get("COLOR"))
+        await sync.apply_stages(conn, tenant_id, int(pid), stages)
     return int(pid)
 
 
