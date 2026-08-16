@@ -12,7 +12,7 @@ from b24bot.bot import comments, keyboards, survey, task_create, texts, views
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access
+from b24bot.domain import access, audit
 from b24bot.domain import events as b24_events
 from b24bot.domain.context import (
     ChatContext,
@@ -828,6 +828,12 @@ async def _bind_commands(ctx: ChatContext, name: str, tg_user_id: int) -> Reply:
     if b24_user_id is None:
         return Reply(texts.MSG_NOT_LINKED)
 
+    # Матрица прав (docs/40-security.md §3): привязка чата — действие админа теннанта.
+    # Привязка решает, чьи задачи видны в чате, поэтому «любой сопоставленный» здесь
+    # слишком широко: сотрудник клиента тоже сопоставлен.
+    if not await access.is_tenant_admin(tenant_id, tg_user_id):
+        return Reply(texts.MSG_NEED_TENANT_ADMIN)
+
     if name == "unbind":
         # Отвязывать можно только то, что привязано.
         async with pool().acquire() as conn:
@@ -1082,6 +1088,11 @@ async def _apply_bind(ctx: ChatContext, tenant_id: int, payload: dict[str, Any],
                       tg_user_id: int) -> Reply:
     action = payload.get("action", "bind")
 
+    # Роль проверяется в момент действия, а не в момент выдачи кнопки: за время
+    # жизни клавиатуры человека могли понизить (docs/40-security.md §3).
+    if not await access.is_tenant_admin(tenant_id, tg_user_id):
+        return Reply(texts.MSG_NEED_TENANT_ADMIN)
+
     if "b24_group_id" in payload:
         # Проект выбран с портала — импортируем его при первой привязке.
         b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
@@ -1099,15 +1110,20 @@ async def _apply_bind(ctx: ChatContext, tenant_id: int, payload: dict[str, Any],
         proj = await conn.fetchrow(
             "SELECT p.name, c.name AS client_name FROM projects p "
             "JOIN clients c ON c.id = p.client_id WHERE p.id = $1", project_id)
-        if proj is None:
-            return Reply(texts.MSG_DIALOG_EXPIRED)
+    if proj is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
 
-        if action == "unbind":
+    if action == "unbind":
+        async with pool().acquire() as conn:
             await conn.execute(
                 "UPDATE chat_bindings SET status = 'disabled' "
                 "WHERE chat_ref = $1 AND project_id = $2", ctx.chat_ref, project_id)
-            return Reply(texts.MSG_UNBOUND)
+        await audit.record(tenant_id, "chat.unbind", actor_tg_id=tg_user_id,
+                           project_id=project_id, target=f"chat:{ctx.chat_ref}",
+                           detail={"проект": proj["name"], "чат": ctx.title})
+        return Reply(texts.MSG_UNBOUND)
 
+    async with pool().acquire() as conn:
         # Чужой чат перехватить нельзя: если он уже принадлежит другому теннанту,
         # привязка не выполняется.
         owner = await conn.fetchval("SELECT tenant_id FROM tg_chats WHERE id = $1",
@@ -1135,6 +1151,10 @@ async def _apply_bind(ctx: ChatContext, tenant_id: int, payload: dict[str, Any],
             "claimed_at = COALESCE(claimed_at, now()) WHERE id = $1",
             ctx.chat_ref, tenant_id)
 
+    await audit.record(tenant_id, "chat.bind", actor_tg_id=tg_user_id,
+                       project_id=project_id, target=f"chat:{ctx.chat_ref}",
+                       detail={"проект": proj["name"], "клиент": proj["client_name"],
+                               "чат": ctx.title})
     log.info("чат %s привязан к проекту %s пользователем TG %s",
              ctx.chat_ref, project_id, tg_user_id)
     return Reply(texts.MSG_BIND_DONE.format(

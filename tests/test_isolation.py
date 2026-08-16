@@ -229,3 +229,116 @@ async def test_every_domain_table_carries_tenant_id(db: object) -> None:
     missing = sorted(r["table_name"] for r in rows
                      if not r["has_tenant"] and r["table_name"] not in exempt)
     assert not missing, f"таблицы без tenant_id: {missing}"
+
+
+# --------------------------------------------------------------- роли и аудит
+async def _member(conn: object, tenant_id: int, tg_user_id: int, b24_user_id: int,
+                  role: str = "member", link: str = "authorized") -> int:
+    user_id = await conn.fetchval(  # type: ignore[attr-defined]
+        "INSERT INTO users (tg_user_id, tg_username, display_name) "
+        "VALUES ($1, $2, $3) RETURNING id",
+        tg_user_id, f"u{tg_user_id}", f"Человек {tg_user_id}")
+    await conn.execute(  # type: ignore[attr-defined]
+        "INSERT INTO tenant_members (tenant_id, user_id, role, b24_user_id, "
+        "link_status, linked_at) VALUES ($1,$2,$3,$4,$5,now())",
+        tenant_id, user_id, role, b24_user_id, link)
+    return int(user_id)
+
+
+async def test_only_tenant_admin_may_bind(db: object) -> None:
+    """Матрица прав (docs/40-security.md §3): `/bind` — действие админа теннанта.
+
+    До этого хватало привязанного аккаунта, то есть привязать чат мог и сотрудник
+    клиента: он тоже сопоставлен и тоже имеет личный токен.
+    """
+    from b24bot.domain import access
+
+    w = await _fixture_world(db)
+    await _member(db, w["tenant_a"], 1001, 11, role="member")
+    await _member(db, w["tenant_a"], 1002, 12, role="tenant_admin")
+
+    assert await access.is_tenant_admin(w["tenant_a"], 1001) is False
+    assert await access.is_tenant_admin(w["tenant_a"], 1002) is True
+    # Человека вообще нет в теннанте — тоже отказ, а не падение.
+    assert await access.is_tenant_admin(w["tenant_a"], 9999) is False
+
+
+async def test_admin_of_one_tenant_is_not_admin_of_another(db: object) -> None:
+    """Роль живёт внутри теннанта. Один телеграм-аккаунт может состоять в двух."""
+    from b24bot.domain import access
+
+    w = await _fixture_world(db)
+    user_id = await _member(db, w["tenant_a"], 2001, 21, role="tenant_admin")
+    await db.execute(  # type: ignore[attr-defined]
+        "INSERT INTO tenant_members (tenant_id, user_id, role, b24_user_id, link_status) "
+        "VALUES ($1,$2,'member',$3,'authorized')", w["tenant_b"], user_id, 21)
+
+    assert await access.is_tenant_admin(w["tenant_a"], 2001) is True
+    assert await access.is_tenant_admin(w["tenant_b"], 2001) is False
+
+
+async def test_portal_admin_promotion_is_idempotent(db: object) -> None:
+    """Подтягивание админа портала срабатывает один раз, а не пишет аудит на каждый вход."""
+    from b24bot.domain import access
+
+    w = await _fixture_world(db)
+    await _member(db, w["tenant_a"], 3001, 31, role="member")
+
+    assert await access.promote_portal_admin(w["tenant_a"], 31) is True
+    assert await access.promote_portal_admin(w["tenant_a"], 31) is False
+    assert await access.role_of_b24_user(w["tenant_a"], 31) == access.TENANT_ADMIN
+
+
+async def test_last_admin_cannot_be_revoked(db: object) -> None:
+    """Иначе теннант остаётся без управления, и вернуть его можно только руками в базе."""
+    from b24bot.api.app_ui import _apply_role
+
+    w = await _fixture_world(db)
+    only = await _member(db, w["tenant_a"], 4001, 41, role="tenant_admin")
+    _, kind = await _apply_role(w["tenant_a"], 41, "revoke", only)
+    assert kind == "err"
+
+    second = await _member(db, w["tenant_a"], 4002, 42, role="member")
+    _, kind = await _apply_role(w["tenant_a"], 41, "grant", second)
+    assert kind == "ok"
+    _, kind = await _apply_role(w["tenant_a"], 41, "revoke", only)
+    assert kind == "ok"
+
+
+async def test_unlinked_person_cannot_become_admin(db: object) -> None:
+    """Права без личного токена — пустая строка в таблице: действовать в Битриксе нечем."""
+    from b24bot.api.app_ui import _apply_role
+
+    w = await _fixture_world(db)
+    await _member(db, w["tenant_a"], 5001, 51, role="tenant_admin")
+    pending = await _member(db, w["tenant_a"], 5002, None, role="member", link="none")
+
+    _, kind = await _apply_role(w["tenant_a"], 51, "grant", pending)
+    assert kind == "err"
+
+
+async def test_role_change_is_written_to_audit(db: object) -> None:
+    """Вопрос «кто выдал этому человеку права» обязан иметь ответ."""
+    from b24bot.api.app_ui import _apply_role
+
+    w = await _fixture_world(db)
+    await _member(db, w["tenant_a"], 6001, 61, role="tenant_admin")
+    target = await _member(db, w["tenant_a"], 6002, 62, role="member")
+    await _apply_role(w["tenant_a"], 61, "grant", target)
+
+    row = await db.fetchrow(  # type: ignore[attr-defined]
+        "SELECT action, actor_id, target, high_risk, detail FROM audit_log "
+        "WHERE tenant_id = $1 ORDER BY occurred_at DESC LIMIT 1", w["tenant_a"])
+    assert row["action"] == "role.grant"
+    assert row["actor_id"] == 61
+    assert row["target"] == f"member:{target}"
+    assert row["high_risk"] is True
+
+
+async def test_audit_of_one_tenant_is_invisible_to_another(db: object) -> None:
+    from b24bot.domain import audit
+
+    w = await _fixture_world(db)
+    await audit.record(w["tenant_b"], "role.grant", actor_id=7, target="member:7")
+    assert await audit.recent(w["tenant_a"]) == []
+    assert len(await audit.recent(w["tenant_b"])) == 1
