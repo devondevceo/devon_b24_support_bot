@@ -16,7 +16,12 @@ from typing import Any
 
 from b24bot.b24 import disk, errors
 from b24bot.b24.client import B24Client
-from b24bot.core.text import esc_bbcode, esc_html, safe_filename
+from b24bot.core.text import (
+    bbcode_to_text,
+    esc_bbcode,
+    esc_html,
+    safe_filename,
+)
 from b24bot.db.pool import pool
 from b24bot.tg import files as tg_files
 
@@ -70,7 +75,9 @@ async def read_discussion(client: B24Client, task_id: int, *,
         out.append({
             "id": m.get("id"),
             "author": user.get("name") or f"пользователь {author_id}",
-            "text": str(m.get("text") or ""),
+            # Портал хранит комментарии в BBCode; показывать `[i]…[/i]` человеку
+            # незачем — рисовать разметку мы всё равно не собираемся.
+            "text": bbcode_to_text(m.get("text") or ""),
             "date": m.get("date"),
         })
     return out[-limit:]

@@ -18,7 +18,7 @@ from b24bot.b24.mapping import (
     TASK_SELECT_LIST,
     as_int,
 )
-from b24bot.core.text import esc_html
+from b24bot.core.text import bbcode_to_text, esc_html
 from b24bot.db.pool import pool
 from b24bot.domain.context import ProjectRef
 
@@ -194,7 +194,7 @@ def render_card(task: dict[str, Any], project: ProjectRef) -> str:
     if task.get("deadline"):
         rows.append(f"Срок: {fmt_date(task.get('deadline'))}")
 
-    description = str(task.get("description") or "").strip()
+    description = bbcode_to_text(task.get("description") or "")
     if description:
         short = description[:400] + ("…" if len(description) > 400 else "")
         rows += ["", esc_html(short)]

@@ -23,6 +23,7 @@ from b24bot.b24 import errors, mapping
 from b24bot.b24.tokens import NeedsReauth
 from b24bot.bot import comments as comments_service
 from b24bot.bot import task_create, views
+from b24bot.core.text import bbcode_to_text
 from b24bot.db.pool import pool
 from b24bot.domain import access, audit, miniapp
 from b24bot.domain import tasks as task_service
@@ -299,7 +300,8 @@ def _card_json(task: dict[str, Any], project: ProjectRef, portal: str,
                b24_user_id: int) -> dict[str, Any]:
     card = _task_json(task, project)
     card.update({
-        "description": task.get("description") or "",
+        # Описание портал хранит в BBCode — человеку показываем текст.
+        "description": bbcode_to_text(task.get("description") or ""),
         "accomplices": [mapping.as_int(x) for x in (task.get("accomplices") or [])],
         "auditors": [mapping.as_int(x) for x in (task.get("auditors") or [])],
         "tags": mapping.parse_tags(task.get("tags")),
