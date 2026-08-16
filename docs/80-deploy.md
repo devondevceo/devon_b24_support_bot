@@ -1,0 +1,229 @@
+# Первый деплой и SPIKE A
+
+Цель этого шага — получить **первый живой per-user токен**. Это самая ранняя точка
+критического пути: без неё ни один сценарий записи нельзя проверить end-to-end
+(см. [70-plan.md](70-plan.md) §3).
+
+Домен: **`b24sdbot.devondev.ru`** · Сервер: `test01.devondev.ru` (91.142.94.189)
+
+## 0. Состояние на 16.08.2026
+
+| Шаг | Статус |
+|---|---|
+| Каталог `/opt/b24sdbot`, права 700 | ✅ развёрнут |
+| `.env` с сгенерированными на сервере секретами, права 600 | ✅ |
+| Образ `b24sdbot-api:latest`, 334 МБ | ✅ собран |
+| PostgreSQL 16, миграция `0001_bootstrap` | ✅ накатана, 3 таблицы + домен `enc_text` |
+| `b24sdbot-api` | ✅ healthy, 46 МБ из лимита 256 МБ |
+| `b24sdbot-postgres` | ✅ healthy, 27 МБ из лимита 1200 МБ |
+| A-запись `b24sdbot.devondev.ru` → 91.142.94.189 | ✅ резолвится |
+| Публикация через Traefik, `TRAEFIK_ENABLE=true` | ✅ включена |
+| Сертификат Let's Encrypt | ✅ выпущен, действует до 13.11.2026 |
+| `ruff`, `mypy --strict`, 32 теста | ✅ чисто локально и в контейнере |
+
+Проверено функционально снаружи:
+
+```
+https://b24sdbot.devondev.ru/health           → {"status":"ok","checks":{"db":"ok"}}
+http://b24sdbot.devondev.ru/health            → 301 на https
+GET  /                 → x-frame-options: DENY                    (security-headers@file)
+POST /b24/placement    → x-frame-options ОТСУТСТВУЕТ,
+                         content-security-policy: frame-ancestors https://devondev.bitrix24.ru
+```
+
+Разные заголовки на разных путях — это и есть смысл двух роутеров: страницу приложения
+портал сможет открыть в iframe, а всё остальное защищено обычным `frameDeny`.
+`frame-ancestors` выдаётся под домен **конкретного проверенного портала**, а не общим
+`*.bitrix24.ru`. Placement с недоверенным доменом отклоняется (инвариант И-4).
+
+**Что осталось:** зарегистрировать приложение на портале (§3) и установить его (§4).
+
+### Две ошибки, найденные при первом развёртывании
+
+1. **`postgres` требует `-c` и значение разными аргументами.** Форма `-c=key=value` даёт
+   `FATAL: unrecognized configuration parameter ""`, контейнер уходит в цикл перезапусков,
+   а кластер остаётся **недоинициализированным**: база не создана и в `pg_hba.conf` нет
+   строки `host all all all scram-sha-256`. Лечится только пересозданием тома.
+2. **`pg_isready` не годится как healthcheck.** На сломанном кластере он рапортовал `healthy`,
+   потому что проверяет лишь то, что сервер отвечает. Заменён на реальный
+   `psql -c 'SELECT 1'` к нашей базе.
+
+### Третья ошибка, найденная 16.08 вечером: healthcheck без проверки
+
+`bot` и `worker` не слушают порт. `worker` наследовал `HEALTHCHECK` из образа —
+`curl -fsS http://localhost:8000/health` — и потому числился `unhealthy` **103 проверки
+подряд**, работая при этом нормально. У `bot` в compose стояла заглушка
+`python -c "import sys; sys.exit(0)"`, которая проходила всегда, то есть тоже не
+проверяла ничего. Два противоположных дефекта с одним следствием: статус контейнера
+не сообщает о его состоянии.
+
+Заменено на пульс (`core/heartbeat.py`): цикл на каждом успешном обороте пишет метку
+времени в файл, healthcheck смотрит на её свежесть.
+
+```yaml
+test: ["CMD", "python", "-m", "b24bot.core.heartbeat", "worker", "120"]
+```
+
+Пульс бота ставит **супервизор** (`PollerRegistry.run_forever`, оборот раз в 30 с),
+а не сам поллер: поллер законно висит в `getUpdates` до 25 секунд, и его молчание —
+норма, а не сбой. Предел бота 180 с, воркера — 120 с.
+
+Файл пульса свой на каждый процесс: образ один, контейнера три, и общий файл означал бы,
+что живой бот «лечит» мёртвого воркера. Ошибка записи пульса проглатывается — диагностика
+не имеет права уронить рабочий цикл.
+
+---
+
+## 1. Перед деплоем
+
+**DNS.** A-запись `b24sdbot.devondev.ru` → IP сервера. Проверить, что резолвится, до запуска:
+Traefik выпускает сертификат по HTTP-01 challenge, и без корректной A-записи выпуск не пройдёт.
+
+**Сеть Traefik.** Уже существует, называется `traefik-public`, наш compose подключается к ней
+как к внешней. Ничего создавать не надо.
+
+**Место.** Освободить мусор Docker до первой сборки — на машине ~41 ГБ реклейма:
+
+```bash
+docker builder prune -af && docker image prune
+```
+
+> `docker volume prune` и `docker system prune --volumes` **не запускать никогда**:
+> на машине 61 неактивный volume, принадлежащий чужим остановленным контейнерам.
+
+## 2. Развёртывание
+
+```bash
+git clone <repo> /opt/b24sdbot && cd /opt/b24sdbot
+cp .env.example .env && chmod 600 .env
+```
+
+Заполнить `.env`. Мастер-ключ сгенерировать так:
+
+```bash
+python3 -c "import os,base64;print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip('='))"
+```
+
+`POSTGRES_PASSWORD` — длинный случайный, он же подставляется в `DATABASE_URL`.
+
+Сборка образа делается **отдельно и в одиночку**: рядом работает чужой прод без лимитов
+памяти, параллельная сборка — реальный шанс уронить его по OOM.
+
+```bash
+cd /opt/b24sdbot && docker compose build
+```
+
+```bash
+cd /opt/b24sdbot && docker compose up -d
+```
+
+Миграции:
+
+```bash
+cd /opt/b24sdbot && docker compose exec -T api alembic upgrade head
+```
+
+Проверка:
+
+```bash
+curl -fsS https://b24sdbot.devondev.ru/health
+```
+
+Ожидаем `{"status":"ok","checks":{"db":"ok"}}`. Если TLS не поднялся — смотреть
+`docker logs traefik` на предмет ошибки ACME.
+
+## 3. Регистрация приложения на портале
+
+Битрикс24 → **Приложения → Разработчикам → Другое → Локальное приложение**.
+
+| Поле | Значение |
+|---|---|
+| Тип | Серверное приложение |
+| Название | Поддержка в Telegram |
+| Путь обработчика | `https://b24sdbot.devondev.ru/b24/placement` |
+| Путь первоначальной установки | `https://b24sdbot.devondev.ru/b24/install` |
+
+**Права — отметить всё из списка сразу:**
+
+```
+task, tasks_extended, user, sonet_group, socialnetwork, disk, crm, im, imbot,
+log, placement, pull, department, timeman, entity
+```
+
+> Расширить scope позже нельзя без переустановки приложения, а переустановка **роняет
+> per-user привязки всех сотрудников разом**. На пилоте уговорить людей привязаться
+> второй раз не выйдет.
+
+После сохранения портал выдаст «Код приложения» и «Ключ приложения» — вписать их в `.env`
+как `B24_CLIENT_ID` и `B24_CLIENT_SECRET`, затем `docker compose up -d api`.
+
+## 4. Установка и что должно произойти
+
+Нажать «Установить». Ожидаемое поведение:
+
+1. Битрикс POST-ит на `/b24/install` токены установщика.
+2. Мы создаём теннанта, сохраняем `APPLICATION_TOKEN` и токены установщика как
+   `service_admin` (оба токена — в шифрованных колонках).
+3. Страница вызывает `BX24.installFinish()`, и приложение появляется в левом меню.
+
+**Без `installFinish()` приложение считается неустановленным**: виджеты не показываются,
+события не приходят вообще. Это типовая причина «ничего не работает» на старте.
+
+Проверить, что установка прошла:
+
+```bash
+cd /opt/b24sdbot && docker compose exec -T postgres psql -U b24sdbot -d b24sdbot -c "SELECT id, b24_domain, install_state, array_length(granted_scope,1) AS scopes FROM tenants"
+```
+
+## 5. SPIKE A: что снимаем
+
+Скелет пишет структуру каждого входящего payload в `b24_payload_log` — **значения секретов
+маскируются до записи**, сохраняются только имена полей и несекретные значения. Это и есть
+цель спайка: узнать, что реально присылает портал.
+
+```bash
+cd /opt/b24sdbot && docker compose exec -T postgres psql -U b24sdbot -d b24sdbot -c "SELECT kind, received_at, jsonb_pretty(shape) FROM b24_payload_log ORDER BY id DESC LIMIT 5"
+```
+
+Чек-лист спайка:
+
+1. **Установка от администратора** — пришли ли `AUTH_ID`, `REFRESH_ID`, `APPLICATION_TOKEN`,
+   `member_id`, какой набор полей на самом деле.
+2. **Открыть приложение от НЕ-администратора** — приходит ли placement-POST с его `AUTH_ID`,
+   совпадает ли `APPLICATION_TOKEN` с полученным при установке.
+3. **Появился ли per-user токен второго человека:**
+
+   ```bash
+   cd /opt/b24sdbot && docker compose exec -T postgres psql -U b24sdbot -d b24sdbot -c "SELECT tenant_id, b24_user_id, role, state, expires_at FROM b24_user_tokens"
+   ```
+
+4. **Открывается ли страница в iframe.** Если браузер ругается на `X-Frame-Options` — значит
+   маршрут ушёл не на тот роутер Traefik. В `docker-compose.yml` для `/b24/placement` и `/app`
+   намеренно **не** подключён `security-headers@file`: в нём `frameDeny: true`, и портал
+   не смог бы встроить страницу. `frame-ancestors` выставляет само приложение, динамически
+   под домен проверенного портала.
+5. **Доживает ли кука `SameSite=None`** до второго запроса внутри iframe.
+6. **`/oauth/authorize/` с `response_type=code` и `redirect_uri`** — работает ли собственный
+   редирект для локального приложения (в документации Битрикса не описан).
+
+По итогам спайка дописать факты в [00-portal-facts.md](00-portal-facts.md) и только потом
+писать полную схему БД.
+
+## 6. После спайка
+
+- `SPIKE_LOG_PAYLOADS=false` в `.env` — журнал структуры больше не нужен.
+- Таблица `b24_payload_log` удаляется отдельной миграцией.
+- Входящий вебхук портала из `.env` (`B24_WEBHOOK_URL`) **отозвать на портале и удалить**:
+  это ключ с правами администратора без срока действия, он уже полежал в каталоге репозитория.
+
+## 7. Откат
+
+```bash
+cd /opt/b24sdbot && docker compose exec -T api alembic downgrade -1 && docker compose down
+```
+
+Дамп перед любой миграцией (обязателен с первой же):
+
+```bash
+cd /opt/b24sdbot && docker compose exec -T postgres pg_dump -U b24sdbot b24sdbot | gzip > "backups/$(date +%F-%H%M).sql.gz"
+```

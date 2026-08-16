@@ -1,0 +1,53 @@
+[project]
+name = "b24bot"
+version = "0.1.0"
+description = "Telegram-бот и мини-апп для работы с задачами Битрикс24 из общих чатов"
+requires-python = ">=3.12"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning:b24bot.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ASYNC", "S"]
+ignore = [
+  "S101",   # assert в тестах — норма
+  "RUF001", # кириллица в строках: у нас весь домен русский
+  "RUF002",
+  "RUF003",
+  # N818 требует суффикс Error у всех исключений. Осознанно отключено: доменные
+  # имена вида NeedsReauth, B24QueryLimit, TokenRaceLost читаются в коде лучше,
+  # чем NeedsReauthError и B24QueryLimitError, а базовый класс B24Error суффикс имеет.
+  "N818",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]          # тестовые «секреты» — не секреты
+"src/b24bot/bot/texts.py" = ["S105"]  # это тексты для людей, а не пароли
+# S608 в миграциях неуместен: это одноразовые DDL и сидирование
+# захардкоженными значениями, пользовательского ввода там нет.
+"migrations/*" = ["E501", "N999", "S608"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["b24bot"]
+warn_unreachable = true
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "migrations.*"]
+ignore_errors = true

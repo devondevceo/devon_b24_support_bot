@@ -1,0 +1,1141 @@
+"""Сценарии бота: команды, создание задач, кнопки."""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import timedelta
+from typing import Any
+
+from b24bot.b24 import errors, mapping
+from b24bot.b24.tokens import NeedsReauth
+from b24bot.bot import comments, keyboards, survey, task_create, texts, views
+from b24bot.core.text import esc_html
+from b24bot.crypto import box
+from b24bot.db.pool import pool
+from b24bot.domain import access
+from b24bot.domain import events as b24_events
+from b24bot.domain.context import (
+    ChatContext,
+    ProjectRef,
+    authorize_task_for_chat,
+    consume_token,
+    issue_token,
+    load_chat_context,
+    remember_task,
+)
+from b24bot.tg import files as tg_files
+
+log = logging.getLogger(__name__)
+
+BIND_PAGE = 40   # сколько проектов портала помещается в одну клавиатуру
+
+
+class Reply:
+    """Ответ бота. Отправкой занимается вызывающий: так проще тестировать."""
+
+    def __init__(self, text: str, *, buttons: list[list[dict[str, str]]] | None = None,
+                 markup: dict[str, Any] | None = None,
+                 edit: bool = False, remember_for_survey: int | None = None) -> None:
+        self.text = text
+        # id сессии опросника, которой надо запомнить message_id этого сообщения
+        self.remember_for_survey = remember_for_survey
+        self._markup = markup or ({"inline_keyboard": buttons} if buttons else None)
+        # Списки и карточки живут в ОДНОМ сообщении, которое редактируется:
+        # иначе чат превращается в ленту из десятков сообщений бота.
+        self.edit = edit
+
+    @property
+    def markup(self) -> dict[str, Any] | None:
+        return self._markup
+
+
+# --------------------------------------------------------------------- разбор
+def _text_of(msg: dict[str, Any]) -> str:
+    return str(msg.get("text") or msg.get("caption") or "")
+
+
+def _author(user: dict[str, Any]) -> str:
+    parts = [user.get("first_name"), user.get("last_name")]
+    name = " ".join(p for p in parts if p) or "без имени"
+    username = user.get("username")
+    return f"{name} (@{username})" if username else name
+
+
+def _command(text: str, bot_username: str) -> tuple[str, str] | None:
+    if not text.startswith("/"):
+        return None
+    head, _, rest = text.partition(" ")
+    cmd = head[1:].split("@")[0].lower()
+    if "@" in head and not head.lower().endswith(f"@{bot_username.lower()}"):
+        return None  # команда адресована другому боту в этой же группе
+    return cmd, rest.strip()
+
+
+def _mentions_bot(msg: dict[str, Any], bot_username: str) -> bool:
+    text = _text_of(msg)
+    for ent in (msg.get("entities") or []) + (msg.get("caption_entities") or []):
+        if ent.get("type") == "mention":
+            off, ln = int(ent["offset"]), int(ent["length"])
+            if text[off:off + ln].lower() == f"@{bot_username.lower()}":
+                return True
+    return False
+
+
+# ------------------------------------------------------------------- сценарии
+async def on_message(bot: dict[str, Any], msg: dict[str, Any]) -> Reply | None:
+    chat = msg.get("chat") or {}
+    if chat.get("id") is None:
+        return None
+    chat_id = int(chat["id"])
+    thread_id = msg.get("message_thread_id")
+    user = msg.get("from") or {}
+    tg_user_id = int(user.get("id") or 0)
+    text = _text_of(msg)
+    bot_username = str(bot["username"])
+
+    ctx = await load_chat_context(chat_id, thread_id)
+    cmd = _command(text, bot_username)
+
+    if chat.get("type") == "private":
+        return await _private(bot, cmd, tg_user_id, user, text)
+
+    if ctx is None:
+        return None
+
+    if cmd:
+        return await _group_command(bot, ctx, cmd, msg, tg_user_id, user)
+
+    # Ответ на вопрос опросника. Проверяем ДО остальных правил, но принимаем
+    # строго реплаем на своё же сообщение: иначе съедим обычную реплику коллеге.
+    reply_to = msg.get("reply_to_message")
+    if reply_to:
+        answered = await _survey_answer(ctx, msg, reply_to, tg_user_id)
+        if answered is not None:
+            return answered
+
+    # Реплай с упоминанием бота — основной триггер создания задачи.
+    if reply_to and _mentions_bot(msg, bot_username):
+        return await _create_from(ctx, reply_to, tg_user_id, msg.get("message_id"))
+    return None
+
+
+async def _resolve_task_arg(ctx: ChatContext, arg: str) -> int | None:
+    """Номер задачи из аргумента команды или из ссылки на портал."""
+    import re
+
+    text = arg.strip()
+    match = re.search(r"/task/view/(\d+)", text) or re.match(r"#?(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+async def _import_project(tenant_id: int, b24_user_id: int, b24_group_id: int,
+                          fallback_name: str) -> int | None:
+    """Завести проект в нашей базе. Клиент по умолчанию — по названию проекта.
+
+    Иначе пришлось бы спрашивать клиента прямо в чате, а это лишний шаг в сценарии,
+    который и так делают редко. Переназначить клиента можно в приложении.
+    """
+    async with pool().acquire() as conn:
+        existing = await conn.fetchval(
+            "SELECT id FROM projects WHERE tenant_id = $1 AND b24_group_id = $2",
+            tenant_id, b24_group_id)
+    if existing:
+        return int(existing)
+
+    name = fallback_name
+    stages: dict[str, Any] = {}
+    try:
+        client = await access.client_for_user(tenant_id, b24_user_id)
+        async with client:
+            groups = await client.call("sonet_group.get",
+                                       {"FILTER": {"ID": b24_group_id}})
+            if groups:
+                name = str(groups[0].get("NAME") or name)
+            stages = await client.call("task.stages.get",
+                                       {"entityId": b24_group_id}) or {}
+    except (NeedsReauth, errors.B24Error) as exc:
+        log.warning("импорт проекта %s: %s", b24_group_id, exc)
+        if not name:
+            return None
+
+    async with pool().acquire() as conn, conn.transaction():
+        client_row = await conn.fetchrow(
+            "INSERT INTO clients (tenant_id, name) VALUES ($1,$2) "
+            "ON CONFLICT (tenant_id, name) DO UPDATE SET name = EXCLUDED.name "
+            "RETURNING id", tenant_id, name)
+        pid = await conn.fetchval(
+            "INSERT INTO projects (tenant_id, client_id, b24_group_id, name, "
+            "name_synced_at) VALUES ($1,$2,$3,$4,now()) "
+            "ON CONFLICT (tenant_id, b24_group_id) DO UPDATE "
+            "SET name = EXCLUDED.name, status = 'active' RETURNING id",
+            tenant_id, client_row["id"], b24_group_id, name)
+        for st in stages.values():
+            await conn.execute(
+                "INSERT INTO project_stages (tenant_id, project_id, b24_stage_id, "
+                "title, sort, system_type, color) VALUES ($1,$2,$3,$4,$5,$6,$7) "
+                "ON CONFLICT (tenant_id, project_id, b24_stage_id) DO UPDATE "
+                "SET title = EXCLUDED.title, synced_at = now()",
+                tenant_id, pid, int(st["ID"]), st["TITLE"], int(st.get("SORT") or 0),
+                st.get("SYSTEM_TYPE"), st.get("COLOR"))
+    return int(pid)
+
+
+async def _authorize_live(ctx: ChatContext, task_id: int, b24_user_id: int,
+                          tg_user_id: int) -> ProjectRef | None:
+    """Проверка доступа с дозапросом группы задачи.
+
+    Кэш неполон по устройству, поэтому его отсутствие не может означать отказ.
+    """
+    if ctx.tenant_id is None:
+        return None
+    project = await authorize_task_for_chat(ctx.tenant_id, ctx.chat_ref, task_id)
+    if project is not None:
+        return project
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            res = await client.call("tasks.task.get",
+                                    {"taskId": task_id, "select": ["ID", "GROUP_ID"]})
+    except (NeedsReauth, errors.B24Error):
+        return None
+    task = res.get("task", res) if isinstance(res, dict) else {}
+    return await authorize_task_for_chat(
+        ctx.tenant_id, ctx.chat_ref, task_id,
+        group_id_hint=mapping.as_int(task.get("groupId")))
+
+
+async def _comment_command(ctx: ChatContext, msg: dict[str, Any], arg: str,
+                           tg_user_id: int) -> Reply:
+    """/comment <номер> текст — комментарий в задачу."""
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    task_id = await _resolve_task_arg(ctx, arg)
+    rest = arg.split(" ", 1)[1].strip() if " " in arg else ""
+    if task_id is None or not rest:
+        return Reply(texts.MSG_COMMENT_USAGE)
+
+    project = await _authorize_live(ctx, task_id, b24_user_id, tg_user_id)
+    if project is None:
+        return Reply(texts.MSG_TASK_NOT_FOUND)
+
+    author = _author(msg.get("from") or {})
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            await comments.add(client, task_id, rest, author=author,
+                               chat_title=ctx.title)
+            note = ""
+            attachments = tg_files.extract(msg)
+            if attachments:
+                count, rejected = await comments.transfer_files(
+                    client, await _bot_token(ctx), ctx.tenant_id, task_id,
+                    project.b24_group_id, b24_user_id, attachments,
+                    f"comment-{ctx.chat_ref}-{msg.get('message_id')}")
+                if count:
+                    note = f"\nФайлов приложено: {count}"
+                for reason in rejected:
+                    note += f"\n{esc_html(reason)}"
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied as exc:
+        return Reply(texts.MSG_NO_RIGHTS_B24.format(reason=esc_html(exc.description)))
+    except errors.B24Error as exc:
+        log.warning("комментарий не добавлен: %s", exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    return Reply(texts.MSG_COMMENT_ADDED.format(task_id=task_id) + note)
+
+
+async def _bot_token(ctx: ChatContext) -> str:
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT b.token, b.bot_id, b.tenant_id FROM tg_bots b "
+            "JOIN tg_chats c ON c.bot_ref = b.id WHERE c.id = $1", ctx.chat_ref)
+    if row is None:
+        raise errors.B24Error("NO_BOT", "бот не найден")
+    return box.decrypt(row["token"],
+                       box.aad("tg_bots", "token", row["tenant_id"], row["bot_id"]))
+
+
+async def _discussion(ctx: ChatContext, arg: str, tg_user_id: int) -> Reply:
+    """Показать обсуждение задачи. Комментарии лежат в чате задачи, не в форуме."""
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    task_id = await _resolve_task_arg(ctx, arg)
+    if task_id is None:
+        return Reply(texts.MSG_COMMENT_USAGE)
+    if await _authorize_live(ctx, task_id, b24_user_id, tg_user_id) is None:
+        return Reply(texts.MSG_TASK_NOT_FOUND)
+
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            items = await comments.read_discussion(client, task_id)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24Error:
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+    return Reply(comments.render_discussion(task_id, items))
+
+
+async def _survey_start(ctx: ChatContext, tg_user_id: int) -> Reply:
+    """Выбор категории обращения."""
+    if not ctx.is_active or not ctx.has_binding:
+        return Reply(texts.MSG_NO_PROJECT)
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    if await access.linked_b24_user(ctx.tenant_id, tg_user_id) is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    rows = []
+    for template_id, title in await survey.categories(ctx.tenant_id):
+        token = await issue_token("survey", tenant_id=ctx.tenant_id,
+                                  owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                                  payload={"template_id": template_id},
+                                  ttl=timedelta(minutes=30))
+        rows.append([{"text": title, "callback_data": f"s:{token}"}])
+    return Reply(texts.MSG_SURVEY_CHOOSE, markup={"inline_keyboard": rows})
+
+
+async def _survey_begin(ctx: ChatContext, tg_user_id: int, template_id: int) -> Reply:
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    project_id = ctx.projects[0].id if len(ctx.projects) == 1 else None
+    session = await survey.start(ctx.tenant_id, ctx.chat_ref, ctx.thread_id,
+                                 tg_user_id, template_id, project_id)
+    items = await survey.questions(ctx.tenant_id, template_id)
+    if not items:
+        await survey.finish(session.id, "cancelled")
+        return Reply(texts.MSG_SURVEY_EMPTY)
+    return Reply(survey.question_text(items[0], 0, len(items)),
+                 markup=await _survey_kb(ctx, tg_user_id, session.id, items[0]),
+                 remember_for_survey=session.id)
+
+
+async def _survey_kb(ctx: ChatContext, tg_user_id: int, session_id: int,
+                     q: survey.Question) -> dict[str, Any]:
+    row = []
+    if not q.required:
+        token = await issue_token("survey_skip", tenant_id=ctx.tenant_id,
+                                  owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                                  payload={"session_id": session_id},
+                                  ttl=timedelta(minutes=30))
+        row.append({"text": "⏭ Пропустить", "callback_data": f"k:{token}"})
+    cancel = await issue_token("survey_cancel", tenant_id=ctx.tenant_id,
+                               owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                               payload={"session_id": session_id},
+                               ttl=timedelta(minutes=30))
+    row.append({"text": "❌ Отменить", "callback_data": f"x:{cancel}"})
+    return {"inline_keyboard": [row]}
+
+
+async def _survey_answer(ctx: ChatContext, msg: dict[str, Any],
+                         reply_to: dict[str, Any], tg_user_id: int) -> Reply | None:
+    """Ответ на вопрос. None означает «это не про опросник, обрабатывай дальше»."""
+    if ctx.tenant_id is None:
+        return None
+    session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
+                                      tg_user_id)
+    if session is None:
+        return None
+    if session.last_message_id != reply_to.get("message_id"):
+        # Реплай на что-то другое: человек просто разговаривает с коллегами.
+        return None
+
+    text = _text_of(msg).strip()
+    if not text:
+        return None
+
+    items = await survey.questions(ctx.tenant_id, session.template_id)
+    if session.step >= len(items):
+        return None
+    await survey.record(session, items[session.step].code, text)
+    return await _survey_next(ctx, session, items, tg_user_id)
+
+
+async def _survey_next(ctx: ChatContext, session: survey.Session,
+                       items: list[survey.Question], tg_user_id: int) -> Reply:
+    if session.step < len(items):
+        q = items[session.step]
+        return Reply(survey.question_text(q, session.step, len(items)),
+                     markup=await _survey_kb(ctx, tg_user_id, session.id, q),
+                     remember_for_survey=session.id)
+
+    # Вопросы кончились — показываем черновик и ждём подтверждения.
+    # Описание собирается заново в момент создания: между превью и нажатием
+    # человек мог ответить ещё раз.
+    title, _ = survey.assemble(items, session.answers)
+    project = next((p for p in ctx.projects if p.id == session.project_id),
+                   ctx.projects[0] if ctx.projects else None)
+    if project is None:
+        await survey.finish(session.id, "cancelled")
+        return Reply(texts.MSG_NO_PROJECT)
+
+    create = await issue_token("survey_create", tenant_id=ctx.tenant_id,
+                               owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                               payload={"session_id": session.id,
+                                        "project_id": project.id},
+                               ttl=timedelta(hours=24))
+    cancel = await issue_token("survey_cancel", tenant_id=ctx.tenant_id,
+                               owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                               payload={"session_id": session.id},
+                               ttl=timedelta(hours=24))
+    return Reply(survey.render_preview(title, items, session.answers, project.name),
+                 markup=keyboards.confirm(create, cancel))
+
+
+async def _survey_create(ctx: ChatContext, tg_user_id: int, session_id: int,
+                         project_id: int) -> Reply:
+    """Создание задачи из собранных ответов."""
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT template_id, answers FROM survey_sessions WHERE id = $1 "
+            "AND state = 'active'", session_id)
+    if row is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
+
+    answers = row["answers"]
+    answers = json.loads(answers) if isinstance(answers, str) else dict(answers or {})
+    items = await survey.questions(ctx.tenant_id, int(row["template_id"]))
+    title, description = survey.assemble(items, answers)
+
+    project = next((p for p in ctx.projects if p.id == project_id), None)
+    if project is None:
+        return Reply(texts.MSG_NO_PROJECT)
+
+    draft = task_create.Draft(
+        title=title, description=description,
+        idem_key=f"survey-{session_id}", source_message_id=None)
+
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            task, created = await task_create.create(
+                client, ctx.tenant_id, project, draft, b24_user_id)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied as exc:
+        return Reply(texts.MSG_NO_RIGHTS_B24.format(reason=esc_html(exc.description)))
+    except errors.B24Error as exc:
+        log.warning("создание задачи из опросника не удалось: %s", exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    await survey.finish(session_id, "done")
+    if not created:
+        return Reply(texts.MSG_TASK_EXISTS.format(
+            task_id=task.get("id"), title=esc_html(task.get("title") or "")))
+    return Reply(texts.MSG_TASK_CREATED.format(
+        task_id=task.get("id"), title=esc_html(task.get("title") or ""),
+        project=esc_html(project.name),
+        responsible=esc_html((task.get("responsible") or {}).get("name") or b24_user_id)))
+
+
+async def _menu_tokens(ctx: ChatContext, tg_user_id: int) -> dict[str, str]:
+    """Токены под кнопки меню. Общие для чата: меню закрепляют, им пользуются все."""
+    actions = ("status", "overdue", "mine", "all", "new")
+    out = {}
+    for action in actions:
+        out[action] = await issue_token(
+            "menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
+            payload={"action": action}, single_use=False,
+            ttl=timedelta(days=365))
+    return out
+
+
+async def _help_reply(ctx: ChatContext, tg_user_id: int) -> Reply:
+    if not ctx.is_active or not ctx.has_binding:
+        return Reply(texts.MSG_HELP if ctx.is_active else texts.MSG_START_GROUP)
+    tokens = await _menu_tokens(ctx, tg_user_id)
+    projects = ", ".join(esc_html(p.name) for p in ctx.projects)
+    text = (f"{texts.MSG_HELP}\n\n<b>Проекты этого чата:</b> {projects}\n"
+            f"<i>Закрепите это сообщение — кнопки будут всегда под рукой.</i>")
+    return Reply(text, markup=keyboards.help_menu(tokens))
+
+
+async def _open_summary(ctx: ChatContext, tg_user_id: int, action: str) -> Reply:
+    """Сводка и списки. Всё через личный токен: видно то, что видно человеку."""
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    group_ids = [p.b24_group_id for p in ctx.projects]
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            tasks = await views.fetch_open(client, group_ids)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24Error as exc:
+        log.warning("не удалось получить задачи: %s", exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    if action == "status":
+        text = await views.render_summary(ctx.tenant_id, ctx.projects, tasks)
+        tokens = await _menu_tokens(ctx, tg_user_id)
+        return Reply(text, markup=keyboards.help_menu(tokens), edit=True)
+
+    if action == "overdue":
+        tasks = [t for t in tasks if views.is_overdue(t)]
+        title = "🔥 Просроченные"
+    elif action == "mine":
+        tasks = [t for t in tasks
+                 if str(t.get("responsibleId")) == str(b24_user_id)]
+        title = "👤 Мои задачи"
+    else:
+        title = "📋 Все открытые задачи"
+
+    numbers = []
+    for i, t in enumerate(views.flatten_for_buttons(tasks), start=1):
+        token = await issue_token("task", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
+                                  payload={"task_id": int(t["id"])}, single_use=False,
+                                  ttl=timedelta(days=7))
+        numbers.append((token, str(i)))
+
+    back = await issue_token("menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
+                             payload={"action": "status"}, single_use=False,
+                             ttl=timedelta(days=7))
+    nav = [{"text": "◀️ Назад", "callback_data": f"m:{back}"}]
+    return Reply(views.render_list(tasks, title=title),
+                 markup=keyboards.task_list(numbers, nav), edit=True)
+
+
+async def _open_card(ctx: ChatContext, tg_user_id: int, task_id: int) -> Reply:
+    """Карточка задачи. Инвариант И-3: проверка принадлежности чату обязательна."""
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    # Читаем задачу ЕГО токеном: если прав нет, Битрикс откажет сам. Проверка
+    # принадлежности чату идёт следом, по фактической группе задачи.
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            res = await client.call("tasks.task.get", {
+                "taskId": task_id, "select": mapping.TASK_SELECT_FULL})
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied:
+        return Reply(texts.MSG_TASK_NOT_FOUND)
+    except errors.B24Error:
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    task = res.get("task", res) if isinstance(res, dict) else {}
+    project = await authorize_task_for_chat(
+        ctx.tenant_id, ctx.chat_ref, task_id,
+        group_id_hint=mapping.as_int(task.get("groupId")))
+    if project is None:
+        return Reply(texts.MSG_TASK_NOT_FOUND)
+    await remember_task(ctx.tenant_id, project, task)
+
+    allowed = mapping.allowed_actions(task)
+
+    tokens = {}
+    for act in ("complete", "start", "pause", "refresh"):
+        tokens[act] = await issue_token(
+            "action", tenant_id=ctx.tenant_id, owner_tg_id=tg_user_id,
+            chat_ref=ctx.chat_ref, payload={"task_id": task_id, "act": act},
+            single_use=(act != "refresh"), ttl=timedelta(hours=12))
+    tokens["back"] = await issue_token(
+        "menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
+        payload={"action": "all"}, single_use=False, ttl=timedelta(days=7))
+
+    domain = await _tenant_domain(ctx.tenant_id)
+    return Reply(views.render_card(task, project),
+                 markup=keyboards.task_card(
+                     tokens, allowed=allowed,
+                     portal_url=views.portal_task_url(domain, task_id, b24_user_id)),
+                 edit=True)
+
+
+async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
+                       act: str) -> Reply:
+    """Смена состояния задачи спец-методами.
+
+    Сырой update STATUS не проводит бизнес-логику и права, поэтому используем
+    tasks.task.complete/start/pause — как и предписывает портал.
+    """
+    if act == "refresh":
+        return await _open_card(ctx, tg_user_id, task_id)
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+    method = {"complete": "tasks.task.complete", "start": "tasks.task.start",
+              "pause": "tasks.task.pause"}.get(act)
+    if method is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
+
+    # Своё же изменение не должно вернуться уведомлением в этот же чат.
+    expected_status = {"complete": 5, "start": 3, "pause": 2}.get(act)
+    if expected_status is not None:
+        await b24_events.suppress_echo(ctx.tenant_id, task_id, "STATUS",
+                                       expected_status, b24_user_id)
+
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            check = await client.call("tasks.task.get",
+                                      {"taskId": task_id, "select": ["ID", "GROUP_ID"]})
+            checked = check.get("task", check) if isinstance(check, dict) else {}
+            if await authorize_task_for_chat(
+                    ctx.tenant_id, ctx.chat_ref, task_id,
+                    group_id_hint=mapping.as_int(checked.get("groupId"))) is None:
+                return Reply(texts.MSG_TASK_NOT_FOUND)
+            await client.call(method, {"taskId": task_id})
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied as exc:
+        return Reply(texts.MSG_NO_RIGHTS_B24.format(reason=esc_html(exc.description)))
+    except errors.B24Error as exc:
+        log.warning("действие %s над задачей %s не удалось: %s", act, task_id, exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    return await _open_card(ctx, tg_user_id, task_id)
+
+
+async def _tenant_domain(tenant_id: int) -> str:
+    async with pool().acquire() as conn:
+        value = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
+                                    tenant_id)
+    return str(value or "")
+
+
+async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
+                   tg_user_id: int, user: dict[str, Any],
+                   text: str = "") -> Reply | None:
+    if cmd is None:
+        # Постоянная клавиатура шлёт обычный ТЕКСТ, а не callback. Без разбора
+        # подписей любое нажатие выглядело как «бот не реагирует».
+        action = keyboards.PRIVATE_LABELS.get(text.strip())
+        if action:
+            return await _private_action(action, tg_user_id)
+        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+    name, arg = cmd
+
+    if name == "start" and arg.startswith("b"):
+        reply = await _link_account(arg[1:], tg_user_id, user)
+        return Reply(reply.text, markup=keyboards.persistent_private())
+    if name in ("start", "help"):
+        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+    if name == "whoami":
+        return await _whoami(tg_user_id)
+    return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+
+
+async def _private_action(action: str, tg_user_id: int) -> Reply:
+    """Действия постоянной клавиатуры.
+
+    В личке нет контекста чата, поэтому собираем задачи по ВСЕМ проектам теннанта,
+    привязанным хоть к одному чату. Видно при этом ровно то, что видит сам человек:
+    ходим его личным токеном.
+    """
+    if action == "help":
+        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+
+    tenant_id = await access.tenant_of_user(tg_user_id)
+    if tenant_id is None:
+        return Reply(texts.MSG_NOT_LINKED, markup=keyboards.persistent_private())
+    b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED, markup=keyboards.persistent_private())
+
+    if action == "mychats":
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT c.title, p.name AS project, cl.name AS client
+                  FROM chat_bindings b
+                  JOIN tg_chats c ON c.id = b.chat_ref
+                  JOIN projects p ON p.id = b.project_id
+                  JOIN clients cl ON cl.id = p.client_id
+                 WHERE b.tenant_id = $1 AND b.status = 'active'
+                 ORDER BY c.title, p.name
+                """, tenant_id)
+        if not rows:
+            return Reply("Пока ни один чат не привязан к проекту.",
+                         markup=keyboards.persistent_private())
+        lines = ["<b>Привязанные чаты</b>", ""]
+        for r in rows:
+            lines.append(f"• {esc_html(r['title'] or 'без названия')}")
+            lines.append(f"    {esc_html(r['client'])} · {esc_html(r['project'])}")
+        return Reply("\n".join(lines), markup=keyboards.persistent_private())
+
+    async with pool().acquire() as conn:
+        groups = await conn.fetch(
+            "SELECT DISTINCT p.b24_group_id FROM chat_bindings b "
+            "JOIN projects p ON p.id = b.project_id AND p.status = 'active' "
+            "WHERE b.tenant_id = $1 AND b.status = 'active'", tenant_id)
+    group_ids = [int(g["b24_group_id"]) for g in groups]
+    if not group_ids:
+        return Reply(texts.MSG_NO_PROJECT, markup=keyboards.persistent_private())
+
+    try:
+        client = await access.client_for_user(tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            tasks = await views.fetch_open(client, group_ids)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH, markup=keyboards.persistent_private())
+    except errors.B24Error:
+        return Reply(texts.MSG_B24_UNAVAILABLE, markup=keyboards.persistent_private())
+
+    if action == "overdue":
+        tasks = [t for t in tasks if views.is_overdue(t)]
+        title = "🔥 Просроченные"
+    else:
+        tasks = [t for t in tasks if str(t.get("responsibleId")) == str(b24_user_id)]
+        title = "📊 Мои задачи"
+    return Reply(views.render_list(tasks, title=title),
+                 markup=keyboards.persistent_private())
+
+
+async def _link_account(token: str, tg_user_id: int, user: dict[str, Any]) -> Reply:
+    """Завершение привязки: человек открыл приложение в Б24 и перешёл по deep link."""
+    row = await consume_token(token, None)
+    if row is None or row["kind"] != "link":
+        return Reply(texts.MSG_LINK_BAD_TOKEN)
+
+    payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+    tenant_id, b24_user_id = int(row["tenant_id"]), int(payload["b24_user_id"])
+
+    async with pool().acquire() as conn, conn.transaction():
+        user_row = await conn.fetchrow(
+            "INSERT INTO users (tg_user_id, tg_username, display_name) VALUES ($1,$2,$3) "
+            "ON CONFLICT (tg_user_id) DO UPDATE SET tg_username = EXCLUDED.tg_username, "
+            "display_name = EXCLUDED.display_name RETURNING id",
+            tg_user_id, user.get("username"), _author(user))
+        await conn.execute(
+            "INSERT INTO tenant_members (tenant_id, user_id, role, b24_user_id, "
+            "link_status, linked_at) VALUES ($1,$2,'member',$3,'authorized',now()) "
+            "ON CONFLICT (tenant_id, user_id) DO UPDATE SET b24_user_id = EXCLUDED.b24_user_id, "
+            "link_status = 'authorized', linked_at = now()",
+            tenant_id, user_row["id"], b24_user_id)
+        # Токен отдаётся только тому, кто его авторизовал (docs/40-security.md §2).
+        await conn.execute(
+            "UPDATE b24_user_tokens SET authorized_tg_user_id = $3 "
+            "WHERE tenant_id = $1 AND b24_user_id = $2", tenant_id, b24_user_id, tg_user_id)
+
+    log.info("привязка завершена: теннант %s, Б24 %s, TG %s",
+             tenant_id, b24_user_id, tg_user_id)
+    return Reply(texts.MSG_LINK_DONE)
+
+
+async def _whoami(tg_user_id: int) -> Reply:
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT t.name, m.role, m.b24_user_id, m.link_status FROM tenant_members m "
+            "JOIN users u ON u.id = m.user_id JOIN tenants t ON t.id = m.tenant_id "
+            "WHERE u.tg_user_id = $1", tg_user_id)
+    if row is None:
+        return Reply(texts.MSG_NOT_LINKED)
+    return Reply(f"Теннант: <b>{esc_html(row['name'])}</b>\n"
+                 f"Пользователь Битрикс24: <code>{row['b24_user_id']}</code>\n"
+                 f"Состояние привязки: {esc_html(row['link_status'])}")
+
+
+async def _group_command(bot: dict[str, Any], ctx: ChatContext, cmd: tuple[str, str],
+                         msg: dict[str, Any], tg_user_id: int,
+                         user: dict[str, Any]) -> Reply | None:
+    name, arg = cmd
+
+    if name in ("start", "help"):
+        return await _help_reply(ctx, tg_user_id)
+    if name in ("status", "list", "overdue"):
+        if not ctx.is_active or not ctx.has_binding:
+            return Reply(texts.MSG_NO_PROJECT)
+        action = {"status": "status", "list": "all", "overdue": "overdue"}[name]
+        return await _open_summary(ctx, tg_user_id, action)
+    if name == "whoami":
+        return await _whoami(tg_user_id)
+    if name == "link":
+        return Reply(texts.MSG_NOT_LINKED)
+
+    if name in ("bind", "bindings", "unbind"):
+        return await _bind_commands(ctx, name, tg_user_id)
+
+
+    if not ctx.is_active:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    if not ctx.has_binding:
+        return Reply(texts.MSG_NO_PROJECT)
+
+    if name in ("task", "ask"):
+        # Порядок ключей важен: {"text": arg, **msg} затирает arg исходным текстом,
+        # и команда «/task» уезжает в заголовок задачи. Проверено на живой задаче.
+        source = msg.get("reply_to_message")
+        if source is None and arg and name == "task":
+            source = {**msg, "text": arg, "caption": None}
+        if source is None:
+            # Ни реплая, ни текста — значит человек не знает, что писать.
+            # Именно для этого и существует опросник.
+            return await _survey_start(ctx, tg_user_id)
+        return await _create_from(ctx, source, tg_user_id, msg.get("message_id"))
+    if name == "comment":
+        return await _comment_command(ctx, msg, arg, tg_user_id)
+    if name == "discussion":
+        return await _discussion(ctx, arg, tg_user_id)
+    if name == "cancel":
+        session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
+                                          tg_user_id)
+        if session is None:
+            return None
+        await survey.finish(session.id, "cancelled")
+        return Reply(texts.MSG_SURVEY_CANCELLED)
+    return None
+
+
+async def _bind_commands(ctx: ChatContext, name: str, tg_user_id: int) -> Reply:
+    if name == "bindings":
+        if not ctx.projects:
+            return Reply(texts.MSG_BINDINGS_EMPTY)
+        lines = [f"• <b>{esc_html(p.name)}</b> (клиент {esc_html(p.client_name)})"
+                 for p in ctx.projects]
+        return Reply("К этому чату привязаны:\n" + "\n".join(lines))
+
+    # Чат может быть ещё ничьим — это нормально: принадлежность и возникает при
+    # привязке. Теннанта берём у того, кто команду выполняет.
+    tenant_id = ctx.tenant_id or await access.tenant_of_user(tg_user_id)
+    if tenant_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    if name == "unbind":
+        # Отвязывать можно только то, что привязано.
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT p.id, p.name, c.name AS client_name FROM chat_bindings b "
+                "JOIN projects p ON p.id = b.project_id "
+                "JOIN clients c ON c.id = p.client_id "
+                "WHERE b.chat_ref = $1 AND b.status = 'active'", ctx.chat_ref)
+        if not rows:
+            return Reply(texts.MSG_BINDINGS_EMPTY)
+        buttons = []
+        for r in rows:
+            token = await issue_token("admin:bind", tenant_id=tenant_id,
+                                      owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                                      payload={"project_id": r["id"], "action": "unbind"})
+            buttons.append([{"text": f"{r['client_name']} · {r['name']}",
+                             "callback_data": f"b:{token}"}])
+        return Reply("Какую привязку снять?", buttons=buttons)
+
+    # Список берём С ПОРТАЛА, а не из своей таблицы: показывать только уже
+    # импортированные проекты — значит показывать три штуки из четырнадцати
+    # и оставлять человека гадать, по какому принципу.
+    try:
+        client = await access.client_for_user(tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            groups = await client.call("sonet_group.user.groups", {})
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24Error as exc:
+        log.warning("не удалось получить проекты портала: %s", exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    async with pool().acquire() as conn:
+        bound = await conn.fetch(
+            "SELECT p.b24_group_id FROM chat_bindings b "
+            "JOIN projects p ON p.id = b.project_id "
+            "WHERE b.chat_ref = $1 AND b.status = 'active'", ctx.chat_ref)
+    already = {int(r["b24_group_id"]) for r in bound}
+
+    items = []
+    for g in groups or []:
+        gid = g.get("GROUP_ID") or g.get("ID")
+        if gid is None or int(gid) in already:
+            continue
+        items.append((int(gid), str(g.get("GROUP_NAME") or g.get("NAME") or gid)))
+    items.sort(key=lambda x: x[1].lower())
+
+    if not items:
+        return Reply(texts.MSG_BIND_ALL_BOUND)
+
+    buttons = []
+    for gid, title in items[:BIND_PAGE]:
+        token = await issue_token("admin:bind", tenant_id=tenant_id,
+                                  owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                                  payload={"b24_group_id": gid, "name": title,
+                                           "action": "bind"})
+        buttons.append([{"text": title[:60], "callback_data": f"b:{token}"}])
+
+    head = texts.MSG_BIND_CHOOSE
+    if len(items) > BIND_PAGE:
+        # Молчаливое усечение — ровно та жалоба, с которой начался этот код:
+        # «показывает не все проекты, непонятно по какому принципу».
+        head += texts.MSG_BIND_TRUNCATED.format(shown=BIND_PAGE, total=len(items))
+    return Reply(head, buttons=buttons)
+
+
+async def _create_from(ctx: ChatContext, source: dict[str, Any], tg_user_id: int,
+                       trigger_message_id: int | None) -> Reply:
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    text = _text_of(source)
+    if not text.strip():
+        return Reply(texts.MSG_EMPTY_SOURCE)
+
+    if len(ctx.projects) > 1:
+        buttons = []
+        for p in ctx.projects:
+            token = await issue_token("task:project", tenant_id=ctx.tenant_id,
+                                      owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                                      payload={"project_id": p.id,
+                                               "source_message_id": source.get("message_id")})
+            buttons.append([{"text": f"{p.client_name} · {p.name}",
+                             "callback_data": f"p:{token}"}])
+        return Reply(texts.MSG_CHOOSE_PROJECT, buttons=buttons)
+
+    return await _do_create(ctx, ctx.projects[0], source, tg_user_id, b24_user_id)
+
+
+async def _do_create(ctx: ChatContext, project: ProjectRef, source: dict[str, Any],
+                     tg_user_id: int, b24_user_id: int) -> Reply:
+    assert ctx.tenant_id is not None
+    source_id = int(source.get("message_id") or 0)
+    draft = task_create.extract(
+        _text_of(source),
+        author=_author(source.get("from") or {}),
+        chat_title=ctx.title,
+        message_link=task_create.message_link(ctx.chat_id, source_id),
+        idem_key=f"tgsrc-{ctx.chat_ref}-{source_id}",
+        source_message_id=source_id)
+
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                             actor_tg_user_id=tg_user_id)
+        async with client:
+            task, created = await task_create.create(
+                client, ctx.tenant_id, project, draft, b24_user_id)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied as exc:
+        return Reply(texts.MSG_NO_RIGHTS_B24.format(reason=esc_html(exc.description)))
+    except errors.B24Error as exc:
+        log.warning("создание задачи не удалось: %s", exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    if not created:
+        return Reply(texts.MSG_TASK_EXISTS.format(
+            task_id=task.get("id"), title=esc_html(task.get("title") or "")))
+
+    async with pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO tg_message_links (tenant_id, chat_ref, message_id, kind, "
+            "b24_task_id) VALUES ($1,$2,$3,'source',$4) ON CONFLICT DO NOTHING",
+            ctx.tenant_id, ctx.chat_ref, source_id, int(task["id"]))
+
+    # Файлы из исходного сообщения переносим в задачу.
+    files_note = await _transfer(ctx, source, int(task["id"]), project, b24_user_id,
+                                 tg_user_id, draft.idem_key)
+
+    responsible = task.get("responsible") or {}
+    text = texts.MSG_TASK_CREATED.format(
+        task_id=task.get("id"), title=esc_html(task.get("title") or ""),
+        project=esc_html(project.name),
+        responsible=esc_html(responsible.get("name") or b24_user_id))
+    return Reply(text + files_note)
+
+
+async def _transfer(ctx: ChatContext, source: dict[str, Any], task_id: int,
+                    project: ProjectRef, b24_user_id: int, tg_user_id: int,
+                    idem_key: str) -> str:
+    """Перенос вложений. Возвращает приписку к ответу — или пустую строку."""
+    attachments = tg_files.extract(source)
+    if not attachments or ctx.tenant_id is None:
+        return ""
+
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT b.token, b.bot_id, b.tenant_id FROM tg_bots b "
+            "JOIN tg_chats c ON c.bot_ref = b.id WHERE c.id = $1", ctx.chat_ref)
+    if row is None:
+        return ""
+    bot_token = box.decrypt(row["token"],
+                            box.aad("tg_bots", "token", row["tenant_id"], row["bot_id"]))
+
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            count, rejected = await comments.transfer_files(
+                client, bot_token, ctx.tenant_id, task_id, project.b24_group_id,
+                b24_user_id, attachments, idem_key)
+    except errors.B24Error as exc:
+        log.warning("перенос вложений не удался: %s", exc)
+        return "\n\n<i>Файлы перенести не удалось.</i>"
+
+    parts = []
+    if count:
+        parts.append(f"Файлов приложено: {count}")
+    for reason in rejected:
+        parts.append(esc_html(reason))
+    return ("\n\n<i>" + "; ".join(parts) + "</i>") if parts else ""
+
+
+# --------------------------------------------------------------------- кнопки
+async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
+    data = str(cb.get("data") or "")
+    user = cb.get("from") or {}
+    tg_user_id = int(user.get("id") or 0)
+    msg = cb.get("message") or {}
+    chat_id = int((msg.get("chat") or {}).get("id") or 0)
+
+    ns, _, token = data.partition(":")
+    row = await consume_token(token, tg_user_id)
+    if row is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
+
+    payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+    ctx = await load_chat_context(chat_id, msg.get("message_thread_id"))
+    if ctx is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+
+    # Теннант берётся из токена: он записан в момент выдачи кнопки и не зависит от
+    # того, стал ли чат к этому моменту чьим-то.
+    tenant_id = int(row["tenant_id"]) if row["tenant_id"] is not None else ctx.tenant_id
+    if tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+
+    if ns == "s":
+        return await _survey_begin(ctx, tg_user_id, int(payload["template_id"]))
+    if ns == "k":
+        session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
+                                          tg_user_id)
+        if session is None:
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        items = await survey.questions(tenant_id, session.template_id)
+        await survey.skip(session)
+        return await _survey_next(ctx, session, items, tg_user_id)
+    if ns == "x":
+        await survey.finish(int(payload["session_id"]), "cancelled")
+        return Reply(texts.MSG_SURVEY_CANCELLED)
+    if ns == "c":
+        return await _survey_create(ctx, tg_user_id, int(payload["session_id"]),
+                                    int(payload["project_id"]))
+    if ns == "m":
+        action = str(payload.get("action") or "status")
+        if action == "new":
+            return await _survey_start(ctx, tg_user_id)
+        return await _open_summary(ctx, tg_user_id, action)
+    if ns == "t":
+        return await _open_card(ctx, tg_user_id, int(payload["task_id"]))
+    if ns == "a":
+        return await _task_action(ctx, tg_user_id, int(payload["task_id"]),
+                                  str(payload.get("act") or "refresh"))
+    if ns == "b":
+        return await _apply_bind(ctx, tenant_id, payload, tg_user_id)
+    if ns == "p":
+        b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
+        if b24_user_id is None:
+            return Reply(texts.MSG_NOT_LINKED)
+        project = next((p for p in ctx.projects if p.id == payload["project_id"]), None)
+        if project is None:
+            async with pool().acquire() as conn:
+                r = await conn.fetchrow(
+                    "SELECT p.id, p.b24_group_id, p.name, c.name AS client_name "
+                    "FROM projects p JOIN clients c ON c.id = p.client_id WHERE p.id = $1",
+                    payload["project_id"])
+            if r is None:
+                return Reply(texts.MSG_DIALOG_EXPIRED)
+            project = ProjectRef(r["id"], r["b24_group_id"], r["name"], r["client_name"])
+        source = {"message_id": payload.get("source_message_id"),
+                  "text": payload.get("text", ""), "from": user}
+        return await _do_create(ctx, project, source, tg_user_id, b24_user_id)
+    return None
+
+
+async def _apply_bind(ctx: ChatContext, tenant_id: int, payload: dict[str, Any],
+                      tg_user_id: int) -> Reply:
+    action = payload.get("action", "bind")
+
+    if "b24_group_id" in payload:
+        # Проект выбран с портала — импортируем его при первой привязке.
+        b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
+        if b24_user_id is None:
+            return Reply(texts.MSG_NOT_LINKED)
+        project_id = await _import_project(
+            tenant_id, b24_user_id, int(payload["b24_group_id"]),
+            str(payload.get("name") or ""))
+        if project_id is None:
+            return Reply(texts.MSG_B24_UNAVAILABLE)
+    else:
+        project_id = int(payload["project_id"])
+
+    async with pool().acquire() as conn:
+        proj = await conn.fetchrow(
+            "SELECT p.name, c.name AS client_name FROM projects p "
+            "JOIN clients c ON c.id = p.client_id WHERE p.id = $1", project_id)
+        if proj is None:
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+
+        if action == "unbind":
+            await conn.execute(
+                "UPDATE chat_bindings SET status = 'disabled' "
+                "WHERE chat_ref = $1 AND project_id = $2", ctx.chat_ref, project_id)
+            return Reply(texts.MSG_UNBOUND)
+
+        # Чужой чат перехватить нельзя: если он уже принадлежит другому теннанту,
+        # привязка не выполняется.
+        owner = await conn.fetchval("SELECT tenant_id FROM tg_chats WHERE id = $1",
+                                    ctx.chat_ref)
+        if owner is not None and int(owner) != tenant_id:
+            log.warning("попытка привязать чужой чат %s: владелец %s, просят %s",
+                        ctx.chat_ref, owner, tenant_id)
+            return Reply(texts.MSG_BIND_CONFLICT)
+
+        try:
+            await conn.execute(
+                "INSERT INTO chat_bindings (tenant_id, chat_ref, project_id, status) "
+                "VALUES ($1,$2,$3,'active') "
+                "ON CONFLICT (chat_ref, COALESCE(topic_ref, 0), project_id) "
+                "DO UPDATE SET status = 'active'",
+                tenant_id, ctx.chat_ref, project_id)
+        except Exception as exc:  # триггер «один чат — один клиент»
+            if "another client" in str(exc):
+                return Reply(texts.MSG_BIND_CONFLICT)
+            raise
+
+        # Чат перестаёт быть ничейным: теперь он обслуживает конкретного клиента.
+        await conn.execute(
+            "UPDATE tg_chats SET tenant_id = $2, status = 'active', "
+            "claimed_at = COALESCE(claimed_at, now()) WHERE id = $1",
+            ctx.chat_ref, tenant_id)
+
+    log.info("чат %s привязан к проекту %s пользователем TG %s",
+             ctx.chat_ref, project_id, tg_user_id)
+    return Reply(texts.MSG_BIND_DONE.format(
+        project=esc_html(proj["name"]), client=esc_html(proj["client_name"])))

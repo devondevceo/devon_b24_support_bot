@@ -1,0 +1,14 @@
+# Нижние границы, а не жёсткие пины: точные версии фиксируются в requirements.lock
+# после первой успешной сборки в CI.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+asyncpg>=0.30
+sqlalchemy[asyncio]>=2.0
+alembic>=1.14
+pydantic>=2.9
+pydantic-settings>=2.6
+cryptography>=43.0
+httpx[socks]>=0.28  # socks-экстра нужна: api.telegram.org
+                     # недоступен с сервера напрямую, ходим через SOCKS5
+orjson>=3.10
+python-multipart>=0.0.12

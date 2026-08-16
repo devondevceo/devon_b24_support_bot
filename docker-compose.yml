@@ -1,0 +1,182 @@
+# Скелет для SPIKE A: приём установки приложения Битрикс24 и placement.
+# Полный состав сервисов (bot, worker) добавляется после спайка, см. docs/10-architecture.md.
+#
+# ВАЖНО про ресурсы: машина общая с devon-website, mclick_landing, devon-billing,
+# у которых лимитов нет. Наши контейнеры обязаны проигрывать им при конкуренции.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: b24sdbot-postgres
+    restart: always
+    shm_size: 128mb
+    mem_limit: 1200m
+    memswap_limit: 1600m
+    cpu_shares: 512
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # ВНИМАНИЕ: postgres требует "-c" и значение РАЗНЫМИ аргументами.
+    # Форма "-c=key=value" даёт FATAL: unrecognized configuration parameter "".
+    command:
+      - postgres
+      - -c
+      - max_connections=40
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - autovacuum_max_workers=2
+      - -c
+      - autovacuum_work_mem=48MB
+      - -c
+      - autovacuum_naptime=30s
+      - -c
+      - wal_compression=on
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - max_parallel_workers_per_gather=1
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # pg_isready проверяет только то, что сервер отвечает: на кластере, где база
+    # не создалась, он рапортует healthy. Проверяем реальным запросом к нашей БД.
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U $$POSTGRES_USER -d $$POSTGRES_DB -c 'SELECT 1' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  api:
+    build: .
+    container_name: b24sdbot-api
+    restart: always
+    mem_limit: 256m
+    memswap_limit: 384m
+    cpu_shares: 512
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+      - traefik-public
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    labels:
+      # TRAEFIK_ENABLE=false на время, пока не создана A-запись домена: иначе Traefik
+      # уходит в цикл неудачных ACME-валидаций и выжигает лимит Let's Encrypt
+      # (5 неудачных проверок на домен в час).
+      - "traefik.enable=${TRAEFIK_ENABLE:-true}"
+      - "traefik.docker.network=traefik-public"
+
+      # --- Маршрут 1: страницы, открываемые Битриксом В IFRAME -------------
+      # security-headers@file СЮДА НЕ ПОДКЛЮЧАТЬ: в нём frameDeny: true,
+      # то есть X-Frame-Options: DENY, и портал не сможет открыть страницу.
+      # Заголовок Content-Security-Policy: frame-ancestors выставляет само
+      # приложение, динамически под домен проверенного портала.
+      - "traefik.http.routers.b24sdbot-frame.rule=Host(`${DOMAIN}`) && (PathPrefix(`/b24/placement`) || PathPrefix(`/app`))"
+      - "traefik.http.routers.b24sdbot-frame.entrypoints=websecure"
+      - "traefik.http.routers.b24sdbot-frame.tls=true"
+      - "traefik.http.routers.b24sdbot-frame.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.b24sdbot-frame.middlewares=b24sdbot-noframe-headers"
+      - "traefik.http.routers.b24sdbot-frame.service=b24sdbot"
+      - "traefik.http.middlewares.b24sdbot-noframe-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.b24sdbot-noframe-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.b24sdbot-noframe-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.b24sdbot-noframe-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
+
+      # --- Маршрут 2: всё остальное, обычные заголовки безопасности --------
+      - "traefik.http.routers.b24sdbot.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.b24sdbot.entrypoints=websecure"
+      - "traefik.http.routers.b24sdbot.tls=true"
+      - "traefik.http.routers.b24sdbot.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.b24sdbot.middlewares=security-headers@file"
+      - "traefik.http.routers.b24sdbot.service=b24sdbot"
+
+      - "traefik.http.services.b24sdbot.loadbalancer.server.port=8000"
+
+  # Приём апдейтов Telegram. Long polling, а не вебхук: проверено, что серверы
+  # Telegram не могут достучаться до этого хоста, а хост — до api.telegram.org.
+  # Исходящие вызовы идут через SOCKS5 (TG_PROXY_URL).
+  bot:
+    build: .
+    container_name: b24sdbot-bot
+    restart: always
+    mem_limit: 320m
+    memswap_limit: 448m
+    cpu_shares: 512
+    env_file: .env
+    command: ["python", "-m", "b24bot.bot.poller"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "python", "-m", "b24bot.core.heartbeat", "bot", "180"]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # События Битрикса -> уведомления в чат, отправка очереди, ретенция.
+  # Отдельно от бота: обработка события ходит в портал и может занять секунды,
+  # а поллер обязан быстро крутить getUpdates.
+  worker:
+    build: .
+    container_name: b24sdbot-worker
+    restart: always
+    mem_limit: 320m
+    memswap_limit: 448m
+    cpu_shares: 512
+    env_file: .env
+    command: ["python", "-m", "b24bot.worker.main"]
+    # Воркер не слушает порт. Наследованный из образа HEALTHCHECK с curl на
+    # localhost:8000 держал его вечно unhealthy — проверяем оборот цикла.
+    healthcheck:
+      test: ["CMD", "python", "-m", "b24bot.core.heartbeat", "worker", "120"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  pgdata:
+    name: b24sdbot-pgdata
+
+networks:
+  internal:
+    name: b24sdbot-internal
+  traefik-public:
+    external: true
