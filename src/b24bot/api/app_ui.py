@@ -22,6 +22,7 @@ import asyncpg
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
+from b24bot.api import ui_kit as ui
 from b24bot.core.config import get_settings, is_trusted_portal_domain
 from b24bot.core.text import esc_attr, esc_html
 from b24bot.crypto import box
@@ -59,38 +60,12 @@ async def load_session(token: str) -> asyncpg.Record | None:
 
 
 # ---------------------------------------------------------------------- вёрстка
-STYLE = """
- body{font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:20px;
-      color:#1a1a1a;background:#fff}
- .card{max-width:680px;border:1px solid #e3e5e7;border-radius:10px;padding:18px 20px;
-       margin:0 0 14px}
- h1{font-size:17px;margin:0 0 14px} h2{font-size:14px;margin:0 0 10px;color:#525c69}
- code{background:#f4f5f6;padding:1px 5px;border-radius:4px;font-size:12px}
- .row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #f2f3f5}
- .row:last-child{border-bottom:0} .row span:first-child{color:#828b95}
- .ok{color:#1f8b4c} .warn{color:#b58200} .err{color:#c8332e}
- input[type=text]{width:100%;padding:9px 11px;border:1px solid #d5d7db;border-radius:6px;
-                  font:13px/1.4 monospace;box-sizing:border-box}
- button{background:#2066b0;color:#fff;border:0;border-radius:6px;padding:9px 18px;
-        font-size:14px;cursor:pointer;margin-top:10px}
- button.sec{background:#eaecef;color:#1a1a1a}
- .hint{color:#828b95;font-size:12px;margin-top:8px}
- .msg{padding:10px 12px;border-radius:6px;margin:0 0 14px}
- .msg.ok{background:#eaf6ee} .msg.err{background:#fdecec} .msg.warn{background:#fdf6e3}
- .chat{padding:12px 0;border-bottom:1px solid #eef0f2} .chat:last-of-type{border-bottom:0}
- .chat-head{display:flex;justify-content:space-between;align-items:baseline;margin:0 0 8px}
- .chat-name{font-weight:600;font-size:15px}
- .proj{display:flex;justify-content:space-between;align-items:center;
-       padding:5px 0 5px 14px;border-left:2px solid #e3e5e7;margin:0 0 2px}
- .muted{color:#828b95;font-weight:400}
- .link-btn{background:none;border:0;color:#2066b0;cursor:pointer;padding:0;margin:0;
-           font-size:12px;text-decoration:underline}
- .bind{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:10px 0 0}
- .bind label{display:flex;flex-direction:column;font-size:12px;color:#828b95;gap:3px}
- .bind select{padding:7px 9px;border:1px solid #d5d7db;border-radius:6px;font-size:13px;
-              max-width:260px}
- .bind button{margin:0;padding:8px 16px}
-"""
+TABS = ("overview", "chats", "bot", "team")
+
+
+def safe_tab(value: str) -> str:
+    """Активная вкладка возвращается с клиента, поэтому сверяется со списком."""
+    return value if value in TABS else "overview"
 
 
 def page(body: str, portal_domain: str | None, *, title: str = "Поддержка в Telegram"
@@ -99,11 +74,12 @@ def page(body: str, portal_domain: str | None, *, title: str = "Поддержк
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
             f"<title>{esc_html(title)}</title>"
             f'<script src="//api.bitrix24.com/api/v1/"></script>'
-            f"<style>{STYLE}</style></head><body>{body}"
-            f"<script>BX24.init(function(){{BX24.fitWindow();}});</script>"
-            f"</body></html>")
+            f"<style>{ui.CSS}</style></head>"
+            f'<body><div class="shell">{body}</div>'
+            f"<script>{ui.SCRIPT}</script></body></html>")
     resp = HTMLResponse(html)
     # frame-ancestors — динамически, только под домен проверенного портала.
+    # Общий *.bitrix24.ru позволил бы встроить страницу любому чужому порталу.
     if portal_domain and is_trusted_portal_domain(portal_domain):
         resp.headers["Content-Security-Policy"] = f"frame-ancestors https://{portal_domain}"
     else:
@@ -111,14 +87,104 @@ def page(body: str, portal_domain: str | None, *, title: str = "Поддержк
     return resp
 
 
-def _row(label: str, value: str, css: str = "") -> str:
-    cls = f' class="{css}"' if css else ""
-    return f"<div class='row'><span>{esc_html(label)}</span><span{cls}>{value}</span></div>"
+def expired_page() -> HTMLResponse:
+    """Истёкшая сессия — тоже экран, а не голый текст на белом фоне."""
+    return page(
+        _head_html("Поддержка в Telegram", "")
+        + ui.panel("", ui.empty(
+            "Сессия истекла",
+            "Страница была открыта дольше получаса. Закройте приложение и откройте "
+            "его заново из меню Битрикс24 — все настройки на месте.",
+            icon_name="refresh")),
+        None)
+
+
+def _head_html(title: str, sub_html: str) -> str:
+    """Шапка: кто мы, какой портал, кто вы. Одинаковая на всех экранах."""
+    sub = f'<div class="head-sub">{sub_html}</div>' if sub_html else ""
+    return (f'<header class="head"><div class="head-id">'
+            f'<div class="mark">{ui.icon("send", 19)}</div>'
+            f'<div class="head-t"><h1>{esc_html(title)}</h1>{sub}</div>'
+            f"</div></header>")
+
+
+def _health(bot: asyncpg.Record | None, chats: int, bindings: int) -> tuple[str, str, str]:
+    """Одна строка о том, работает ли интеграция.
+
+    Раньше это приходилось собирать в голове из шести строк «свойство — значение»
+    на трёх разных карточках. Между тем ответ почти всегда определяется одним
+    фактом, и порядок проверок здесь — это порядок, в котором всё ломается.
+
+    Включённый privacy mode стоит рядом с отказом Telegram намеренно: бот при нём
+    формально «работает», но не видит сообщений в группах, то есть продукта нет.
+    """
+    if bot is None:
+        return ("warn", "Бот не подключён",
+                "Пока не введён токен Telegram-бота, из чатов не работает ничего.")
+    if bot["status"] == "suspended":
+        return ("err", "Бот приостановлен",
+                bot["last_error"] or "Подключение остановлено из соображений безопасности.")
+    if bot["status"] == "error":
+        return ("err", "Ошибка подключения",
+                bot["last_error"] or "Telegram вернул ошибку при последней проверке.")
+    if bot["privacy_mode_off"] is False:
+        return ("err", "Включён privacy mode",
+                "Бот видит в группах только команды и упоминания. Создать задачу "
+                "ответом на сообщение коллеги нельзя, пока это не выключено.")
+    if bot["status"] == "pending":
+        return ("warn", "Бот подключается", "Подключение ещё не подтверждено.")
+    if chats == 0:
+        return ("warn", "Бот не добавлен ни в один чат",
+                "Добавьте бота в групповой чат Telegram — чат появится здесь сам.")
+    if bindings == 0:
+        return ("warn", "Ни один чат не привязан к проекту",
+                "Бот в чатах есть, но не знает, в какой проект складывать задачи.")
+    if bot["privacy_mode_off"] is None:
+        return ("warn", "Подключение давно не проверялось",
+                "Не удалось подтвердить настройки бота при последней проверке.")
+    return ("ok", "Интеграция работает",
+            "Бот на связи, чаты привязаны к проектам. Задачи создаются из чатов.")
+
+
+def _tabs_html(active: str, items: list[tuple[str, str, str, int]]) -> str:
+    """Вкладки с счётчиками.
+
+    Счётчик скрыт от скринридера и продублирован в `aria-label`: иначе имя
+    кнопки склеивается в «Чаты3», и это же произносится вслух.
+    """
+    out = []
+    for key, label, icon_name, count in items:
+        sel = "true" if key == active else "false"
+        cnt = (f'<span class="count" aria-hidden="true">{count}</span>'
+               if count else "")
+        name = f"{label}, {count}" if count else label
+        out.append(
+            f'<button type="button" class="tab" role="tab" data-tab="{esc_attr(key)}" '
+            f'id="tab-{esc_attr(key)}" aria-controls="panel-{esc_attr(key)}" '
+            f'aria-selected="{sel}" tabindex="{"0" if key == active else "-1"}" '
+            f'aria-label="{esc_attr(name)}">'
+            f'{ui.icon(icon_name, 15)}<span>{esc_html(label)}</span>{cnt}</button>')
+    return f'<div class="tabs" role="tablist" aria-label="Разделы">{"".join(out)}</div>'
+
+
+def _panel_html(key: str, active: str, body_html: str) -> str:
+    hidden = "" if key == active else " hidden"
+    return (f'<div role="tabpanel" data-panel="{esc_attr(key)}" id="panel-{esc_attr(key)}" '
+            f'aria-labelledby="tab-{esc_attr(key)}"{hidden}>{body_html}</div>')
 
 
 async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
-                      session: str, *, message: str = "", message_kind: str = "ok") -> str:
-    """Главный экран приложения."""
+                      session: str, *, message: str = "", message_kind: str = "ok",
+                      active_tab: str = "overview") -> str:
+    """Главный экран приложения.
+
+    Два разных экрана, а не один с выключенными кнопками. Сотруднику нужен ровно
+    один ответ — привязан ли его Telegram и в каких чатах он может работать;
+    остальное для него шум, который раньше занимал четыре карточки из пяти.
+    Управляющему нужен пульт, и он получает вкладки вместо простыни.
+    """
+    active = safe_tab(active_tab)
+
     async with pool().acquire() as conn:
         bot = await conn.fetchrow(
             "SELECT bot_id, username, status, mode, privacy_mode_off, last_check_at, "
@@ -128,99 +194,185 @@ async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
             "       (SELECT count(*) FROM projects WHERE tenant_id = $1 "
             "        AND status = 'active') AS projects, "
             "       (SELECT count(*) FROM chat_bindings WHERE tenant_id = $1 "
-            "        AND status = 'active') AS bindings",
+            "        AND status = 'active') AS bindings, "
+            "       (SELECT count(*) FROM tg_chats c LEFT JOIN tg_bots b "
+            "         ON b.id = c.bot_ref WHERE c.status <> 'migrated' "
+            "         AND (c.tenant_id = $1 OR (c.tenant_id IS NULL "
+            "              AND b.tenant_id = $1))) AS chats, "
+            "       (SELECT count(*) FROM tenant_members WHERE tenant_id = $1) AS members",
             tenant["id"])
 
-    msg_html = (f"<div class='msg {message_kind}'>{message}</div>") if message else ""
-
-    # ------------------------------------------------------ статус интеграции
-    scopes = len(tenant["granted_scope"] or [])
-    status_rows = (
-        _row("Портал", f"<code>{esc_html(tenant['b24_domain'])}</code>")
-        + _row("Установка", "<span class='ok'>завершена</span>"
-               if tenant["install_state"] == "finished"
-               else f"<span class='warn'>{esc_html(tenant['install_state'])}</span>")
-        + _row("Выдано прав", str(scopes))
-        + _row("Клиентов", str(counts["clients"]))
-        + _row("Проектов", str(counts["projects"]))
-        + _row("Привязанных чатов", str(counts["bindings"]))
-    )
-
-    # --------------------------------------------------------------- бот
-    if bot:
-        privacy = bot["privacy_mode_off"]
-        privacy_html = {
-            True: "<span class='ok'>выключен, как надо</span>",
-            False: "<span class='err'>ВКЛЮЧЁН — бот не увидит сообщения в группах</span>",
-            None: "<span class='warn'>не проверено</span>",
-        }[privacy]
-        status_html = {
-            "active": "<span class='ok'>работает</span>",
-            "pending": "<span class='warn'>подключается</span>",
-            "error": f"<span class='err'>ошибка: {esc_html(bot['last_error'] or '')}</span>",
-            "suspended": "<span class='err'>приостановлен</span>",
-        }.get(bot["status"], esc_html(bot["status"]))
-
-        bot_rows = (
-            _row("Бот", f"<code>@{esc_html(bot['username'])}</code>")
-            + _row("Состояние", status_html)
-            + _row("Режим приёма", "long polling через прокси"
-                   if bot["mode"] == "polling" else "вебхук")
-            + _row("Privacy mode", privacy_html)
-            + _row("Проверен", bot["last_check_at"].strftime("%d.%m.%Y %H:%M")
-                   if bot["last_check_at"] else "—")
-        )
-        bot_form = (
-            f"{bot_rows}"
-            f"<form method='post' action='/b24/app/bot'>"
-            f"<input type='hidden' name='session' value='{esc_attr(session)}'>"
-            f"<input type='hidden' name='action' value='recheck'>"
-            f"<button class='sec' type='submit'>Проверить подключение</button>"
-            f"</form>"
-            if is_admin else bot_rows)
-    else:
-        bot_form = (
-            "<p>Бот пока не подключён. Создайте его в "
-            "<code>@BotFather</code> и вставьте токен сюда.</p>"
-            f"<form method='post' action='/b24/app/bot'>"
-            f"<input type='hidden' name='session' value='{esc_attr(session)}'>"
-            f"<input type='hidden' name='action' value='save'>"
-            f"<input type='text' name='token' placeholder='123456789:AA...' "
-            f"autocomplete='off' spellcheck='false'>"
-            f"<button type='submit'>Подключить бота</button>"
-            f"</form>"
-            "<div class='hint'>В BotFather обязательно выполните "
-            "<code>/setprivacy</code> → выберите бота → <b>Disable</b>. "
-            "Иначе бот в группе видит только команды и упоминания, и создать задачу "
-            "ответом на сообщение коллеги будет нельзя.</div>"
-            if is_admin else
-            "<p>Бот не подключён. Обратитесь к администратору портала.</p>")
-
-    link_block = await _link_block(tenant, b24_user_id, bot)
-    chats_block = await _chats_block(tenant, b24_user_id, is_admin, session)
-
-    can_roles = await can_manage_admins(int(tenant["id"]), b24_user_id, is_admin)
     my_role = await access.role_of_b24_user(int(tenant["id"]), b24_user_id)
-    admins_block = await _admins_block(tenant, b24_user_id, can_roles, session)
+    is_manager = is_admin or my_role == access.TENANT_ADMIN
+    linked = await _link_state(int(tenant["id"]), b24_user_id)
 
-    admin_note = "" if is_admin else (
-        "<div class='hint'>Вы вошли как обычный пользователь. Настройки доступны "
-        "администратору портала.</div>")
+    flash = ui.banner(message, message_kind) if message else ""
 
-    rights = "администратор портала" if is_admin else (
-        "администратор теннанта" if my_role == access.TENANT_ADMIN else "сотрудник")
+    if not is_manager:
+        return await _employee_screen(tenant, b24_user_id, bot, linked, flash)
 
-    return (
-        f"{msg_html}"
-        f"<div class='card'><h1>Поддержка в Telegram</h1>"
-        f"<h2>Интеграция</h2>{status_rows}{admin_note}</div>"
-        f"<div class='card'><h2>Telegram-бот</h2>{bot_form}</div>"
-        f"<div class='card'><h2>Чаты</h2>{chats_block}</div>"
-        f"<div class='card'><h2>Администраторы</h2>{admins_block}</div>"
-        f"<div class='card'><h2>Вы</h2>"
-        f"{_row('Пользователь Битрикс24', f'<code>{b24_user_id}</code>')}"
-        f"{_row('Права', rights)}"
-        f"{link_block}</div>")
+    return await _manager_screen(tenant, b24_user_id, is_admin, session, bot, counts,
+                                 linked, active, flash)
+
+
+# ------------------------------------------------------------------- сотрудник
+async def _employee_screen(tenant: asyncpg.Record, b24_user_id: int,
+                           bot: asyncpg.Record | None, linked: asyncpg.Record | None,
+                           flash: str) -> str:
+    """Экран обычного сотрудника: одно действие и ответ на один вопрос."""
+    head = _head_html("Поддержка в Telegram",
+                      f'{ui.icon("shield", 13)}<span>{esc_html(tenant["b24_domain"])}</span>'
+                      f'<span>·</span><span>вы — сотрудник</span>')
+
+    rows = await _my_projects(int(tenant["id"]))
+    if rows:
+        projects = f'<ul class="list">{"".join(rows)}</ul>'
+        projects_panel = ui.panel("Ваши проекты в Telegram", projects,
+                                  icon_name="folder", flush=True)
+    else:
+        projects_panel = ui.panel(
+            "Ваши проекты в Telegram",
+            ui.empty("Пока ни один чат не привязан",
+                     "Как только администратор привяжет чат к проекту, он появится "
+                     "здесь, и из него можно будет создавать задачи.",
+                     icon_name="folder"),
+            icon_name="folder")
+
+    link = await _link_panel(tenant, b24_user_id, bot, linked)
+    return head + flash + link + projects_panel
+
+
+async def _my_projects(tenant_id: int) -> list[str]:
+    """Проекты и чаты теннанта — то, что человек увидит в Telegram."""
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.name AS project, c.name AS client, ch.title, ch.chat_id
+              FROM chat_bindings b
+              JOIN projects p ON p.id = b.project_id
+              JOIN clients  c ON c.id = p.client_id
+              JOIN tg_chats ch ON ch.id = b.chat_ref
+             WHERE b.tenant_id = $1 AND b.status = 'active'
+             ORDER BY p.name
+            """, tenant_id)
+    out = []
+    for r in rows:
+        chat = r["title"] or f"чат {r['chat_id']}"
+        out.append(ui.item(
+            esc_html(r["project"]),
+            sub_html=f'{ui.icon("chat", 12)} {esc_html(chat)}'
+                     f' · клиент {esc_html(r["client"])}'))
+    return out
+
+
+# ------------------------------------------------------------------ управление
+async def _manager_screen(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
+                          session: str, bot: asyncpg.Record | None,
+                          counts: asyncpg.Record, linked: asyncpg.Record | None,
+                          active: str, flash: str) -> str:
+    rights = "администратор портала" if is_admin else "администратор теннанта"
+    head = _head_html("Поддержка в Telegram",
+                      f'{ui.icon("shield", 13)}<span>{esc_html(tenant["b24_domain"])}</span>'
+                      f'<span>·</span><span>{esc_html(rights)}</span>')
+
+    chats_n, bindings_n = int(counts["chats"]), int(counts["bindings"])
+    kind, title, detail = _health(bot, chats_n, bindings_n)
+
+    # Не привязанный к Telegram админ не может ничего сделать в самих чатах —
+    # права у него есть, а инструмента нет. Это стоит отдельного предупреждения.
+    warn_link = ""
+    if not (linked and linked["link_status"] == "authorized"):
+        warn_link = ui.banner(
+            "<b>Ваш Telegram не привязан.</b> Права администратора у вас есть, но "
+            "создавать и комментировать задачи из чатов вы пока не можете — "
+            "привязка находится во вкладке «Команда».", "warn")
+
+    tabs = _tabs_html(active, [
+        ("overview", "Обзор", "info", 0),
+        ("chats", "Чаты", "chat", chats_n),
+        ("bot", "Бот", "send", 0),
+        ("team", "Команда", "users", int(counts["members"])),
+    ])
+
+    overview = await _overview_panel(tenant, counts, bot, kind, title, detail,
+                                     is_admin, session, active)
+    chats = await _chats_block(tenant, b24_user_id, is_admin, session, active)
+    bot_panel = _bot_panel(bot, is_admin, session, active)
+    team = await _team_panel(tenant, b24_user_id, is_admin, session, bot, linked, active)
+
+    body = (_panel_html("overview", active, (flash if active == "overview" else "") + overview)
+            + _panel_html("chats", active, (flash if active == "chats" else "") + chats)
+            + _panel_html("bot", active, (flash if active == "bot" else "") + bot_panel)
+            + _panel_html("team", active, (flash if active == "team" else "") + team))
+
+    return head + warn_link + tabs + body
+
+
+async def _overview_panel(tenant: asyncpg.Record, counts: asyncpg.Record,
+                          bot: asyncpg.Record | None, kind: str, title: str,
+                          detail: str, is_admin: bool, session: str,
+                          active: str) -> str:
+    """Обзор — либо мастер настройки, либо состояние работающей интеграции.
+
+    Пока настройка не доведена до конца, счётчики бессмысленны: везде нули.
+    Поэтому до первой привязки здесь стоит список шагов, а не плитки.
+    """
+    chats_n, bindings_n = int(counts["chats"]), int(counts["bindings"])
+    done = bot is not None and bot["status"] in ("active", "pending")
+    complete = done and chats_n > 0 and bindings_n > 0
+
+    health = (f'<div class="row-wrap" style="align-items:flex-start">'
+              f'{ui.badge(title, kind)}</div>'
+              f'<p class="hint" style="margin-top:10px">{esc_html(detail)}</p>')
+
+    if not complete:
+        # У активного шага есть кнопка, ведущая ровно туда, где он выполняется.
+        # Второй шаг делается в самом Telegram, поэтому ведёт к боту, а не к вкладке.
+        open_bot = ""
+        if bot is not None and bot["username"]:
+            open_bot = ui.link_button(f"https://t.me/{bot['username']}",
+                                      "Открыть бота в Telegram", variant="sec",
+                                      icon_name="external")
+        steps = "".join([
+            ui.step(1, "Подключить Telegram-бота",
+                    "Создайте бота в @BotFather, выключите ему privacy mode и введите "
+                    "токен во вкладке «Бот».",
+                    state="done" if done else "now",
+                    action_html=ui.goto_button("bot", "Перейти к настройке бота",
+                                               icon_name="send")),
+            ui.step(2, "Добавить бота в рабочий чат",
+                    "Добавьте бота в групповой чат с клиентом. Чат появится во вкладке "
+                    "«Чаты» сам — вводить его идентификатор вручную нельзя.",
+                    state="done" if chats_n else ("now" if done else "todo"),
+                    action_html=open_bot),
+            ui.step(3, "Привязать чат к проекту",
+                    "Свяжите чат с рабочей группой Битрикс24 — туда будут попадать "
+                    "задачи из этого чата.",
+                    state="done" if bindings_n else
+                          ("now" if done and chats_n else "todo"),
+                    action_html=ui.goto_button("chats", "Перейти к чатам",
+                                               icon_name="chat")),
+        ])
+        return (ui.panel("Состояние", health, icon_name="info")
+                + ui.panel("Что осталось настроить", f'<ol class="steps">{steps}</ol>',
+                           icon_name="check-circle", flush=True))
+
+    tiles = ui.stats([
+        (str(chats_n), "чатов с ботом"),
+        (str(bindings_n), "привязок к проектам"),
+        (str(counts["projects"]), "проектов"),
+        (str(counts["clients"]), "клиентов"),
+    ])
+    portal = (ui.field("Портал", f"<code>{esc_html(tenant['b24_domain'])}</code>")
+              + ui.field("Установка приложения",
+                         ui.badge("завершена", "ok")
+                         if tenant["install_state"] == "finished"
+                         else ui.badge(str(tenant["install_state"]), "warn"))
+              + ui.field("Прав выдано порталом",
+                         f'<span class="tnum">{len(tenant["granted_scope"] or [])}</span>'))
+    return (ui.panel("Состояние", health, icon_name="info")
+            + ui.panel("Охват", tiles, icon_name="folder")
+            + ui.panel("Портал", portal, icon_name="shield"))
 
 
 async def _portal_projects(tenant_id: int, b24_user_id: int
@@ -259,7 +411,7 @@ async def _portal_projects(tenant_id: int, b24_user_id: int
 
 
 async def _chats_block(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
-                       session: str) -> str:
+                       session: str, active: str = "chats") -> str:
     """Чаты, где присутствует бот теннанта, и их привязки к проектам.
 
     Показываем только свои чаты и ничейные, увиденные НАШИМ ботом. Чужой чат сюда
@@ -297,10 +449,14 @@ async def _chats_block(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
     known_ids = {int(k["b24_group_id"]) for k in known}
 
     if not chats:
-        return ("<p>Бот пока не добавлен ни в один чат.</p>"
-                "<div class='hint'>Добавьте бота в групповой чат Telegram — чат появится "
-                "здесь сам. Вводить идентификатор чата вручную нельзя: принадлежность "
-                "подтверждается фактом присутствия бота.</div>")
+        return ui.panel(
+            "Чаты",
+            ui.empty("Бот пока не добавлен ни в один чат",
+                     "Добавьте бота в групповой чат Telegram — чат появится здесь сам. "
+                     "Вводить идентификатор чата вручную нельзя: принадлежность "
+                     "подтверждается фактом присутствия бота.",
+                     icon_name="chat"),
+            icon_name="chat")
 
     by_chat: dict[int, list[asyncpg.Record]] = {}
     for b in bindings:
@@ -315,117 +471,279 @@ async def _chats_block(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
 
     out = []
     for ch in chats:
-        label, css = state.get(ch["status"], (ch["status"], ""))
+        label, kind = state.get(ch["status"], (str(ch["status"]), "neutral"))
         chat_name = ch["title"] or f"чат {ch['chat_id']}"
-        head = (f"<div class='chat-head'>"
-                f"<span class='chat-name'>{esc_html(chat_name)}</span>"
-                f"<span class='{css}'>{esc_html(label)}</span></div>")
+        forum = " · форум" if ch["is_forum"] else ""
+        head = ui.row(
+            esc_html(chat_name),
+            sub_html=f'<span class="tnum">{esc_html(ch["chat_id"])}</span>{esc_html(forum)}',
+            actions_html=ui.badge(label, kind))
 
         linked = by_chat.get(ch["id"], [])
-        items = []
+        rows = []
         for b in linked:
             btn = ""
             if is_admin:
-                btn = (
-                    "<form method='post' action='/b24/app/chat' style='display:inline'>"
-                    f"<input type='hidden' name='session' value='{esc_attr(session)}'>"
-                    "<input type='hidden' name='action' value='unbind'>"
-                    f"<input type='hidden' name='binding_id' value='{b['id']}'>"
-                    "<button class='link-btn' type='submit'>отвязать</button></form>")
-            items.append(
-                f"<div class='proj'><span><b>{esc_html(b['project'])}</b>"
-                f"<span class='muted'> · клиент {esc_html(b['client'])}</span></span>"
-                f"{btn}</div>")
-        if not linked:
-            items.append("<div class='proj muted'>проектов пока нет</div>")
+                btn = ui.action_form(
+                    "/b24/app/chat",
+                    {"session": session, "action": "unbind", "binding_id": b["id"],
+                     "tab": active},
+                    "Отвязать", variant="danger", icon_name="unlink",
+                    confirm=f"Отвязать проект «{b['project']}» от чата "
+                            f"«{chat_name}»?\n\nЗадачи из этого чата больше не будут "
+                            f"попадать в проект.")
+            rows.append(
+                f'<li class="sub-i"><span class="item-m">'
+                f'<span class="item-t">{esc_html(b["project"])}</span>'
+                f'<span class="item-s">клиент {esc_html(b["client"])}</span></span>'
+                f'<span class="item-a">{btn}</span></li>')
+
+        if linked:
+            body = f'<ul class="sub">{"".join(rows)}</ul>'
+        else:
+            body = ('<div class="sub"><div class="sub-i muted">'
+                    "Проектов пока нет — задачи из этого чата создать нельзя"
+                    "</div></div>")
 
         form = ""
         if is_admin and ch["status"] != "left":
-            form = _bind_form(ch, linked, portal, known_ids, clients, session)
+            form = _bind_form(ch, linked, portal, known_ids, clients, session, active)
 
-        out.append(f"<div class='chat'>{head}{''.join(items)}{form}</div>")
+        out.append(f'<div class="chat-block">{head}{body}{form}</div>')
 
-    err = (f"<div class='hint err'>{esc_html(portal_error)}</div>" if portal_error else "")
-    hint = ("" if is_admin else
-            "<div class='hint'>Управлять привязками может администратор портала.</div>")
-    return "".join(out) + err + hint
+    err = ui.banner(esc_html(portal_error), "warn") if portal_error else ""
+    tail = ("" if is_admin else
+            ui.hint("Управлять привязками может администратор портала."))
+    return err + ui.panel("Чаты и проекты", "".join(out), icon_name="chat",
+                          flush=True, footer_html=tail)
 
 
 def _bind_form(chat: asyncpg.Record, linked: list[asyncpg.Record],
                portal: list[dict[str, Any]], known_ids: set[int],
-               clients: list[asyncpg.Record], session: str) -> str:
+               clients: list[asyncpg.Record], session: str, active: str) -> str:
     """Привязка чата к проекту портала.
 
     Клиент выбирается ЯВНО и всегда. Раньше он подставлялся из существующих привязок
     чата, из-за чего новый проект молча уезжал под чужого клиента.
+
+    Форма была строкой из двух узких `select` и кнопки, сжимавшейся в кашу на
+    любой ширине меньше десктопной. Теперь это сетка с настоящими подписями:
+    подпись над полем, а не плейсхолдер внутри, — иначе выбранное значение
+    стирает вопрос, на который отвечает.
     """
     bound = {int(b["b24_group_id"]) for b in linked if b["b24_group_id"]}
+    available = [g for g in portal if g["id"] not in bound]
+    if not available:
+        return (f'<div class="panel-b">'
+                f"{ui.hint('Все доступные вам проекты портала уже привязаны к этому чату.')}"
+                f"</div>")
+
     options = "".join(
-        f"<option value='{g['id']}'>{esc_html(g['name'])}"
-        f"{'' if g['id'] in known_ids else ' — новый'}</option>"
-        for g in portal if g["id"] not in bound)
-    if not options:
-        return "<div class='hint'>Все доступные вам проекты уже привязаны к этому чату.</div>"
+        f'<option value="{esc_attr(g["id"])}">{esc_html(g["name"])}'
+        f'{"" if g["id"] in known_ids else " — новый"}</option>'
+        for g in available)
+    client_opts = "".join(
+        f'<option value="{esc_attr(c["id"])}">{esc_html(c["name"])}</option>'
+        for c in clients)
+    cid = esc_attr(chat["id"])
+    note = ui.hint("Один чат обслуживает одного клиента: все проекты этого чата "
+                   "должны принадлежать ему.")
 
-    client_opts = "".join(f"<option value='{c['id']}'>{esc_html(c['name'])}</option>"
-                          for c in clients)
     return (
-        "<form method='post' action='/b24/app/chat' class='bind'>"
-        f"<input type='hidden' name='session' value='{esc_attr(session)}'>"
-        "<input type='hidden' name='action' value='bind'>"
-        f"<input type='hidden' name='chat_ref' value='{chat['id']}'>"
-        f"<label>Проект портала<select name='b24_group_id'>{options}</select></label>"
-        f"<label>Клиент<select name='client_id'>"
-        "<option value='0'>создать по названию проекта</option>"
-        f"{client_opts}</select></label>"
-        "<button type='submit'>Привязать</button></form>"
-        "<div class='hint'>Один чат обслуживает одного клиента: все проекты чата "
-        "должны принадлежать ему.</div>")
+        f'<div class="panel-b" style="border-top:1px solid var(--border)">'
+        f'<form method="post" action="/b24/app/chat">'
+        f'<input type="hidden" name="session" value="{esc_attr(session)}">'
+        f'<input type="hidden" name="action" value="bind">'
+        f'<input type="hidden" name="tab" value="{esc_attr(active)}">'
+        f'<input type="hidden" name="chat_ref" value="{cid}">'
+        f'<div class="grid2">'
+        f'<div class="f-group">'
+        f'<label class="f-l" for="proj-{cid}">Проект портала</label>'
+        f'<select class="input" id="proj-{cid}" name="b24_group_id">{options}</select>'
+        f"</div>"
+        f'<div class="f-group">'
+        f'<label class="f-l" for="cl-{cid}">Клиент</label>'
+        f'<select class="input" id="cl-{cid}" name="client_id">'
+        f'<option value="0">Создать по названию проекта</option>{client_opts}</select>'
+        f"</div></div>"
+        f'<div class="btn-row" style="margin-top:4px">'
+        f'<button class="btn" type="submit">{ui.icon("plus", 15)}Привязать чат</button>'
+        f"</div></form>{note}</div>")
 
 
-async def _link_block(tenant: asyncpg.Record, b24_user_id: int,
-                      bot: asyncpg.Record | None) -> str:
+async def _link_state(tenant_id: int, b24_user_id: int) -> asyncpg.Record | None:
+    async with pool().acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT u.tg_username, m.link_status FROM tenant_members m "
+            "JOIN users u ON u.id = m.user_id "
+            "WHERE m.tenant_id = $1 AND m.b24_user_id = $2", tenant_id, b24_user_id)
+
+
+async def _link_panel(tenant: asyncpg.Record, b24_user_id: int,
+                      bot: asyncpg.Record | None,
+                      linked: asyncpg.Record | None) -> str:
     """Привязка Telegram — ОСНОВНОЙ путь сопоставления.
 
     Телефон заполнен у 5 сотрудников из 27, поэтому сопоставление по нему как главный
     механизм нежизнеспособно. Здесь мы уже знаем, кто человек: портал сам прислал его
     токен. Остаётся связать это с его telegram-аккаунтом одноразовой ссылкой.
+
+    Для сотрудника это единственное действие на экране, поэтому кнопка крупная и
+    занимает всю ширину, а не прячется последней строкой в последней карточке.
     """
     if bot is None:
-        return ("<div class='hint'>Привязка Telegram станет доступна, когда "
-                "администратор подключит бота.</div>")
-
-    async with pool().acquire() as conn:
-        linked = await conn.fetchrow(
-            "SELECT u.tg_username, m.link_status FROM tenant_members m "
-            "JOIN users u ON u.id = m.user_id "
-            "WHERE m.tenant_id = $1 AND m.b24_user_id = $2", tenant["id"], b24_user_id)
+        return ui.panel(
+            "Ваш Telegram",
+            ui.empty("Привязка пока недоступна",
+                     "Она откроется, когда администратор портала подключит "
+                     "Telegram-бота теннанта.", icon_name="send"),
+            icon_name="user")
 
     if linked and linked["link_status"] == "authorized":
-        who = f"@{esc_html(linked['tg_username'])}" if linked["tg_username"] else "привязан"
-        return (_row("Telegram", f"<span class='ok'>{who}</span>")
-                + "<div class='hint'>Вы можете создавать и редактировать задачи из чатов.</div>")
+        who = (f"@{esc_html(linked['tg_username'])}" if linked["tg_username"]
+               else "аккаунт привязан")
+        body = (ui.field("Telegram", f'<span class="row-wrap">{who}'
+                                     f'{ui.badge("привязан", "ok")}</span>')
+                + ui.field("Пользователь Битрикс24",
+                           f'<code class="tnum">{esc_html(b24_user_id)}</code>')
+                + ui.hint("Вы можете создавать и комментировать задачи из привязанных "
+                          "чатов — в пределах прав, которые вам даёт сам Битрикс24."))
+        return ui.panel("Ваш Telegram", body, icon_name="user")
 
+    # Токен одноразовый и живёт 15 минут, поэтому выпускается при показе экрана.
     token = await context.issue_token(
         "link", tenant_id=tenant["id"], payload={"b24_user_id": b24_user_id},
         ttl=timedelta(minutes=15))
-    url = f"https://t.me/{esc_attr(bot['username'])}?start=b{esc_attr(token)}"
-    return (_row("Telegram", "<span class='warn'>не привязан</span>")
-            + f"<a href='{url}' target='_blank' rel='noopener'>"
-            f"<button type='button'>Привязать Telegram</button></a>"
-            "<div class='hint'>Ссылка одноразовая и живёт 15 минут. "
-            "Откроется чат с ботом — нажмите «Запустить».</div>")
+    url = f"https://t.me/{bot['username']}?start=b{token}"
+    note = ui.hint("Ссылка одноразовая и действует 15 минут. Если открываете с "
+                   "компьютера, а Telegram у вас на телефоне — перешлите себе "
+                   "адрес ниже.")
+
+    body = (
+        f'<div class="row-wrap" style="margin-bottom:14px">'
+        f'{ui.badge("не привязан", "warn")}</div>'
+        f"<p>Нажмите кнопку — откроется чат с ботом "
+        f"<code>@{esc_html(bot['username'])}</code>. В нём нажмите «Запустить», "
+        f"и аккаунты свяжутся.</p>"
+        f'<div class="btn-row">'
+        f'{ui.link_button(url, "Привязать Telegram", icon_name="link")}</div>'
+        f'{note}<p class="hint"><code>{esc_html(url)}</code></p>')
+    return ui.panel("Ваш Telegram", body, icon_name="user")
+
+
+def _bot_panel(bot: asyncpg.Record | None, is_admin: bool, session: str,
+               active: str) -> str:
+    """Вкладка «Бот»: подключение и состояние.
+
+    Поле токена получило настоящую подпись вместо плейсхолдера: плейсхолдер
+    исчезает при вводе, и человек перестаёт видеть, что именно он заполняет.
+    """
+    if bot is None:
+        if not is_admin:
+            return ui.panel(
+                "Telegram-бот",
+                ui.empty("Бот не подключён",
+                         "Подключить бота может администратор портала Битрикс24. "
+                         "Обратитесь к нему — без бота интеграция не работает.",
+                         icon_name="send"),
+                icon_name="send")
+        form = (
+            f'<form method="post" action="/b24/app/bot">'
+            f'<input type="hidden" name="session" value="{esc_attr(session)}">'
+            f'<input type="hidden" name="action" value="save">'
+            f'<input type="hidden" name="tab" value="{esc_attr(active)}">'
+            f'<div class="f-group">'
+            f'<label class="f-l" for="bot-token">Токен бота из @BotFather</label>'
+            f'<input class="input mono" type="text" id="bot-token" name="token" '
+            f'placeholder="123456789:AA..." autocomplete="off" spellcheck="false" '
+            f'aria-describedby="bot-token-h">'
+            f'<p class="hint" id="bot-token-h">Токен виден только при вводе. '
+            f'Обратно он не показывается никогда и хранится в шифрованном виде.</p>'
+            f"</div>"
+            f'<button class="btn" type="submit">{ui.icon("link", 15)}'
+            f"Подключить бота</button></form>")
+        steps = (
+            "<p>Создайте бота командой <code>/newbot</code> в "
+            "<code>@BotFather</code>, затем обязательно выполните там же "
+            "<code>/setprivacy</code> → выберите бота → <b>Disable</b>.</p>"
+            "<p class=\"hint\">Без этого бот видит в группе только команды и "
+            "упоминания, и создать задачу ответом на сообщение коллеги будет "
+            "нельзя — это самая частая причина «бот не работает».</p>")
+        return ui.panel("Подключение бота", steps + '<div class="divider"></div>' + form,
+                        icon_name="send")
+
+    privacy = bot["privacy_mode_off"]
+    privacy_html = {
+        True: ui.badge("выключен, как надо", "ok"),
+        False: ui.badge("включён — бот не видит сообщений", "err"),
+        None: ui.badge("не проверено", "warn"),
+    }[privacy]
+    status_html = {
+        "active": ui.badge("работает", "ok"),
+        "pending": ui.badge("подключается", "warn"),
+        "error": ui.badge("ошибка", "err"),
+        "suspended": ui.badge("приостановлен", "err"),
+    }.get(bot["status"], ui.badge(str(bot["status"]), "neutral"))
+
+    rows = (ui.field("Бот", f"<code>@{esc_html(bot['username'])}</code>")
+            + ui.field("Состояние", status_html)
+            + ui.field("Режим приёма", esc_html(
+                "long polling через прокси" if bot["mode"] == "polling" else "вебхук"))
+            + ui.field("Privacy mode", privacy_html)
+            + ui.field("Последняя проверка", esc_html(
+                bot["last_check_at"].strftime("%d.%m.%Y %H:%M")
+                if bot["last_check_at"] else "—")))
+
+    err = ""
+    if bot["last_error"]:
+        err = ui.banner(f"<b>Последняя ошибка.</b> {esc_html(bot['last_error'])}", "err")
+
+    fix = ""
+    if privacy is False:
+        fix = ui.banner(
+            "<b>Выключите privacy mode.</b> В <code>@BotFather</code>: "
+            "<code>/setprivacy</code> → выберите бота → <b>Disable</b>. "
+            "Затем нажмите «Проверить подключение».", "warn")
+
+    actions = ""
+    if is_admin:
+        actions = ui.action_form(
+            "/b24/app/bot",
+            {"session": session, "action": "recheck", "tab": active},
+            "Проверить подключение", variant="sec", icon_name="refresh")
+
+    replace = ""
+    if is_admin:
+        replace = (
+            f'<details><summary class="hint" style="cursor:pointer">'
+            f"Заменить бота другим</summary>"
+            f'<form method="post" action="/b24/app/bot" style="margin-top:12px">'
+            f'<input type="hidden" name="session" value="{esc_attr(session)}">'
+            f'<input type="hidden" name="action" value="save">'
+            f'<input type="hidden" name="tab" value="{esc_attr(active)}">'
+            f'<div class="f-group">'
+            f'<label class="f-l" for="bot-token2">Новый токен из @BotFather</label>'
+            f'<input class="input mono" type="text" id="bot-token2" name="token" '
+            f'placeholder="123456789:AA..." autocomplete="off" spellcheck="false">'
+            f"</div>"
+            f'<button class="btn sec" type="submit" data-confirm="Заменить '
+            f'подключённого бота на другого? Чаты старого бота перестанут '
+            f'обслуживаться.">Заменить бота</button></form></details>')
+
+    return (err + fix
+            + ui.panel("Telegram-бот", rows, icon_name="send", actions_html=actions,
+                       footer_html=replace))
 
 
 # ------------------------------------------------------------------ сохранение
 @router.post("/bot")
 async def save_bot(request: Request, session: str = Form(...), action: str = Form("save"),
-                   token: str = Form("")) -> HTMLResponse:
+                   token: str = Form(""), tab: str = Form("bot")) -> HTMLResponse:
     sess = await load_session(session)
     if sess is None:
-        return page("<div class='card'><h1>Сессия истекла</h1>"
-                    "<p>Закройте и откройте приложение заново.</p></div>", None)
+        return expired_page()
 
+    tab = safe_tab(tab)
     async with pool().acquire() as conn:
         tenant = await conn.fetchrow(
             "SELECT id, b24_domain, install_state, granted_scope FROM tenants WHERE id = $1",
@@ -437,7 +755,7 @@ async def save_bot(request: Request, session: str = Form(...), action: str = For
                     sess["tenant_id"], sess["b24_user_id"])
         body = await render_home(tenant, sess["b24_user_id"], False, session,
                                  message="Настраивать бота может только администратор "
-                                         "портала.", message_kind="err")
+                                         "портала.", message_kind="err", active_tab=tab)
         return page(body, domain)
 
     message, kind = "", "ok"
@@ -450,20 +768,20 @@ async def save_bot(request: Request, session: str = Form(...), action: str = For
     async with pool().acquire() as conn:
         fresh = await issue_session(conn, tenant["id"], sess["b24_user_id"], True)
     body = await render_home(tenant, sess["b24_user_id"], True, fresh,
-                             message=message, message_kind=kind)
+                             message=message, message_kind=kind, active_tab=tab)
     return page(body, domain)
 
 
 @router.post("/chat")
 async def chat_action(session: str = Form(...), action: str = Form(...),
                       chat_ref: int = Form(0), b24_group_id: int = Form(0),
-                      client_id: int = Form(0),
-                      binding_id: int = Form(0)) -> HTMLResponse:
+                      client_id: int = Form(0), binding_id: int = Form(0),
+                      tab: str = Form("chats")) -> HTMLResponse:
     sess = await load_session(session)
     if sess is None:
-        return page("<div class='card'><h1>Сессия истекла</h1>"
-                    "<p>Закройте и откройте приложение заново.</p></div>", None)
+        return expired_page()
 
+    tab = safe_tab(tab)
     async with pool().acquire() as conn:
         tenant = await conn.fetchrow(
             "SELECT id, b24_domain, install_state, granted_scope FROM tenants WHERE id = $1",
@@ -472,7 +790,7 @@ async def chat_action(session: str = Form(...), action: str = Form(...),
     if not sess["is_portal_admin"]:
         body = await render_home(tenant, sess["b24_user_id"], False, session,
                                  message="Управлять привязками может только администратор "
-                                         "портала.", message_kind="err")
+                                         "портала.", message_kind="err", active_tab=tab)
         return page(body, tenant["b24_domain"])
 
     message, kind = await _apply_chat_action(
@@ -482,7 +800,7 @@ async def chat_action(session: str = Form(...), action: str = Form(...),
     async with pool().acquire() as conn:
         fresh = await issue_session(conn, tenant["id"], sess["b24_user_id"], True)
     body = await render_home(tenant, sess["b24_user_id"], True, fresh,
-                             message=message, message_kind=kind)
+                             message=message, message_kind=kind, active_tab=tab)
     return page(body, tenant["b24_domain"])
 
 
@@ -806,8 +1124,22 @@ async def _b24_names(tenant_id: int, b24_user_id: int, ids: list[int]) -> dict[i
     return out
 
 
+async def _team_panel(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
+                      session: str, bot: asyncpg.Record | None,
+                      linked: asyncpg.Record | None, active: str) -> str:
+    """Вкладка «Команда»: люди и права, плюс собственная привязка.
+
+    Своя привязка стоит первой намеренно: у администратора без неё права есть,
+    а работать в чатах нечем, и это состояние надо видеть раньше чужих ролей.
+    """
+    can_roles = await can_manage_admins(int(tenant["id"]), b24_user_id, is_admin)
+    mine = await _link_panel(tenant, b24_user_id, bot, linked)
+    admins = await _admins_block(tenant, b24_user_id, can_roles, session, active)
+    return mine + admins
+
+
 async def _admins_block(tenant: asyncpg.Record, b24_user_id: int, can_manage: bool,
-                        session: str) -> str:
+                        session: str, active: str = "team") -> str:
     async with pool().acquire() as conn:
         members = await conn.fetch(
             """
@@ -820,15 +1152,24 @@ async def _admins_block(tenant: asyncpg.Record, b24_user_id: int, can_manage: bo
             """, tenant["id"])
 
     if not members:
-        return ("<p>Пока никто не привязал свой Telegram к порталу.</p>"
-                "<div class='hint'>Права назначаются тем, кто уже связал аккаунты: "
-                "администратор — это конкретный человек с личным токеном Битрикс24, "
-                "а не строка в таблице.</div>")
+        return ui.panel(
+            "Администраторы",
+            ui.empty("Пока никто не привязал Telegram",
+                     "Права назначаются тем, кто уже связал аккаунты: администратор — "
+                     "это конкретный человек с личным токеном Битрикс24, а не строка "
+                     "в таблице.", icon_name="users"),
+            icon_name="users")
 
     names = await _b24_names(int(tenant["id"]), b24_user_id,
                              [int(m["b24_user_id"]) for m in members
                               if m["b24_user_id"] is not None])
     admins = sum(1 for m in members if m["role"] == "tenant_admin")
+
+    # Ограничение выборки имён — не «деталь реализации», а видимый факт:
+    # молча показать 50 из 60 человек значит соврать про состав команды.
+    shown = ui.hint(f"Показаны все {len(members)} участников.") if len(members) <= 50 \
+        else ui.hint(f"Имена подтянуты для первых 50 участников из {len(members)}; "
+                     f"у остальных вместо имени показан номер в Битрикс24.")
 
     rows = []
     for m in members:
@@ -838,50 +1179,56 @@ async def _admins_block(tenant: asyncpg.Record, b24_user_id: int, can_manage: bo
             or "без имени"
         tg = f"@{m['tg_username']}" if m["tg_username"] else "telegram не показан"
         b24_part = f" · Б24 #{b24_id}" if b24_id is not None else ""
-        role_html = ("<span class='ok'>админ теннанта</span>" if row_is_admin
-                     else "<span class='muted'>сотрудник</span>")
-        link_html = ("" if m["link_status"] == "authorized"
-                     else f"<span class='warn'> · {esc_html(m['link_status'])}</span>")
+        role_badge = (ui.badge("админ теннанта", "ok") if row_is_admin
+                      else ui.badge("сотрудник", "neutral"))
+        link_badge = ("" if m["link_status"] == "authorized"
+                      else ui.badge(str(m["link_status"]), "warn"))
 
         btn = ""
         if can_manage:
             # Последнего админа снять нельзя: теннант остался бы без управления,
             # а вернуть его можно было бы только руками в базе.
             last_one = row_is_admin and admins <= 1
-            action = "revoke" if row_is_admin else "grant"
-            label = "снять права" if row_is_admin else "назначить админом"
-            disabled = (" disabled title='это единственный админ теннанта'"
-                        if last_one else "")
-            btn = (
-                "<form method='post' action='/b24/app/role' style='display:inline'>"
-                f"<input type='hidden' name='session' value='{esc_attr(session)}'>"
-                f"<input type='hidden' name='action' value='{action}'>"
-                f"<input type='hidden' name='member_user_id' value='{m['user_id']}'>"
-                f"<button class='link-btn' type='submit'{disabled}>{label}</button>"
-                "</form>")
+            btn = ui.action_form(
+                "/b24/app/role",
+                {"session": session,
+                 "action": "revoke" if row_is_admin else "grant",
+                 "member_user_id": m["user_id"], "tab": active},
+                "Снять права" if row_is_admin else "Назначить админом",
+                variant="danger" if row_is_admin else "ghost",
+                icon_name="shield",
+                disabled=last_one,
+                title="Это единственный админ теннанта" if last_one else "",
+                confirm=(f"Снять права администратора у {who}?" if row_is_admin
+                         else f"Назначить {who} администратором теннанта? "
+                              f"Он сможет привязывать чаты, менять бота и "
+                              f"назначать других администраторов."))
 
-        rows.append(
-            f"<div class='proj'><span><b>{esc_html(who)}</b>"
-            f"<span class='muted'> · {esc_html(tg)}{b24_part}</span>{link_html}"
-            f"<br>{role_html}</span>{btn}</div>")
+        rows.append(ui.item(
+            esc_html(who),
+            sub_html=f"{esc_html(tg)}{esc_html(b24_part)}",
+            actions_html=f"{link_badge}{role_badge}{btn}"))
 
-    hint = ("<div class='hint'>Админ теннанта привязывает чаты к проектам, вводит токен "
-            "бота и назначает других админов. Обычный сотрудник создаёт и комментирует "
-            "задачи — в пределах прав, которые ему дал сам Битрикс24.</div>"
+    foot = (ui.hint("Админ теннанта привязывает чаты к проектам, вводит токен бота и "
+                    "назначает других админов. Обычный сотрудник создаёт и "
+                    "комментирует задачи — в пределах прав, которые ему дал Битрикс24.")
             if can_manage else
-            "<div class='hint'>Назначать администраторов может администратор портала "
-            "или действующий администратор теннанта.</div>")
-    return "".join(rows) + hint
+            ui.hint("Назначать администраторов может администратор портала или "
+                    "действующий администратор теннанта."))
+
+    return ui.panel("Администраторы", f'<ul class="list">{"".join(rows)}</ul>',
+                    icon_name="users", flush=True, footer_html=shown + foot)
 
 
 @router.post("/role")
 async def role_action(session: str = Form(...), action: str = Form(...),
-                      member_user_id: int = Form(0)) -> HTMLResponse:
+                      member_user_id: int = Form(0),
+                      tab: str = Form("team")) -> HTMLResponse:
     sess = await load_session(session)
     if sess is None:
-        return page("<div class='card'><h1>Сессия истекла</h1>"
-                    "<p>Закройте и откройте приложение заново.</p></div>", None)
+        return expired_page()
 
+    tab = safe_tab(tab)
     async with pool().acquire() as conn:
         tenant = await conn.fetchrow(
             "SELECT id, b24_domain, install_state, granted_scope FROM tenants WHERE id = $1",
@@ -902,7 +1249,7 @@ async def role_action(session: str = Form(...), action: str = Form(...),
     async with pool().acquire() as conn:
         fresh = await issue_session(conn, tenant_id, actor, is_portal_admin)
     body = await render_home(tenant, actor, is_portal_admin, fresh,
-                             message=message, message_kind=kind)
+                             message=message, message_kind=kind, active_tab=tab)
     return page(body, tenant["b24_domain"])
 
 

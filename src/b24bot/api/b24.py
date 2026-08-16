@@ -21,7 +21,9 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from b24bot.api import app_ui
+from b24bot.api import ui_kit as ui
 from b24bot.core.config import get_settings, is_trusted_portal_domain
+from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
 from b24bot.domain import events as event_queue
@@ -149,26 +151,20 @@ async def log_payload(kind: str, member_id: str | None, payload: dict[str, str])
 
 
 # ---------------------------------------------------------------------- страницы
-def _page(body: str, portal_domain: str | None) -> HTMLResponse:
-    html = f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Поддержка в Telegram</title>
-<script src="//api.bitrix24.com/api/v1/"></script>
-<style>
- body{{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px;color:#1a1a1a}}
- .card{{max-width:640px;border:1px solid #e3e5e7;border-radius:10px;padding:20px}}
- h1{{font-size:18px;margin:0 0 12px}} code{{background:#f4f5f6;padding:1px 5px;border-radius:4px}}
- .ok{{color:#1f8b4c}} .warn{{color:#b8860b}}
-</style></head><body><div class="card">{body}</div></body></html>"""
-    resp = HTMLResponse(html)
-    # frame-ancestors — динамически, только под домен проверенного портала.
-    # Общий *.bitrix24.ru позволил бы встроить страницу любому чужому порталу.
-    if portal_domain and is_trusted_portal_domain(portal_domain):
-        resp.headers["Content-Security-Policy"] = f"frame-ancestors https://{portal_domain}"
-    else:
-        resp.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
-    return resp
+def _notice(kind: str, title: str, text: str, portal_domain: str | None, *,
+            extra_html: str = "") -> HTMLResponse:
+    """Служебный экран установки или отказа.
+
+    Раньше здесь была своя маленькая копия вёрстки со своими хексами, и экраны
+    установки выглядели чужими рядом с самим приложением. Теперь это тот же
+    дизайн: человек попадает в приложение с первого же экрана, а не после него.
+
+    Причина отказа намеренно не уточняется: сообщения «нет такого портала» и
+    «токен не совпал» вместе работают оракулом для подбора.
+    """
+    icon_name = {"ok": "check-circle", "warn": "alert", "err": "x-circle"}.get(kind, "info")
+    body = (ui.panel("", ui.empty(title, text, icon_name=icon_name)) + extra_html)
+    return app_ui.page(body, portal_domain)
 
 
 # ------------------------------------------------------------------ /b24/install
@@ -182,8 +178,9 @@ async def install(request: Request) -> Response:
 
     if not n["member_id"] or not n["domain"]:
         log.warning("install без member_id/domain: %s", shape_for_log(payload))
-        return _page("<h1>Установка не завершена</h1><p>Портал не передал идентификатор. "
-                     "Откройте установку из интерфейса Битрикс24.</p>", None)
+        return _notice("err", "Установка не завершена",
+                       "Портал не передал идентификатор. Откройте установку из "
+                       "интерфейса Битрикс24, а не по прямой ссылке.", None)
 
     tenant_id = await upsert_tenant(n, n["scope"])
 
@@ -202,13 +199,20 @@ async def install(request: Request) -> Response:
     log.info("установка завершена: tenant=%s domain=%s installer=%s",
              tenant_id, n["domain"], installer_id)
 
-    return _page(
-        f"""<h1 class="ok">Приложение установлено</h1>
-        <p>Портал: <code>{n['domain']}</code><br>
-        Установил: пользователь <code>{installer_id or '?'}</code></p>
-        <p>Дальше: подключите Telegram-бота теннанта и привяжите проекты к чатам.</p>
-        <script>BX24.init(function(){{ BX24.installFinish(); }});</script>""",
-        n["domain"])
+    # installFinish обязателен: без него приложение считается неустановленным —
+    # виджеты не показываются, события не приходят вообще (docs/50 §2.1).
+    details = (ui.panel("Что дальше", ui.field(
+        "Портал", f"<code>{esc_html(n['domain'])}</code>")
+        + ui.field("Установил", f"<code>пользователь {esc_html(installer_id or '?')}</code>")
+        + ui.hint("Откройте «Поддержка в Telegram» в левом меню портала: там "
+                  "мастер настройки проведёт по трём шагам — бот, чат, проект."),
+        icon_name="check-circle")
+        + "<script>BX24.init(function(){ BX24.installFinish(); });</script>")
+
+    return _notice("ok", "Приложение установлено",
+                   "Интеграция зарегистрирована на портале. Осталось подключить "
+                   "Telegram-бота и привязать чаты к проектам.",
+                   n["domain"], extra_html=details)
 
 
 # ---------------------------------------------------------------- /b24/placement
@@ -220,15 +224,17 @@ async def placement(request: Request) -> Response:
     await log_payload("placement", n["member_id"], payload)
 
     if not n["member_id"] or not is_trusted_portal_domain(n["domain"] or ""):
-        return _page("<h1>Доступ не подтверждён</h1>", None)
+        return _notice("err", "Доступ не подтверждён",
+                       "Откройте приложение из интерфейса Битрикс24.", None)
 
     async with pool().acquire() as conn:
         t = await conn.fetchrow(
             "SELECT id, b24_app_token, b24_domain, status FROM tenants WHERE b24_member_id = $1",
             n["member_id"])
     if not t:
-        return _page("<h1>Портал не подключён</h1>"
-                     "<p>Сначала установите приложение.</p>", n["domain"])
+        return _notice("warn", "Портал не подключён",
+                       "Сначала установите приложение на портале — тогда этот "
+                       "экран откроется сам.", n["domain"])
 
     # И-8: сверка APPLICATION_TOKEN подтверждает, что запрос от известного портала,
     # но НЕ доказывает, что его прислал Битрикс. Деструктивных действий здесь нет.
@@ -242,7 +248,9 @@ async def placement(request: Request) -> Response:
         if not n["app_token"] or not hmac.compare_digest(expected, n["app_token"]):
             log.warning("placement: APPLICATION_TOKEN отсутствует или не совпал, "
                         "member_id=%s", n["member_id"])
-            return _page("<h1>Доступ не подтверждён</h1>", n["domain"])
+            return _notice("err", "Доступ не подтверждён",
+                           "Откройте приложение из интерфейса Битрикс24.",
+                           n["domain"])
 
     b24_user_id: int | None = None
     is_portal_admin = False
@@ -267,9 +275,10 @@ async def placement(request: Request) -> Response:
                                        detail={"причина": "администратор портала"})
 
     if b24_user_id is None:
-        return _page("<h1>Не удалось определить пользователя</h1>"
-                     "<p>Откройте приложение из интерфейса Битрикс24 заново.</p>",
-                     t["b24_domain"])
+        return _notice("warn", "Не удалось определить пользователя",
+                       "Портал не прислал ваш токен. Закройте приложение и "
+                       "откройте его из интерфейса Битрикс24 заново.",
+                       t["b24_domain"])
 
     tenant = await _tenant_row(t["id"])
     async with pool().acquire() as conn:
