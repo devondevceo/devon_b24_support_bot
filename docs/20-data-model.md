@@ -568,15 +568,19 @@ CREATE TABLE survey_templates (
 );
 
 CREATE TABLE survey_questions (
-  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  tenant_id   BIGINT  REFERENCES tenants(id) ON DELETE CASCADE,  -- NULL = системный
-  template_id BIGINT  NOT NULL REFERENCES survey_templates(id) ON DELETE CASCADE,
-  sort        INT     NOT NULL,
-  code        TEXT    NOT NULL,
-  text        TEXT    NOT NULL,
-  answer_kind TEXT    NOT NULL CHECK (answer_kind IN ('text','choice','file','skip')),
-  options     JSONB,
-  required    BOOLEAN NOT NULL DEFAULT false
+  id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id      BIGINT  REFERENCES tenants(id) ON DELETE CASCADE,  -- NULL = системный
+  template_id    BIGINT  NOT NULL REFERENCES survey_templates(id) ON DELETE CASCADE,
+  sort           INT     NOT NULL,
+  code           TEXT    NOT NULL,          -- стабилен, переживает переименование
+  text           TEXT    NOT NULL,
+  answer_kind    TEXT    NOT NULL DEFAULT 'text'
+                   CHECK (answer_kind IN ('text','choice','file','skip')),
+  options        JSONB,                     -- [{"value": "в Б24", "label": "на кнопке"}]
+  required       BOOLEAN NOT NULL DEFAULT false,
+  b24_field      TEXT,                      -- UPPER_SNAKE; NULL = ответ в тело задачи
+  b24_field_type TEXT,                      -- тип на момент привязки
+  UNIQUE (template_id, code)
 );
 CREATE INDEX ix_survey_questions__tenant
   ON survey_questions (tenant_id, template_id, sort);
@@ -606,6 +610,15 @@ CREATE INDEX ix_survey_sessions__active ON survey_sessions (chat_ref, owner_tg_i
 > сообщения владельца сессии в течение 120 секунд» в общем чате съедал бы обычные реплики
 > коллегам («ага», «щас гляну») и отправлял их в описание задачи в Битриксе.
 
+> `answer_kind` и `options` описаны здесь с самого начала, но миграция `0007` их
+> **не создала** — расхождение вскрылось только в тот момент, когда понадобился
+> выпадающий список: `column "options" does not exist`. Догнали миграцией `0011`.
+> Мораль ровно та, что написана в шапке документа: модель данных права, схему надо
+> сверять с ней, а не наоборот.
+>
+> `b24_field` — куда уходит ответ. NULL означает «в тело задачи», и это не служебное
+> значение, а полноценный режим: несвязанные ответы собираются в описание.
+>
 > `tenant_id` у вопроса появился миграцией `0009` — до неё вопрос ссылался только на шаблон,
 > и выборка шла по одному `template_id`, то есть изоляция держалась на дисциплине
 > вызывающего. Нашёл тест-страж `test_every_domain_table_carries_tenant_id`; это ровно тот
@@ -633,6 +646,17 @@ CREATE TABLE audit_log (            -- партиционируется по м�
 CREATE TABLE security_log (LIKE audit_log INCLUDING ALL);   -- НЕотключаемый
 CREATE TABLE pd_access_log (LIKE audit_log INCLUDING ALL);  -- НЕотключаемый, доступ к ПДн
 ```
+
+> **Что создано миграцией `0010` (16.08.2026):** `audit_log` в форме выше, с партициями
+> на пять месяцев вперёд **и партицией по умолчанию**. Партиция по умолчанию обязательна:
+> без неё первая же запись после конца последнего месяца упала бы, а падать аудит права
+> не имеет. Добавлена колонка `actor_tg_id` — в боте действующее лицо известно по
+> Telegram, а не по Битриксу. `security_log` и `pd_access_log` пока не созданы, режим
+> `minimal` и дроп партиций по ретенции — отдельной работой.
+>
+> Пишет `domain/audit.py::record`. Ошибка записи журнала **не роняет действие**: оно уже
+> совершилось, откатывать поздно, — но логируется через `log.exception`, потому что
+> пропажа аудита сама по себе инцидент.
 
 **Правила аудита:**
 - `audit_mode='minimal'` вырезает только `detail`, но не факт события.

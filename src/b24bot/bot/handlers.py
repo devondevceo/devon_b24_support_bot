@@ -12,7 +12,7 @@ from b24bot.bot import comments, keyboards, survey, task_create, texts, views
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access, miniapp
+from b24bot.domain import access, audit, miniapp
 from b24bot.domain import events as b24_events
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
@@ -29,7 +29,8 @@ from b24bot.tg import files as tg_files
 
 log = logging.getLogger(__name__)
 
-BIND_PAGE = 40   # сколько проектов портала помещается в одну клавиатуру
+BIND_PAGE = 40    # сколько проектов портала помещается в одну клавиатуру
+MAX_OPTIONS = 20  # вариантов ответа на один вопрос; больше не влезает в экран
 
 
 class Reply:
@@ -327,6 +328,18 @@ async def _survey_begin(ctx: ChatContext, tg_user_id: int, template_id: int) -> 
 
 async def _survey_kb(ctx: ChatContext, tg_user_id: int, session_id: int,
                      q: survey.Question) -> dict[str, Any]:
+    rows: list[list[dict[str, str]]] = []
+
+    # Выпадающий список в чате — это кнопки под вопросом. По одной в ряд:
+    # варианты бывают длинными, а Telegram режет подпись без предупреждения.
+    for i, option in enumerate(q.options[:MAX_OPTIONS] if q.kind == "choice" else []):
+        token = await issue_token("survey_pick", tenant_id=ctx.tenant_id,
+                                  owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                                  payload={"session_id": session_id, "index": i},
+                                  ttl=timedelta(minutes=30))
+        label = str(option.get("label") or option.get("value") or "—")
+        rows.append([{"text": label[:60], "callback_data": f"p:{token}"}])
+
     row = []
     if not q.required:
         token = await issue_token("survey_skip", tenant_id=ctx.tenant_id,
@@ -339,7 +352,8 @@ async def _survey_kb(ctx: ChatContext, tg_user_id: int, session_id: int,
                                payload={"session_id": session_id},
                                ttl=timedelta(minutes=30))
     row.append({"text": "❌ Отменить", "callback_data": f"x:{cancel}"})
-    return {"inline_keyboard": [row]}
+    rows.append(row)
+    return {"inline_keyboard": rows}
 
 
 async def _survey_answer(ctx: ChatContext, msg: dict[str, Any],
@@ -362,7 +376,20 @@ async def _survey_answer(ctx: ChatContext, msg: dict[str, Any],
     items = await survey.questions(ctx.tenant_id, session.template_id)
     if session.step >= len(items):
         return None
-    await survey.record(session, items[session.step].code, text)
+
+    q = items[session.step]
+    if q.kind == "choice" and q.options:
+        # Человек напечатал вместо нажатия. Принимаем, если это в точности одна
+        # из подписей: иначе в поле Битрикса уедет текст вместо значения.
+        match = next((o for o in q.options
+                      if str(o.get("label", "")).strip().lower() == text.lower()), None)
+        if match is None:
+            return Reply(texts.MSG_SURVEY_PICK_BUTTON,
+                         markup=await _survey_kb(ctx, tg_user_id, session.id, q),
+                         remember_for_survey=session.id)
+        text = str(match.get("value") or match.get("label") or "")
+
+    await survey.record(session, q.code, text)
     return await _survey_next(ctx, session, items, tg_user_id)
 
 
@@ -377,7 +404,8 @@ async def _survey_next(ctx: ChatContext, session: survey.Session,
     # Вопросы кончились — показываем черновик и ждём подтверждения.
     # Описание собирается заново в момент создания: между превью и нажатием
     # человек мог ответить ещё раз.
-    title, _ = survey.assemble(items, session.answers)
+    built = survey.assemble(items, session.answers)
+    title = built.title
     project = next((p for p in ctx.projects if p.id == session.project_id),
                    ctx.projects[0] if ctx.projects else None)
     if project is None:
@@ -416,15 +444,16 @@ async def _survey_create(ctx: ChatContext, tg_user_id: int, session_id: int,
     answers = row["answers"]
     answers = json.loads(answers) if isinstance(answers, str) else dict(answers or {})
     items = await survey.questions(ctx.tenant_id, int(row["template_id"]))
-    title, description = survey.assemble(items, answers)
+    built = survey.assemble(items, answers)
 
     project = next((p for p in ctx.projects if p.id == project_id), None)
     if project is None:
         return Reply(texts.MSG_NO_PROJECT)
 
     draft = task_create.Draft(
-        title=title, description=description,
-        idem_key=f"survey-{session_id}", source_message_id=None)
+        title=built.title, description=built.description,
+        idem_key=f"survey-{session_id}", source_message_id=None,
+        fields=built.fields)
 
     try:
         client = await access.client_for_user(ctx.tenant_id, b24_user_id,
@@ -648,6 +677,9 @@ async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
 
 
 # ------------------------------------------------------------- редактирование
+EDIT_AUDIT = {"responsible_id": "task.responsible.change",
+              "deadline": "task.deadline.change",
+              "priority": "task.priority.change"}
 PRIORITY_LABELS = {0: "низкий", 1: "средний", 2: "высокий"}
 DEADLINE_LABELS = {"today": "сегодня", "tomorrow": "завтра", "in3": "через 3 дня",
                    "week": "через неделю", "clear": "снят"}
@@ -724,6 +756,15 @@ async def _edit(ctx: ChatContext, tg_user_id: int, payload: dict[str, Any]) -> R
     except errors.B24Error as exc:
         log.warning("правка задачи %s не удалась: %s", task_id, exc)
         return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    # Словарь действий общий с мини-аппом: одно и то же действие обязано называться
+    # одинаково, откуда бы его ни сделали, иначе журнал бесполезен для разбора.
+    for field in patch:
+        await audit.record(ctx.tenant_id, EDIT_AUDIT.get(field, "task.edit"),
+                           actor_id=b24_user_id, actor_tg_id=tg_user_id,
+                           target=f"task:{task_id}", project_id=project.id,
+                           detail={"field": field, "not_applied": missed,
+                                   "source": "bot"})
 
     note = texts.MSG_EDIT_DONE.format(what=esc_html(_edit_summary(act, payload, patch)))
     if missed:
@@ -1050,6 +1091,12 @@ async def _bind_commands(ctx: ChatContext, name: str, tg_user_id: int) -> Reply:
     if b24_user_id is None:
         return Reply(texts.MSG_NOT_LINKED)
 
+    # Матрица прав (docs/40-security.md §3): привязка чата — действие админа теннанта.
+    # Привязка решает, чьи задачи видны в чате, поэтому «любой сопоставленный» здесь
+    # слишком широко: сотрудник клиента тоже сопоставлен.
+    if not await access.is_tenant_admin(tenant_id, tg_user_id):
+        return Reply(texts.MSG_NEED_TENANT_ADMIN)
+
     if name == "unbind":
         # Отвязывать можно только то, что привязано.
         async with pool().acquire() as conn:
@@ -1262,6 +1309,23 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
         items = await survey.questions(tenant_id, session.template_id)
         await survey.skip(session)
         return await _survey_next(ctx, session, items, tg_user_id)
+    if ns == "p":
+        session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
+                                          tg_user_id)
+        if session is None:
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        items = await survey.questions(tenant_id, session.template_id)
+        if session.step >= len(items):
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        q = items[session.step]
+        index = int(payload.get("index", -1))
+        if not (0 <= index < len(q.options)):
+            # Набор правили, пока человек думал над кнопкой.
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        option = q.options[index]
+        await survey.record(session, q.code,
+                            str(option.get("value") or option.get("label") or ""))
+        return await _survey_next(ctx, session, items, tg_user_id)
     if ns == "x":
         await survey.finish(int(payload["session_id"]), "cancelled")
         return Reply(texts.MSG_SURVEY_CANCELLED)
@@ -1306,6 +1370,11 @@ async def _apply_bind(ctx: ChatContext, tenant_id: int, payload: dict[str, Any],
                       tg_user_id: int) -> Reply:
     action = payload.get("action", "bind")
 
+    # Роль проверяется в момент действия, а не в момент выдачи кнопки: за время
+    # жизни клавиатуры человека могли понизить (docs/40-security.md §3).
+    if not await access.is_tenant_admin(tenant_id, tg_user_id):
+        return Reply(texts.MSG_NEED_TENANT_ADMIN)
+
     if "b24_group_id" in payload:
         # Проект выбран с портала — импортируем его при первой привязке.
         b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
@@ -1323,15 +1392,20 @@ async def _apply_bind(ctx: ChatContext, tenant_id: int, payload: dict[str, Any],
         proj = await conn.fetchrow(
             "SELECT p.name, c.name AS client_name FROM projects p "
             "JOIN clients c ON c.id = p.client_id WHERE p.id = $1", project_id)
-        if proj is None:
-            return Reply(texts.MSG_DIALOG_EXPIRED)
+    if proj is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
 
-        if action == "unbind":
+    if action == "unbind":
+        async with pool().acquire() as conn:
             await conn.execute(
                 "UPDATE chat_bindings SET status = 'disabled' "
                 "WHERE chat_ref = $1 AND project_id = $2", ctx.chat_ref, project_id)
-            return Reply(texts.MSG_UNBOUND)
+        await audit.record(tenant_id, "chat.unbind", actor_tg_id=tg_user_id,
+                           project_id=project_id, target=f"chat:{ctx.chat_ref}",
+                           detail={"проект": proj["name"], "чат": ctx.title})
+        return Reply(texts.MSG_UNBOUND)
 
+    async with pool().acquire() as conn:
         # Чужой чат перехватить нельзя: если он уже принадлежит другому теннанту,
         # привязка не выполняется.
         owner = await conn.fetchval("SELECT tenant_id FROM tg_chats WHERE id = $1",
@@ -1359,6 +1433,10 @@ async def _apply_bind(ctx: ChatContext, tenant_id: int, payload: dict[str, Any],
             "claimed_at = COALESCE(claimed_at, now()) WHERE id = $1",
             ctx.chat_ref, tenant_id)
 
+    await audit.record(tenant_id, "chat.bind", actor_tg_id=tg_user_id,
+                       project_id=project_id, target=f"chat:{ctx.chat_ref}",
+                       detail={"проект": proj["name"], "клиент": proj["client_name"],
+                               "чат": ctx.title})
     log.info("чат %s привязан к проекту %s пользователем TG %s",
              ctx.chat_ref, project_id, tg_user_id)
     return Reply(texts.MSG_BIND_DONE.format(

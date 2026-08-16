@@ -98,3 +98,55 @@ async def tenant_of_user(tg_user_id: int) -> int | None:
              WHERE u.tg_user_id = $1 AND m.link_status = 'authorized'
             """, tg_user_id)
     return int(rows[0]["tenant_id"]) if len(rows) == 1 else None
+
+
+# --------------------------------------------------------------------- роли
+TENANT_ADMIN = "tenant_admin"
+MEMBER = "member"
+
+
+async def role_in_tenant(tenant_id: int, tg_user_id: int) -> str | None:
+    """Роль человека в теннанте по его телеграм-аккаунту. None — не участник."""
+    async with pool().acquire() as conn:
+        value = await conn.fetchval(
+            "SELECT m.role FROM tenant_members m JOIN users u ON u.id = m.user_id "
+            "WHERE m.tenant_id = $1 AND u.tg_user_id = $2", tenant_id, tg_user_id)
+    return str(value) if value is not None else None
+
+
+async def is_tenant_admin(tenant_id: int, tg_user_id: int) -> bool:
+    """Инвариант из docs/40-security.md §3: `/bind`, `/unbind`, `/map` — только админ.
+
+    Роль проверяется **в момент действия**, а не в момент выдачи кнопки: за время
+    жизни клавиатуры человека могли понизить.
+    """
+    return await role_in_tenant(tenant_id, tg_user_id) == TENANT_ADMIN
+
+
+async def role_of_b24_user(tenant_id: int, b24_user_id: int) -> str | None:
+    """То же, но со стороны портала: в приложении мы знаем человека по Битриксу."""
+    async with pool().acquire() as conn:
+        value = await conn.fetchval(
+            "SELECT role FROM tenant_members WHERE tenant_id = $1 AND b24_user_id = $2",
+            tenant_id, b24_user_id)
+    return str(value) if value is not None else None
+
+
+async def promote_portal_admin(tenant_id: int, b24_user_id: int) -> bool:
+    """Администратор портала — всегда админ теннанта.
+
+    Это решение проблемы курицы и яйца: первого админа назначить некому, а раздавать
+    права по факту установки нельзя — приложение мог поставить кто угодно из админов,
+    и его права мы всё равно спрашиваем у Битрикса (`user.admin`), а не выдаём сами.
+    Поэтому при каждом входе в приложение администратор портала подтягивается до
+    `tenant_admin`, если его телеграм уже привязан. Обратного действия нет: снятие
+    прав в Битриксе не снимает роль у нас — это делается явно на экране админов.
+
+    Возвращает True, если роль действительно поднялась (для записи в аудит).
+    """
+    async with pool().acquire() as conn:
+        updated = await conn.fetchval(
+            "UPDATE tenant_members SET role = $3 "
+            "WHERE tenant_id = $1 AND b24_user_id = $2 AND role <> $3 "
+            "RETURNING user_id", tenant_id, b24_user_id, TENANT_ADMIN)
+    return updated is not None

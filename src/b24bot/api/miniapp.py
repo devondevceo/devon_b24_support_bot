@@ -24,7 +24,7 @@ from b24bot.b24.tokens import NeedsReauth
 from b24bot.bot import comments as comments_service
 from b24bot.bot import task_create, views
 from b24bot.db.pool import pool
-from b24bot.domain import access, miniapp
+from b24bot.domain import access, audit, miniapp
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
     TASK_NOT_FOUND,
@@ -336,6 +336,7 @@ async def task_action(task_id: int, bundle: CtxDep, body: JsonBody) -> JSONRespo
         await miniapp_suppress(actor, task_id, act)
         await client.call(method, {"taskId": task_id})
         task, project = await _authorized_task(actor, ctx, client, task_id)
+    await _audit(actor, AUDIT_ACTIONS[act], task_id, project, {"act": act})
     async with pool().acquire() as conn:
         portal = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
                                      actor.tenant_id)
@@ -349,6 +350,24 @@ async def miniapp_suppress(actor: miniapp.Actor, task_id: int, act: str) -> None
     if status is not None:
         await b24_events.suppress_task_echo(actor.tenant_id, task_id,
                                             actor.b24_user_id, status=status)
+
+
+# Словарь действий аудита общий с ботом: одно и то же действие обязано называться
+# одинаково, откуда бы его ни сделали, иначе журнал бесполезен для разбора.
+AUDIT_ACTIONS = {"complete": "task.complete", "defer": "task.defer",
+                 "start": "task.status.change", "pause": "task.status.change",
+                 "renew": "task.status.change"}
+AUDIT_FIELDS = {"responsible_id": "task.responsible.change",
+                "deadline": "task.deadline.change",
+                "priority": "task.priority.change"}
+
+
+async def _audit(actor: miniapp.Actor, action: str, task_id: int,
+                 project: ProjectRef | None, detail: dict[str, Any]) -> None:
+    await audit.record(actor.tenant_id, action, actor_id=actor.b24_user_id,
+                       actor_tg_id=actor.tg_user_id, target=f"task:{task_id}",
+                       project_id=project.id if project else None,
+                       detail={**detail, "source": "miniapp"})
 
 
 @router.patch("/tasks/{task_id}")
@@ -370,6 +389,9 @@ async def task_patch(task_id: int, bundle: CtxDep, body: JsonBody) -> JSONRespon
     if project is None:
         raise ApiError(404, "not_found", TASK_NOT_FOUND)
     await remember_task(actor.tenant_id, project, task)
+    for field in patch:
+        await _audit(actor, AUDIT_FIELDS.get(field, "task.edit"), task_id, project,
+                     {"field": field, "not_applied": missed})
 
     async with pool().acquire() as conn:
         portal = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
@@ -405,6 +427,7 @@ async def add_comment(task_id: int, bundle: CtxDep, body: JsonBody) -> JSONRespo
         await _authorized_task(actor, ctx, client, task_id)
         await comments_service.add(client, task_id, text, author=_author(actor),
                                    chat_title=ctx.title)
+        await _audit(actor, "task.comment", task_id, None, {"length": len(text)})
         items = await comments_service.read_discussion(client, task_id,
                                                        limit=COMMENTS_LIMIT)
     return JSONResponse({"items": items})
@@ -458,6 +481,9 @@ async def create_task(bundle: CtxDep, body: JsonBody) -> JSONResponse:
         fresh = await task_service.read(client, mapping.as_int(task.get("id")) or 0)
 
     await remember_task(actor.tenant_id, project, fresh or task)
+    if created:
+        await _audit(actor, "task.create", mapping.as_int(task.get("id")) or 0, project,
+                     {"title": title[:80]})
     async with pool().acquire() as conn:
         portal = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
                                      actor.tenant_id)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any
 
 from b24bot.b24 import errors
@@ -32,6 +33,9 @@ class Draft:
     description: str
     idem_key: str
     source_message_id: int | None
+    fields: dict[str, Any] = dc_field(default_factory=dict)
+    """Поля задачи из привязанных вопросов опросника. Наши обязательные поля
+    (заголовок, проект, тег идемпотентности) перекрывают их всегда."""
     # Поля полной формы мини-аппа. В чате их не спрашивают — там задача создаётся
     # одним движением, и всё, кроме заголовка, берётся по умолчанию.
     responsible_id: int | None = None
@@ -109,16 +113,21 @@ async def create(client: B24Client, tenant_id: int, project: ProjectRef, draft: 
         log.info("задача по ключу %s уже существует: #%s", draft.idem_key, existing.get("id"))
         return existing, False
 
-    fields: dict[str, Any] = {
+    # Поля опросника кладём первыми: наши обязательные их перекрывают, а не
+    # наоборот. Иначе вопрос, привязанный к GROUP_ID, унёс бы задачу в чужой проект.
+    fields: dict[str, Any] = dict(draft.fields)
+    fields.update({
         "TITLE": draft.title,
         "DESCRIPTION": draft.description,
         "DESCRIPTION_IN_BBCODE": "Y",
         "RESPONSIBLE_ID": draft.responsible_id or responsible_id,
         "GROUP_ID": project.b24_group_id,
-        "TAGS": [draft.idem_key],
-    }
-    # Всё это портал принимает прямо при создании — проверено записью (§9.1).
-    # Пустые значения не шлём вовсе: пустой DEADLINE трактуется как «снять срок».
+        # Тег идемпотентности обязан уцелеть рядом с тегами из ответов (И-10).
+        "TAGS": [draft.idem_key, *(draft.fields.get("TAGS") or [])],
+    })
+    # Поля полной формы мини-аппа. Портал принимает их прямо при создании —
+    # проверено записью (§9.1). Пустые значения не шлём вовсе: пустой DEADLINE
+    # трактуется порталом как «снять срок».
     if draft.deadline:
         fields["DEADLINE"] = draft.deadline
     if draft.priority is not None:

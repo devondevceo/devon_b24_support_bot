@@ -9,13 +9,13 @@
 вовсе. Показать ссылку на несуществующее приложение хуже, чем не показать ничего:
 Telegram отвечает «приложение не найдено», и это выглядит как поломка продукта.
 
-Revision ID: 0010_miniapp
-Revises: 0009_survey_questions_tenant
+Revision ID: 0012_miniapp
+Revises: 0011_survey_builder
 """
 from alembic import op
 
-revision = "0010_miniapp"
-down_revision = "0009_survey_questions_tenant"
+revision = "0012_miniapp"
+down_revision = "0011_survey_builder"
 branch_labels = None
 depends_on = None
 

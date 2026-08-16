@@ -254,6 +254,17 @@ async def placement(request: Request) -> Response:
             await store_user_token(t["id"], n["member_id"], b24_user_id,
                                    n["access_token"], n["refresh_token"], "user")
             is_portal_admin = await _is_portal_admin(t["b24_domain"], n["access_token"])
+            if is_portal_admin:
+                # Первого админа теннанта назначить некому. Права администратора
+                # портала мы не выдаём, а спрашиваем у Битрикса (user.admin), и
+                # подтягиваем роль при каждом входе. Обратного действия нет:
+                # снятие прав в портале роль не отбирает — это делается явно.
+                from b24bot.domain import access, audit
+                if await access.promote_portal_admin(t["id"], b24_user_id):
+                    await audit.record(t["id"], "role.grant", actor_kind="system",
+                                       actor_id=b24_user_id,
+                                       target=f"b24_user:{b24_user_id}",
+                                       detail={"причина": "администратор портала"})
 
     if b24_user_id is None:
         return _page("<h1>Не удалось определить пользователя</h1>"
