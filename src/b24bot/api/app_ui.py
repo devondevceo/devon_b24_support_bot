@@ -26,7 +26,7 @@ from b24bot.core.config import get_settings, is_trusted_portal_domain
 from b24bot.core.text import esc_attr, esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import context
+from b24bot.domain import access, audit, context
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -199,9 +199,16 @@ async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
     link_block = await _link_block(tenant, b24_user_id, bot)
     chats_block = await _chats_block(tenant, b24_user_id, is_admin, session)
 
+    can_roles = await can_manage_admins(int(tenant["id"]), b24_user_id, is_admin)
+    my_role = await access.role_of_b24_user(int(tenant["id"]), b24_user_id)
+    admins_block = await _admins_block(tenant, b24_user_id, can_roles, session)
+
     admin_note = "" if is_admin else (
         "<div class='hint'>Вы вошли как обычный пользователь. Настройки доступны "
         "администратору портала.</div>")
+
+    rights = "администратор портала" if is_admin else (
+        "администратор теннанта" if my_role == access.TENANT_ADMIN else "сотрудник")
 
     return (
         f"{msg_html}"
@@ -209,9 +216,10 @@ async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
         f"<h2>Интеграция</h2>{status_rows}{admin_note}</div>"
         f"<div class='card'><h2>Telegram-бот</h2>{bot_form}</div>"
         f"<div class='card'><h2>Чаты</h2>{chats_block}</div>"
+        f"<div class='card'><h2>Администраторы</h2>{admins_block}</div>"
         f"<div class='card'><h2>Вы</h2>"
         f"{_row('Пользователь Битрикс24', f'<code>{b24_user_id}</code>')}"
-        f"{_row('Права', 'администратор портала' if is_admin else 'сотрудник')}"
+        f"{_row('Права', rights)}"
         f"{link_block}</div>")
 
 
@@ -753,3 +761,196 @@ async def _probe_privacy(token: str) -> bool | None:
         return None
     value = me.get("can_read_all_group_messages")
     return bool(value) if isinstance(value, bool) else None
+
+
+# ------------------------------------------------------------- админы теннанта
+async def can_manage_admins(tenant_id: int, b24_user_id: int,
+                            is_portal_admin: bool) -> bool:
+    """Кто распоряжается ролями.
+
+    Администратор портала — всегда: он поставил приложение, и отнимать у него это
+    право внутри нашего интерфейса было бы фикцией, он всё равно переустановит.
+    Плюс это единственный способ выдать права первому админу теннанта, пока их нет
+    ни у кого.
+    """
+    if is_portal_admin:
+        return True
+    return await access.role_of_b24_user(tenant_id, b24_user_id) == access.TENANT_ADMIN
+
+
+async def _b24_names(tenant_id: int, b24_user_id: int, ids: list[int]) -> dict[int, str]:
+    """Имена сотрудников портала одним batch-вызовом.
+
+    Без них список выглядит как «Битрикс24 #7», и назначать по такому списку права
+    страшно. Отказ портала здесь не критичен: подписи деградируют до номеров.
+    """
+    if not ids:
+        return {}
+    try:
+        client = await access.client_for_user(tenant_id, b24_user_id)
+        async with client:
+            res = await client.batch({str(i): ("user.get", {"ID": i}) for i in ids[:50]})
+    except Exception as exc:
+        log.warning("не удалось получить имена сотрудников: %s", str(exc)[:150])
+        return {}
+
+    # batch() отдаёт свою обёртку: {"result": {...}, "errors": {...}, ...}.
+    # Ошибки по отдельным ключам он уже залогировал, нам нужны только удачные.
+    out: dict[int, str] = {}
+    for key, value in ((res or {}).get("result") or {}).items():
+        row = (value or [None])[0] if isinstance(value, list) else value
+        if not isinstance(row, dict):
+            continue
+        name = " ".join(x for x in (row.get("NAME"), row.get("LAST_NAME")) if x).strip()
+        out[int(key)] = name or str(row.get("EMAIL") or key)
+    return out
+
+
+async def _admins_block(tenant: asyncpg.Record, b24_user_id: int, can_manage: bool,
+                        session: str) -> str:
+    async with pool().acquire() as conn:
+        members = await conn.fetch(
+            """
+            SELECT m.user_id, m.role, m.b24_user_id, m.link_status,
+                   u.tg_username, u.display_name
+              FROM tenant_members m
+              JOIN users u ON u.id = m.user_id
+             WHERE m.tenant_id = $1
+             ORDER BY (m.role = 'tenant_admin') DESC, u.display_name
+            """, tenant["id"])
+
+    if not members:
+        return ("<p>Пока никто не привязал свой Telegram к порталу.</p>"
+                "<div class='hint'>Права назначаются тем, кто уже связал аккаунты: "
+                "администратор — это конкретный человек с личным токеном Битрикс24, "
+                "а не строка в таблице.</div>")
+
+    names = await _b24_names(int(tenant["id"]), b24_user_id,
+                             [int(m["b24_user_id"]) for m in members
+                              if m["b24_user_id"] is not None])
+    admins = sum(1 for m in members if m["role"] == "tenant_admin")
+
+    rows = []
+    for m in members:
+        row_is_admin = m["role"] == "tenant_admin"
+        b24_id = int(m["b24_user_id"]) if m["b24_user_id"] is not None else None
+        who = names.get(b24_id if b24_id is not None else -1) or m["display_name"] \
+            or "без имени"
+        tg = f"@{m['tg_username']}" if m["tg_username"] else "telegram не показан"
+        b24_part = f" · Б24 #{b24_id}" if b24_id is not None else ""
+        role_html = ("<span class='ok'>админ теннанта</span>" if row_is_admin
+                     else "<span class='muted'>сотрудник</span>")
+        link_html = ("" if m["link_status"] == "authorized"
+                     else f"<span class='warn'> · {esc_html(m['link_status'])}</span>")
+
+        btn = ""
+        if can_manage:
+            # Последнего админа снять нельзя: теннант остался бы без управления,
+            # а вернуть его можно было бы только руками в базе.
+            last_one = row_is_admin and admins <= 1
+            action = "revoke" if row_is_admin else "grant"
+            label = "снять права" if row_is_admin else "назначить админом"
+            disabled = (" disabled title='это единственный админ теннанта'"
+                        if last_one else "")
+            btn = (
+                "<form method='post' action='/b24/app/role' style='display:inline'>"
+                f"<input type='hidden' name='session' value='{esc_attr(session)}'>"
+                f"<input type='hidden' name='action' value='{action}'>"
+                f"<input type='hidden' name='member_user_id' value='{m['user_id']}'>"
+                f"<button class='link-btn' type='submit'{disabled}>{label}</button>"
+                "</form>")
+
+        rows.append(
+            f"<div class='proj'><span><b>{esc_html(who)}</b>"
+            f"<span class='muted'> · {esc_html(tg)}{b24_part}</span>{link_html}"
+            f"<br>{role_html}</span>{btn}</div>")
+
+    hint = ("<div class='hint'>Админ теннанта привязывает чаты к проектам, вводит токен "
+            "бота и назначает других админов. Обычный сотрудник создаёт и комментирует "
+            "задачи — в пределах прав, которые ему дал сам Битрикс24.</div>"
+            if can_manage else
+            "<div class='hint'>Назначать администраторов может администратор портала "
+            "или действующий администратор теннанта.</div>")
+    return "".join(rows) + hint
+
+
+@router.post("/role")
+async def role_action(session: str = Form(...), action: str = Form(...),
+                      member_user_id: int = Form(0)) -> HTMLResponse:
+    sess = await load_session(session)
+    if sess is None:
+        return page("<div class='card'><h1>Сессия истекла</h1>"
+                    "<p>Закройте и откройте приложение заново.</p></div>", None)
+
+    async with pool().acquire() as conn:
+        tenant = await conn.fetchrow(
+            "SELECT id, b24_domain, install_state, granted_scope FROM tenants WHERE id = $1",
+            sess["tenant_id"])
+
+    tenant_id, actor = int(tenant["id"]), int(sess["b24_user_id"])
+    is_portal_admin = bool(sess["is_portal_admin"])
+
+    # Право проверяется здесь, а не только при отрисовке кнопки: форму можно
+    # отправить и без неё (docs/40-security.md §3).
+    if not await can_manage_admins(tenant_id, actor, is_portal_admin):
+        log.warning("попытка сменить роль без прав: теннант %s, пользователь %s",
+                    tenant_id, actor)
+        message, kind = "Назначать администраторов может только администратор.", "err"
+    else:
+        message, kind = await _apply_role(tenant_id, actor, action, member_user_id)
+
+    async with pool().acquire() as conn:
+        fresh = await issue_session(conn, tenant_id, actor, is_portal_admin)
+    body = await render_home(tenant, actor, is_portal_admin, fresh,
+                             message=message, message_kind=kind)
+    return page(body, tenant["b24_domain"])
+
+
+async def _apply_role(tenant_id: int, actor_b24_id: int, action: str,
+                      member_user_id: int) -> tuple[str, str]:
+    if action not in ("grant", "revoke"):
+        return "Неизвестное действие.", "err"
+
+    async with pool().acquire() as conn, conn.transaction():
+        target = await conn.fetchrow(
+            "SELECT m.role, m.b24_user_id, m.link_status, u.display_name, u.tg_username "
+            "FROM tenant_members m JOIN users u ON u.id = m.user_id "
+            "WHERE m.tenant_id = $1 AND m.user_id = $2 FOR UPDATE",
+            tenant_id, member_user_id)
+        if target is None:
+            return "Этот человек не состоит в теннанте.", "err"
+
+        if action == "grant" and target["link_status"] != "authorized":
+            return ("Сначала человек должен привязать Telegram к Битрикс24: без личного "
+                    "токена права администратора ничего не дадут.", "err")
+
+        new_role = access.TENANT_ADMIN if action == "grant" else access.MEMBER
+        if target["role"] == new_role:
+            return "Роль уже такая, ничего не меняли.", "ok"
+
+        if action == "revoke":
+            # Считаем под тем же локом: два одновременных снятия иначе оставят
+            # теннант без единого администратора.
+            admins = await conn.fetchval(
+                "SELECT count(*) FROM tenant_members "
+                "WHERE tenant_id = $1 AND role = 'tenant_admin'", tenant_id)
+            if int(admins) <= 1:
+                return ("Это единственный администратор теннанта. Сначала назначьте "
+                        "другого — иначе управлять интеграцией станет некому.", "err")
+
+        await conn.execute(
+            "UPDATE tenant_members SET role = $3 WHERE tenant_id = $1 AND user_id = $2",
+            tenant_id, member_user_id, new_role)
+
+    who = target["display_name"] or (f"@{target['tg_username']}"
+                                     if target["tg_username"] else str(member_user_id))
+    await audit.record(
+        tenant_id, "role.grant" if action == "grant" else "role.revoke",
+        actor_id=actor_b24_id, target=f"member:{member_user_id}",
+        detail={"кому": who, "было": target["role"], "стало": new_role,
+                "b24_user_id": target["b24_user_id"]})
+    log.info("роль в теннанте %s изменена: user_id=%s %s -> %s (кем: Б24 %s)",
+             tenant_id, member_user_id, target["role"], new_role, actor_b24_id)
+
+    return ((f"{esc_html(who)} — теперь администратор теннанта." if action == "grant"
+             else f"С {esc_html(who)} сняты права администратора."), "ok")
