@@ -8,7 +8,15 @@ from typing import Any
 
 from b24bot.b24 import errors, mapping
 from b24bot.b24.tokens import NeedsReauth
-from b24bot.bot import comments, keyboards, survey, task_create, texts, views
+from b24bot.bot import (
+    commands,
+    comments,
+    keyboards,
+    survey,
+    task_create,
+    texts,
+    views,
+)
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
@@ -28,7 +36,14 @@ from b24bot.tg import files as tg_files
 log = logging.getLogger(__name__)
 
 BIND_PAGE = 40    # сколько проектов портала помещается в одну клавиатуру
+
+
 MAX_OPTIONS = 20  # вариантов ответа на один вопрос; больше не влезает в экран
+
+
+def _help_text(*, private: bool) -> str:
+    """Помощь строится из реестра команд: список в меню Telegram и в /help — один."""
+    return texts.MSG_HELP_HEAD + "\n\n" + commands.render_help(private=private)
 
 
 class Reply:
@@ -491,10 +506,12 @@ async def _menu_tokens(ctx: ChatContext, tg_user_id: int) -> dict[str, str]:
 
 async def _help_reply(ctx: ChatContext, tg_user_id: int) -> Reply:
     if not ctx.is_active or not ctx.has_binding:
-        return Reply(texts.MSG_HELP if ctx.is_active else texts.MSG_START_GROUP)
+        return Reply(_help_text(private=False) if ctx.is_active
+                     else texts.MSG_START_GROUP)
     tokens = await _menu_tokens(ctx, tg_user_id)
     projects = ", ".join(esc_html(p.name) for p in ctx.projects)
-    text = (f"{texts.MSG_HELP}\n\n<b>Проекты этого чата:</b> {projects}\n"
+    text = (f"{_help_text(private=False)}\n\n"
+            f"<b>Проекты этого чата:</b> {projects}\n"
             f"<i>Закрепите это сообщение — кнопки будут всегда под рукой.</i>")
     return Reply(text, markup=keyboards.help_menu(tokens))
 
@@ -664,17 +681,25 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
         action = keyboards.PRIVATE_LABELS.get(text.strip())
         if action:
             return await _private_action(action, tg_user_id)
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(_help_text(private=True), markup=keyboards.persistent_private())
     name, arg = cmd
 
     if name == "start" and arg.startswith("b"):
         reply = await _link_account(arg[1:], tg_user_id, user)
         return Reply(reply.text, markup=keyboards.persistent_private())
     if name in ("start", "help"):
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(_help_text(private=True), markup=keyboards.persistent_private())
     if name == "whoami":
         return await _whoami(tg_user_id)
-    return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+    if name == "link":
+        return Reply(texts.MSG_NOT_LINKED, markup=keyboards.persistent_private())
+    # Те же действия, что на постоянной клавиатуре: человек, привыкший к слешам,
+    # не должен искать кнопку, а пришедший из меню Telegram — знать про кнопки.
+    slash_actions = {"status": "mine", "list": "mine",
+                     "overdue": "overdue", "mychats": "mychats"}
+    if name in slash_actions:
+        return await _private_action(slash_actions[name], tg_user_id)
+    return Reply(_help_text(private=True), markup=keyboards.persistent_private())
 
 
 async def _private_action(action: str, tg_user_id: int) -> Reply:
@@ -685,7 +710,7 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
     ходим его личным токеном.
     """
     if action == "help":
-        return Reply(texts.MSG_HELP, markup=keyboards.persistent_private())
+        return Reply(_help_text(private=True), markup=keyboards.persistent_private())
 
     tenant_id = await access.tenant_of_user(tg_user_id)
     if tenant_id is None:

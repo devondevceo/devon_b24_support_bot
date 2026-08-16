@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import logging
 
-from b24bot.bot import dispatch
+from b24bot.bot import commands, dispatch
 from b24bot.core import heartbeat
 from b24bot.crypto import box
 from b24bot.db.pool import pool
@@ -47,11 +47,29 @@ class BotPoller:
     def stop(self) -> None:
         self._stop.set()
 
+    async def _publish_commands(self) -> None:
+        """Меню слеш-команд. Своё на личку, на группы и на админов группы.
+
+        Ставится при каждом старте: это единственный момент, когда мы точно знаем,
+        что токен жив. Недоступность Telegram здесь не должна мешать поллеру —
+        без меню бот работает, команды всё равно набираются руками.
+        """
+        for scope in commands.scopes():
+            try:
+                await tg.set_my_commands(self._token, commands.for_scope(scope),
+                                         scope=scope)
+            except tg.TelegramError as exc:
+                log.warning("меню команд (%s) не установлено для @%s: %s",
+                            scope, self.username, exc)
+                return
+        log.info("меню команд обновлено: @%s", self.username)
+
     async def run(self) -> None:
         log.info("поллер запущен: @%s (теннант %s)", self.username, self.tenant_id)
         # Вебхук и getUpdates взаимоисключающи: Telegram отдаст 409, пока висит вебхук.
         with contextlib.suppress(tg.TelegramError):
             await tg.delete_webhook(self._token)
+        await self._publish_commands()
 
         while not self._stop.is_set():
             try:

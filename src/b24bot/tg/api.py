@@ -106,6 +106,30 @@ async def get_webhook_info(token: str, *, proxy_base: str | None = None) -> dict
     return info
 
 
+async def set_my_commands(token: str, commands: list[dict[str, str]], *,
+                          scope: str | None = None,
+                          proxy_base: str | None = None) -> bool:
+    """Меню слеш-команд. Пустой список стирает меню для этой области.
+
+    Область (`scope`) обязательна для всего, кроме умолчания: без неё Telegram
+    пишет один список во все чаты сразу, и в личке появляются команды группы.
+    """
+    params: dict[str, Any] = {"commands": commands}
+    if scope:
+        params["scope"] = {"type": scope}
+    result = await call(token, "setMyCommands", params, proxy_base=proxy_base)
+    return bool(result)
+
+
+async def get_my_commands(token: str, *, scope: str | None = None,
+                          proxy_base: str | None = None) -> list[dict[str, str]]:
+    params: dict[str, Any] = {}
+    if scope:
+        params["scope"] = {"type": scope}
+    result = await call(token, "getMyCommands", params, proxy_base=proxy_base)
+    return list(result or [])
+
+
 async def send_message(token: str, chat_id: int, text: str, *,
                        thread_id: int | None = None,
                        reply_markup: dict[str, Any] | None = None,
