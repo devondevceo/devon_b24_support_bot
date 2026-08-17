@@ -60,7 +60,7 @@ async def load_session(token: str) -> asyncpg.Record | None:
 
 
 # ---------------------------------------------------------------------- вёрстка
-TABS = ("overview", "chats", "bot", "survey", "team")
+TABS = ("overview", "chats", "bot", "survey", "approval", "team")
 
 
 def safe_tab(value: str) -> str:
@@ -288,14 +288,19 @@ async def _manager_screen(tenant: asyncpg.Record, b24_user_id: int, is_admin: bo
             "создавать и комментировать задачи из чатов вы пока не можете — "
             "привязка находится во вкладке «Команда».", "warn")
 
+    from b24bot.api import app_approval
+
     can_roles = await can_manage_admins(int(tenant["id"]), b24_user_id, is_admin)
     survey = await _survey_block(int(tenant["id"]), can_roles, session, active)
+    approval_tab = await app_approval.render_block(int(tenant["id"]), b24_user_id,
+                                                    can_roles, session, active)
 
     tabs = _tabs_html(active, [
         ("overview", "Обзор", "info", 0),
         ("chats", "Чаты", "chat", chats_n),
         ("bot", "Бот", "send", 0),
         ("survey", "Опросник", "inbox", 0),
+        ("approval", "Подтверждение", "check-circle", 0),
         ("team", "Команда", "users", int(counts["members"])),
     ])
 
@@ -312,6 +317,8 @@ async def _manager_screen(tenant: asyncpg.Record, b24_user_id: int, is_admin: bo
             + _panel_html("chats", active, (flash if active == "chats" else "") + chats)
             + _panel_html("bot", active, (flash if active == "bot" else "") + bot_panel)
             + _panel_html("survey", active, (flash if active == "survey" else "") + survey)
+            + _panel_html("approval", active,
+                         (flash if active == "approval" else "") + approval_tab)
             + _panel_html("team", active, (flash if active == "team" else "") + team))
 
     return head + warn_link + tabs + body

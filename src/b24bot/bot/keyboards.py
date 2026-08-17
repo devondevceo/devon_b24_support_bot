@@ -54,6 +54,7 @@ def persistent_private(app_url: str | None = None) -> dict[str, Any]:
         "keyboard": [
             [{"text": "📊 Мои задачи"}, {"text": "🔥 Просроченные"}],
             [{"text": "🔗 Мои чаты"}, {"text": "❓ Помощь"}],
+            [{"text": "🙋 Ожидают подтверждения"}],
             *([app_row] if app_row else []),
         ],
         "resize_keyboard": True,
@@ -66,6 +67,7 @@ PRIVATE_LABELS = {
     "📊 Мои задачи": "mytasks",
     "🔥 Просроченные": "overdue",
     "🔗 Мои чаты": "mychats",
+    "🙋 Ожидают подтверждения": "pending",
     "❓ Помощь": "help",
 }
 

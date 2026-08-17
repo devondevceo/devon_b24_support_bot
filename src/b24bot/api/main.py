@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from b24bot.api.app_approval import router as approval_router
 from b24bot.api.app_survey import router as survey_router
 from b24bot.api.app_ui import router as app_router
 from b24bot.api.b24 import router as b24_router
@@ -58,6 +59,7 @@ app = FastAPI(title="devon b24 support bot", lifespan=lifespan, docs_url=None,
 app.include_router(b24_router)
 app.include_router(app_router)
 app.include_router(survey_router)
+app.include_router(approval_router)
 app.include_router(tg_router)
 app.include_router(miniapp_router)
 

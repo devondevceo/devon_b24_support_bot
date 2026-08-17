@@ -838,6 +838,7 @@ docker run --rm --network b24sdbot-internal -v /opt/b24sdbot:/w -w /tmp \
 | `b24_event_inbox` (`done`/`dropped`) | 14 дней | джоб |
 | `task_cache` отбойники (`is_ours=false`) | 7 дней | по `expires_at` |
 | `task_cache` закрытые задачи | 90 дней после `closed_date` | джоб |
+| `task_approvals` решённые (`confirmed`/`rejected`) | 90 дней после `resolved_at` | джоб (см. §16, не реализован) |
 | `callback_tokens` | по `expires_at` + 1 день | джоб раз в час |
 | `survey_sessions`, `tg_fsm_states` | 30 дней | джоб |
 | `tg_message_links` | 180 дней | джоб |
@@ -903,3 +904,65 @@ postgres:
 занижение в 1.5 раза): api 1 воркер × 8 + bot 8 + worker 10 + 2 отдельных соединения под
 `LISTEN` мимо пула = **28 из 40 (70%)**. Число воркеров api вынесено в переменную окружения
 с комментарием-формулой, чтобы его нельзя было поднять, не увидев расчёт.
+
+## 16. Подтверждение задач ответственным
+
+Опциональная (миграция `0013`, добавлена уже после первичного проектирования модели —
+поэтому отдельным разделом в конце, а не внутри §9: перенумеровать §10–15 означало бы
+молча сломать все внешние ссылки вида «§13.1», которых по кодовой базе и докам несколько).
+
+```sql
+CREATE TABLE task_approval_settings (       -- опция на уровне ПРОЕКТА
+  tenant_id           BIGINT      NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  project_id          BIGINT      NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  enabled             BOOLEAN     NOT NULL DEFAULT false,
+  responsible_user_id BIGINT      REFERENCES users(id),
+  confirm_stage_id    BIGINT,                -- b24_stage_id, НЕ project_stages.id
+  confirm_stage_title TEXT        NOT NULL DEFAULT '',
+  reject_stage_id     BIGINT,
+  reject_stage_title  TEXT        NOT NULL DEFAULT '',
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, project_id)
+);
+
+CREATE TABLE task_approvals (               -- один запрос на подтверждение задачи
+  id                   BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id            BIGINT      NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  project_id           BIGINT      NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  b24_task_id          BIGINT      NOT NULL,
+  task_title           TEXT        NOT NULL DEFAULT '',
+  responsible_user_id  BIGINT      NOT NULL REFERENCES users(id),
+  confirm_stage_id     BIGINT      NOT NULL,   -- снимок настроек на момент запроса
+  confirm_stage_title  TEXT        NOT NULL DEFAULT '',
+  reject_stage_id      BIGINT      NOT NULL,
+  reject_stage_title   TEXT        NOT NULL DEFAULT '',
+  status               TEXT        NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending','confirmed','rejected')),
+  requested_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolved_at          TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX ux_task_approvals__task_pending
+  ON task_approvals (tenant_id, b24_task_id) WHERE status = 'pending';
+CREATE INDEX ix_task_approvals__responsible_pending
+  ON task_approvals (tenant_id, responsible_user_id) WHERE status = 'pending';
+```
+
+Почему это НЕ ещё одна строка в `notification_settings`: стадии канбана — целиком
+проектная сущность (у каждого проекта свой набор `b24_stage_id`), наследовать
+`binding → project → tenant` здесь нечем — стадию тенанта заимствовать неоткуда.
+Поэтому `task_approval_settings` без иерархии, ключ сразу `(tenant_id, project_id)`,
+а не `(tenant_id, scope_kind, scope_id, code)`.
+
+`task_approvals` хранит СНИМОК стадий и ответственного, а не читает настройки заново
+в момент решения: правка проектных настроек после отправки запроса не должна задним
+числом подменить то, что уже увидел человек в кнопках Telegram.
+
+`ux_task_approvals__task_pending` — идемпотентность на уровне таблицы (И-10), а не
+только вызывающего кода: повторный вызов хука на ту же задачу не породит вторую
+параллельную заявку.
+
+Доставка запроса — НЕ через `outbox`: та таблица жёстко требует `chat_ref REFERENCES
+tg_chats(id)`, а личные чаты в `tg_chats` принципиально не регистрируются (см.
+docs/10-architecture.md о `dispatch.py`). Сообщение с кнопками уходит напрямую
+`tg.send_message`, в обход очереди; если человек ни разу не писал боту в личку,
+Telegram отвечает 400/403, заявка остаётся `pending` и находится через `/pending`.

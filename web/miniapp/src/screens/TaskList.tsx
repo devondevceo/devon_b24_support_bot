@@ -10,10 +10,11 @@ type Props = {
   context: Context
   onOpen: (taskId: number) => void
   onCreate: () => void
+  onApprovals: () => void
   onSwitchChat: (() => void) | null
 }
 
-export function TaskList({ context, onOpen, onCreate, onSwitchChat }: Props) {
+export function TaskList({ context, onOpen, onCreate, onApprovals, onSwitchChat }: Props) {
   const [filter, setFilter] = useState<TaskFilter>('all')
   const [query, setQuery] = useState('')
   const [search, setSearch] = useState('')
@@ -57,6 +58,10 @@ export function TaskList({ context, onOpen, onCreate, onSwitchChat }: Props) {
         <h1>{context.title}</h1>
         <div className="sub">
           {context.projects.map((p) => p.name).join(' · ')}
+          {' · '}
+          <button className="link" onClick={onApprovals}>
+            🙋 на подтверждении
+          </button>
           {onSwitchChat ? (
             <>
               {' · '}
