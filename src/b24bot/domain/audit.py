@@ -24,6 +24,7 @@ HIGH_RISK = frozenset({
     "bot.token.set", "bot.suspend",
     "user.map",
     "task.responsible.change", "task.complete", "task.defer",
+    "task.approval.confirm", "task.approval.reject",
     "report.export",
 })
 

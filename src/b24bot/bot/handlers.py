@@ -20,7 +20,7 @@ from b24bot.bot import (
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access, audit, miniapp, sync
+from b24bot.domain import access, approvals, audit, miniapp, sync
 from b24bot.domain import events as b24_events
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
@@ -946,7 +946,8 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
     # Те же действия, что на постоянной клавиатуре: человек, привыкший к слешам,
     # не должен искать кнопку, а пришедший из меню Telegram — знать про кнопки.
     slash_actions = {"status": "mine", "list": "mine",
-                     "overdue": "overdue", "mychats": "mychats"}
+                     "overdue": "overdue", "mychats": "mychats",
+                     "pending": "pending"}
     if name in slash_actions:
         return await _private_action(slash_actions[name], tg_user_id)
     return Reply(_help_text(private=True), markup=_private_kb())
@@ -968,6 +969,9 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
     b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
     if b24_user_id is None:
         return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
+
+    if action == "pending":
+        return await _pending_approvals(tenant_id, tg_user_id)
 
     if action == "mychats":
         async with pool().acquire() as conn:
@@ -1017,6 +1021,79 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
         title = "📊 Мои задачи"
     return Reply(views.render_list(tasks, title=title),
                  markup=_private_kb())
+
+
+# ------------------------------------------------------------ подтверждение задач
+APPROVAL_PAGE = 15  # столько поместится кнопок под одним сообщением
+
+
+async def _pending_approvals(tenant_id: int, tg_user_id: int) -> Reply:
+    """/pending и кнопка «🙋 Ожидают подтверждения» — личный список, не чата.
+
+    Как и остальные действия постоянной клавиатуры, собирает задачи по всему
+    теннанту: у решения ответственного нет привязки к одному чату.
+    """
+    user_id = await approvals.user_id_of(tg_user_id)
+    if user_id is None:
+        return Reply(texts.MSG_APPROVAL_PENDING_EMPTY, markup=_private_kb())
+
+    items, total = await approvals.pending_for(tenant_id, user_id, limit=APPROVAL_PAGE)
+    if not items:
+        return Reply(texts.MSG_APPROVAL_PENDING_EMPTY, markup=_private_kb())
+
+    lines = ["<b>🙋 Ожидают вашего подтверждения</b>", ""]
+    buttons: list[list[dict[str, str]]] = []
+    for item in items:
+        lines.append(f"#{item.b24_task_id} · {esc_html(item.task_title)}")
+        lines.append(f"    {esc_html(item.client_name)} · {esc_html(item.project_name)}")
+        confirm = await issue_token(
+            "task_approval", tenant_id=tenant_id, owner_tg_id=tg_user_id,
+            payload={"approval_id": item.id, "decision": "confirm"}, ttl=timedelta(days=30))
+        reject = await issue_token(
+            "task_approval", tenant_id=tenant_id, owner_tg_id=tg_user_id,
+            payload={"approval_id": item.id, "decision": "reject"}, ttl=timedelta(days=30))
+        buttons.append([
+            {"text": f"✅ #{item.b24_task_id}", "callback_data": f"av:{confirm}"},
+            {"text": f"❌ #{item.b24_task_id}", "callback_data": f"av:{reject}"},
+        ])
+
+    text = "\n".join(lines)
+    if total > len(items):
+        # Молчаливое усечение — тот же баг продукта, что и везде в этом боте.
+        text += f"\n\nПоказаны первые {len(items)} из {total}."
+    return Reply(text, buttons=buttons)
+
+
+async def _approval_vote(tenant_id: int, tg_user_id: int, payload: dict[str, Any]) -> Reply:
+    """Нажатие «Подтвердить»/«Отклонить» под запросом в личке."""
+    decision_raw = str(payload.get("decision") or "")
+    if decision_raw not in ("confirm", "reject") or not payload.get("approval_id"):
+        return Reply(texts.MSG_DIALOG_EXPIRED, markup={"inline_keyboard": []}, edit=True)
+    decision: approvals.Decision = "confirm" if decision_raw == "confirm" else "reject"
+
+    result = await approvals.resolve(tenant_id, int(payload["approval_id"]), decision,
+                                     tg_user_id)
+
+    if result.outcome == "confirmed":
+        text = texts.MSG_APPROVAL_CONFIRMED.format(
+            task_id=result.task_id, title=esc_html(result.title),
+            stage=esc_html(result.stage_title))
+    elif result.outcome == "rejected":
+        text = texts.MSG_APPROVAL_REJECTED.format(
+            task_id=result.task_id, title=esc_html(result.title),
+            stage=esc_html(result.stage_title))
+    elif result.outcome == "already_done":
+        text = texts.MSG_APPROVAL_ALREADY_DONE.format(
+            task_id=result.task_id, title=esc_html(result.title))
+    elif result.outcome == "needs_reauth":
+        text = texts.MSG_NEEDS_REAUTH
+    elif result.outcome == "b24_error":
+        text = texts.MSG_B24_UNAVAILABLE
+    else:  # forbidden, not_found — чужое или устаревшее нажатие
+        text = texts.MSG_DIALOG_EXPIRED
+    # Кнопки снимаются в любом исходе: повторное нажатие по тому же сообщению
+    # либо уже невозможно (токен одноразовый), либо бессмысленно.
+    return Reply(text, markup={"inline_keyboard": []}, edit=True)
 
 
 async def _link_account(token: str, tg_user_id: int, user: dict[str, Any]) -> Reply:
@@ -1330,6 +1407,16 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
         return Reply(texts.MSG_DIALOG_EXPIRED)
 
     payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+
+    if ns == "av":
+        # Кнопки подтверждения задачи живут в личке ответственного, а не в чате
+        # клиента: личные чаты в tg_chats не регистрируются (dispatch.py), поэтому
+        # ChatContext здесь взять неоткуда — это нормальное свойство личного
+        # диалога, а не повод отвечать «чат не подключён».
+        if row["tenant_id"] is None:
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        return await _approval_vote(int(row["tenant_id"]), tg_user_id, payload)
+
     ctx = await load_chat_context(chat_id, msg.get("message_thread_id"))
     if ctx is None:
         return Reply(texts.MSG_NOT_CLAIMED)

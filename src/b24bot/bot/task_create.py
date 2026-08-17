@@ -18,6 +18,7 @@ from b24bot.b24 import errors
 from b24bot.b24.client import B24Client
 from b24bot.core.text import esc_bbcode
 from b24bot.db.pool import pool
+from b24bot.domain import approvals
 from b24bot.domain.context import ProjectRef
 
 log = logging.getLogger(__name__)
@@ -160,5 +161,10 @@ async def create(client: B24Client, tenant_id: int, project: ProjectRef, draft: 
             task.get("title"), int(task.get("status") or 2),
             int(task.get("responsibleId") or responsible_id),
             int(task.get("createdBy") or responsible_id))
+
+    # Опционально на уровне проекта (docs/50-web-and-b24-app.md). Не поднимает
+    # исключений — ответ человеку о созданной задаче не должен пропасть из-за
+    # сбоя в отправке запроса на подтверждение.
+    await approvals.on_task_created(tenant_id, project, task)
 
     return task, True

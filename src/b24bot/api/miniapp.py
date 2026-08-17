@@ -25,7 +25,7 @@ from b24bot.bot import comments as comments_service
 from b24bot.bot import task_create, views
 from b24bot.core.text import bbcode_to_text
 from b24bot.db.pool import pool
-from b24bot.domain import access, audit, miniapp
+from b24bot.domain import access, approvals, audit, miniapp
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
     TASK_NOT_FOUND,
@@ -403,6 +403,58 @@ async def task_patch(task_id: int, bundle: CtxDep, body: JsonBody) -> JSONRespon
     # значит показать «сохранено» там, где ничего не сохранилось.
     card["not_applied"] = missed
     return JSONResponse(card)
+
+
+# ------------------------------------------------------ подтверждение задач
+def _approval_json(item: approvals.PendingItem) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "task_id": item.b24_task_id,
+        "title": item.task_title,
+        "project": {"id": item.project_id, "name": item.project_name,
+                    "client": item.client_name},
+        "requested_at": item.requested_at.isoformat(),
+    }
+
+
+@router.get("/approvals")
+async def approvals_list(actor: ActorDep) -> JSONResponse:
+    """Список задач на подтверждение — как список дел, а не задачи одного чата.
+
+    Единственный эндпоинт мини-аппа без `CtxDep`: решение ответственного не
+    привязано к тому, из какого чата открыто приложение, — так же как
+    «Ожидают подтверждения» в боте собирает задачи по всему теннанту.
+    """
+    user_id = await approvals.user_id_of(actor.tg_user_id)
+    if user_id is None:
+        return JSONResponse({"items": [], "total": 0})
+    items, total = await approvals.pending_for(actor.tenant_id, user_id)
+    return JSONResponse({"items": [_approval_json(i) for i in items], "total": total})
+
+
+@router.post("/approvals/{approval_id}/action")
+async def approval_action(approval_id: int, actor: ActorDep, body: JsonBody) -> JSONResponse:
+    decision_raw = str(body.get("decision") or "")
+    if decision_raw not in ("confirm", "reject"):
+        raise ApiError(400, "validation", "Неизвестное решение.")
+    decision: approvals.Decision = "confirm" if decision_raw == "confirm" else "reject"
+
+    result = await approvals.resolve(actor.tenant_id, approval_id, decision,
+                                     actor.tg_user_id, source="miniapp")
+    if result.outcome in ("confirmed", "rejected"):
+        return JSONResponse({"outcome": result.outcome, "task_id": result.task_id,
+                             "title": result.title, "stage": result.stage_title})
+    if result.outcome == "already_done":
+        raise ApiError(409, "already_done", "Решение по этой задаче уже принято.")
+    if result.outcome == "needs_reauth":
+        raise ApiError(403, "needs_reauth",
+                       "Доступ к Битрикс24 истёк. Откройте приложение внутри портала "
+                       "и привяжите Telegram заново.")
+    if result.outcome == "b24_error":
+        raise ApiError(502, "upstream_error", "Битрикс24 не ответил. Попробуйте ещё раз.")
+    # forbidden, not_found — тот же однотипный отказ, что и у И-3: не раскрываем,
+    # что именно не так с чужим или устаревшим идентификатором запроса.
+    raise ApiError(404, "not_found", "Запрос на подтверждение не найден.")
 
 
 # ---------------------------------------------------------------- комментарии

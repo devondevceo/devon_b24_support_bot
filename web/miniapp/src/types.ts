@@ -65,6 +65,14 @@ export type ContextListItem = {
 
 export type Member = { id: number; name: string; position: string; role: string }
 
+export type Approval = {
+  id: number
+  task_id: number
+  title: string
+  project: { id: number; name: string; client: string }
+  requested_at: string
+}
+
 export type Comment = { id: number | string; author: string; text: string; date: string }
 
 export type TaskFilter = 'all' | 'mine' | 'overdue' | 'closed'

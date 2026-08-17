@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, ApiError } from './api'
 import { Empty, Failure, Loading } from './components/States'
+import { ApprovalsScreen } from './screens/ApprovalsScreen'
 import { ContextPicker } from './screens/ContextPicker'
 import { CreateTask } from './screens/CreateTask'
 import { TaskCardScreen } from './screens/TaskCardScreen'
@@ -17,6 +18,7 @@ type Screen =
   | { name: 'card'; taskId: number }
   | { name: 'create' }
   | { name: 'pick' }
+  | { name: 'approvals' }
 
 export function App() {
   const [boot, setBoot] = useState<Bootstrap | null>(null)
@@ -112,12 +114,21 @@ export function App() {
     )
   }
 
+  if (screen.name === 'approvals') {
+    return (
+      <Shell>
+        <ApprovalsScreen onBack={backToList} />
+      </Shell>
+    )
+  }
+
   return (
     <Shell>
       <TaskList
         context={context}
         onOpen={(taskId) => setScreen({ name: 'card', taskId })}
         onCreate={() => setScreen({ name: 'create' })}
+        onApprovals={() => setScreen({ name: 'approvals' })}
         // Чат, пришедший ссылкой из группы, менять нельзя: кнопка в чате одного
         // клиента не должна открывать задачи другого.
         onSwitchChat={context.pinned ? null : () => setScreen({ name: 'pick' })}

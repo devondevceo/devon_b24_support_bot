@@ -8,6 +8,7 @@
  */
 import { tg } from './telegram'
 import type {
+  Approval,
   Bootstrap,
   Comment,
   Context,
@@ -147,4 +148,16 @@ export const api = {
       `/projects/${projectId}/stages`,
       { query: { chat_ref: chatRef } },
     ),
+
+  approvals: {
+    // Не привязано к чату: решение ответственного касается всего теннанта,
+    // как и «Ожидают подтверждения» в боте.
+    list: () => request<{ items: Approval[]; total: number }>('/approvals'),
+
+    act: (id: number, decision: 'confirm' | 'reject') =>
+      request<{ outcome: string; task_id: number; title: string; stage: string }>(
+        `/approvals/${id}/action`,
+        { method: 'POST', body: { decision } },
+      ),
+  },
 }
