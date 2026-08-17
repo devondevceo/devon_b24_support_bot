@@ -296,11 +296,28 @@ Settings → Secrets and variables → Actions:
 | `DEPLOY_HOST` | secret | `91.142.94.189` |
 | `DEPLOY_USER` | secret | `root` |
 | `DEPLOY_SSH_KEY` | secret | приватный ключ целиком, включая строки `-----BEGIN/END-----` |
-| `DEPLOY_KNOWN_HOSTS` | secret | вывод `ssh-keyscan -t ed25519 91.142.94.189` |
+| `DEPLOY_KNOWN_HOSTS` | secret | строка `91.142.94.189 ssh-ed25519 AAAA…`, см. ниже |
 | `DEPLOY_DIR` | variable | необязательно, по умолчанию `/opt/b24sdbot` |
 
 `DEPLOY_KNOWN_HOSTS` обязателен: `StrictHostKeyChecking=no` в пайплайне, который держит
 ssh-ключ от root боевого сервера, — это подпись под любым MITM в сети раннера.
+
+Взять значение проще всего из своего же `known_hosts` — там лежит ключ, которому
+машина доверяет с прошлых деплоев:
+
+```bash
+ssh-keygen -F 91.142.94.189 | grep -v '^#'
+```
+
+**`ssh-keyscan` из комплекта Windows на этом сервере не работает:** падает с
+`choose_kex: unsupported KEX method sntrup761x25519-sha512@openssh.com`. Клиент
+`C:\Windows\System32\OpenSSH\` старше сервера и не знает постквантовый KEX, который
+тот предлагает первым. Сервер тут ни при чём, обычный `ssh` ходит нормально. Если
+ключ нужен именно с сервера, а не из `known_hosts` — брать `ssh-keyscan` из Git Bash
+(`/usr/bin/ssh-keyscan`), он свежее.
+
+`ssh-rsa` в секрет не класть: ключ на сервере рабочий, но выбирать подпись на SHA-1
+там, где есть ed25519, незачем.
 
 Токен GHCR отдельным секретом **не нужен**: публикует образ `GITHUB_TOKEN` самого прогона,
 он же уходит на сервер для `docker login` — через stdin, а не аргументом команды
