@@ -54,7 +54,7 @@ def persistent_private(app_url: str | None = None) -> dict[str, Any]:
         "keyboard": [
             [{"text": "📊 Мои задачи"}, {"text": "🔥 Просроченные"}],
             [{"text": "🔗 Мои чаты"}, {"text": "❓ Помощь"}],
-            [{"text": "🙋 Ожидают подтверждения"}],
+            [{"text": "🙋 Ожидают подтверждения"}, {"text": "⏱ Трудозатраты"}],
             *([app_row] if app_row else []),
         ],
         "resize_keyboard": True,
@@ -68,6 +68,7 @@ PRIVATE_LABELS = {
     "🔥 Просроченные": "overdue",
     "🔗 Мои чаты": "mychats",
     "🙋 Ожидают подтверждения": "pending",
+    "⏱ Трудозатраты": "timesheet",
     "❓ Помощь": "help",
 }
 
@@ -80,10 +81,26 @@ def help_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, A
          cb("m", tokens["overdue"], "🔥 Просроченные")],
         [cb("m", tokens["mine"], "👤 Мои задачи"),
          cb("m", tokens["all"], "📋 Все задачи")],
+        [cb("m", tokens["time"], "⏱ Трудозатраты")],
         [cb("m", tokens["new"], "➕ Создать задачу")],
     ]
     if app_url:
         rows.append([url_button("🧩 Приложение", app_url)])
+    return inline(rows)
+
+
+def month_menu(months: list[tuple[str, str]], back_token: str) -> dict[str, Any]:
+    """Месяцы по два в ряд: подписи короткие, а список всегда одной длины."""
+    rows: Rows = []
+    row: list[Button] = []
+    for token, label in months:
+        row.append(cb("m", token, label))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([cb("m", back_token, "◀️ Назад")])
     return inline(rows)
 
 

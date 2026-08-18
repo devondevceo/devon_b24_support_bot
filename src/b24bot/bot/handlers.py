@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from b24bot.b24 import errors, mapping
@@ -22,7 +22,7 @@ from b24bot.bot import (
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access, approvals, audit, miniapp, sync
+from b24bot.domain import access, approvals, audit, miniapp, sync, timesheet
 from b24bot.domain import events as b24_events
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
@@ -550,7 +550,7 @@ async def _survey_create(ctx: ChatContext, tg_user_id: int, session_id: int,
 
 async def _menu_tokens(ctx: ChatContext, tg_user_id: int) -> dict[str, str]:
     """Токены под кнопки меню. Общие для чата: меню закрепляют, им пользуются все."""
-    actions = ("status", "overdue", "mine", "all", "new")
+    actions = ("status", "overdue", "mine", "all", "new", "time")
     out = {}
     for action in actions:
         out[action] = await issue_token(
@@ -630,6 +630,140 @@ async def _open_summary(ctx: ChatContext, tg_user_id: int, action: str) -> Reply
                                    domain=await _tenant_domain(ctx.tenant_id),
                                    b24_user_id=b24_user_id),
                  markup=keyboards.task_list(numbers, nav), edit=True)
+
+
+async def _timesheet_months(ctx: ChatContext, tg_user_id: int) -> Reply:
+    """За какой месяц показать трудозатраты. Список всегда одной длины."""
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    if not ctx.has_binding:
+        return Reply(texts.MSG_NO_PROJECT)
+
+    months = []
+    for year, month in timesheet.months_back(datetime.now(UTC).date()):
+        token = await issue_token(
+            "menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
+            payload={"action": "time", "month": f"{year}-{month:02d}"},
+            single_use=False, ttl=timedelta(days=7))
+        months.append((token, timesheet.month_title(year, month)))
+    back = await issue_token("menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
+                             payload={"action": "status"}, single_use=False,
+                             ttl=timedelta(days=7))
+    return Reply(texts.MSG_TIME_CHOOSE_MONTH,
+                 markup=keyboards.month_menu(months, back), edit=True)
+
+
+async def _timesheet(ctx: ChatContext, tg_user_id: int, month: str) -> Reply:
+    """Свод трудозатрат за месяц по проектам чата.
+
+    Ходим личным токеном человека: видно ровно то, что видно ему самому. Границу
+    задаёт список групп чата — тот же, что и у всех остальных выборок (И-3).
+    """
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+    parsed = timesheet.parse_month(month)
+    if parsed is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
+    year, month_number = parsed
+
+    group_ids = [p.b24_group_id for p in ctx.projects]
+    if not group_ids:
+        return Reply(texts.MSG_NO_PROJECT)
+
+    text = await _timesheet_text(ctx.tenant_id, tg_user_id, b24_user_id, ctx.projects,
+                                 year, month_number)
+    back = await issue_token("menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
+                             payload={"action": "time"}, single_use=False,
+                             ttl=timedelta(days=7))
+    return Reply(text,
+                 markup=keyboards.inline([[keyboards.cb("m", back, "◀️ Другой месяц")]]),
+                 edit=True)
+
+
+async def _timesheet_text(tenant_id: int, tg_user_id: int, b24_user_id: int,
+                          projects: list[ProjectRef], year: int, month: int) -> str:
+    """Ядро отчёта, общее для чата и для лички.
+
+    Отличается только источник проектов: в чате это его привязки, в личке — все
+    проекты теннанта, привязанные хоть к одному чату. Всё остальное — те же
+    данные, те же разрезы и та же сумма.
+    """
+    try:
+        client = await access.client_for_user(tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            snap = await timesheet.snapshot(
+                client, tenant_id, [p.b24_group_id for p in projects])
+    except NeedsReauth:
+        return texts.MSG_NEEDS_REAUTH
+    except errors.B24Error as exc:
+        log.warning("трудозатраты не собрались: %s", exc)
+        return texts.MSG_B24_UNAVAILABLE
+
+    # Названия стадий — из справочника проектов: в своде их может быть несколько,
+    # и колонки разных проектов встают в одном порядке с их канбаном.
+    stage_titles: dict[int, str] = {}
+    for project in projects:
+        stage_titles.update(dict(await views.stages_of(tenant_id, project.id)))
+
+    report = timesheet.aggregate(
+        snap.entries, snap.tasks, stage_titles, year=year, month=month,
+        complete=snap.complete, seen=snap.seen, total_on_portal=snap.total_on_portal)
+    return views.render_timesheet(report, projects)
+
+
+async def _tenant_projects(tenant_id: int) -> list[ProjectRef]:
+    """Проекты теннанта, привязанные хоть к одному чату, — область личных экранов."""
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT p.id, p.b24_group_id, p.name, c.name AS client_name
+              FROM chat_bindings b
+              JOIN projects p ON p.id = b.project_id AND p.status = 'active'
+              JOIN clients  c ON c.id = p.client_id
+             WHERE b.tenant_id = $1 AND b.status = 'active'
+             ORDER BY 4, 3
+            """, tenant_id)
+    return [ProjectRef(r["id"], r["b24_group_id"], r["name"], r["client_name"])
+            for r in rows]
+
+
+async def _private_timesheet(tenant_id: int, tg_user_id: int,
+                             month: str | None) -> Reply:
+    """Трудозатраты в личке: тот же отчёт по всем проектам теннанта.
+
+    Токены здесь без `chat_ref` — личных чатов в `tg_chats` нет вовсе, как и у
+    кнопок подтверждения задач. Поэтому и ветка в `on_callback` своя, до загрузки
+    контекста чата.
+    """
+    b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
+    projects = await _tenant_projects(tenant_id)
+    if not projects:
+        return Reply(texts.MSG_NO_PROJECT, markup=_private_kb())
+
+    if month is None:
+        months = []
+        for year, number in timesheet.months_back(datetime.now(UTC).date()):
+            token = await issue_token(
+                "menu", tenant_id=tenant_id, owner_tg_id=tg_user_id,
+                payload={"month": f"{year}-{number:02d}"},
+                single_use=False, ttl=timedelta(days=7))
+            months.append((token, timesheet.month_title(year, number)))
+        rows = [[keyboards.cb("mt", token, label)] for token, label in months]
+        return Reply(texts.MSG_TIME_CHOOSE_MONTH, markup=keyboards.inline(rows))
+
+    parsed = timesheet.parse_month(month)
+    if parsed is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
+    year, number = parsed
+    text = await _timesheet_text(tenant_id, tg_user_id, b24_user_id, projects,
+                                 year, number)
+    return Reply(text)
 
 
 async def _open_card(ctx: ChatContext, tg_user_id: int, task_id: int) -> Reply:
@@ -1092,6 +1226,9 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
     if action == "pending":
         return await _pending_approvals(tenant_id, tg_user_id)
 
+    if action == "timesheet":
+        return await _private_timesheet(tenant_id, tg_user_id, None)
+
     if action == "mychats":
         async with pool().acquire() as conn:
             rows = await conn.fetch(
@@ -1553,6 +1690,14 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
 
     payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
 
+    if ns == "mt":
+        # Личный отчёт по трудозатратам: как и подтверждение задач, живёт в личке,
+        # где ChatContext взять неоткуда — личных чатов в tg_chats нет.
+        if row["tenant_id"] is None:
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        return await _private_timesheet(int(row["tenant_id"]), tg_user_id,
+                                        payload.get("month"))
+
     if ns == "av":
         # Кнопки подтверждения задачи живут в личке ответственного, а не в чате
         # клиента: личные чаты в tg_chats не регистрируются (dispatch.py), поэтому
@@ -1609,6 +1754,11 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
         action = str(payload.get("action") or "status")
         if action == "new":
             return await _survey_start(ctx, tg_user_id)
+        if action == "time":
+            month = payload.get("month")
+            if month is None:
+                return await _timesheet_months(ctx, tg_user_id)
+            return await _timesheet(ctx, tg_user_id, str(month))
         return await _open_summary(ctx, tg_user_id, action)
     if ns == "t":
         return _keep_source(payload,

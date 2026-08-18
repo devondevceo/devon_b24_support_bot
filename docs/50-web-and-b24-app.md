@@ -641,7 +641,7 @@ Telegram при каждом обращении. Своей сессии нет 
 | `GET /bootstrap` | кто я, портал, контекст чата. Непривязанный аккаунт — не ошибка, а состояние `not_linked` |
 | `GET /contexts` | чаты на выбор (личный режим) |
 | `GET /tasks?chat_ref=&filter=&q=&project_id=` | список; `filter` = `all\|mine\|overdue\|closed` |
-| `GET /tasks/{id}` | карточка, включая блок `allowed` из ответа портала и `stage_title` |
+| `GET /tasks/{id}` | карточка: блок `allowed` из ответа портала, `stage_title`, `time_spent` (секунды списаний) |
 | `POST /tasks/{id}/action` | `complete\|start\|pause\|defer\|renew` спец-методами |
 | `PATCH /tasks/{id}` | заголовок, описание, срок, приоритет, ответственный, стадия |
 | `GET /tasks/{id}/comments` · `POST` | обсуждение задачи |
