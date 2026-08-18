@@ -10,11 +10,14 @@
   меню группы, потому что закреплённое сообщение всегда под рукой.
 
 `callback_data` ограничен 64 байтами, поэтому туда уходит только `<ns>:<токен>`,
-а полезная нагрузка лежит в `callback_tokens` (docs/30-bot-spec.md §0.2).
+а полезная нагрузка лежит в `callback_tokens` (docs/30-bot-spec.md §0.2). Список
+префиксов — в `callbacks.py`, собирать `callback_data` руками нельзя.
 """
 from __future__ import annotations
 
 from typing import Any
+
+from b24bot.bot import callbacks
 
 Button = dict[str, str]
 Rows = list[list[Button]]
@@ -25,7 +28,8 @@ def inline(rows: Rows) -> dict[str, Any]:
 
 
 def cb(ns: str, token: str, text: str) -> Button:
-    return {"text": text, "callback_data": f"{ns}:{token}"}
+    """Инлайн-кнопка. `ns` обязан быть в реестре — см. `callbacks.data()`."""
+    return {"text": text, "callback_data": callbacks.data(ns, token)}
 
 
 def url_button(text: str, url: str) -> Button:

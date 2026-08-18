@@ -9,6 +9,7 @@ from typing import Any
 from b24bot.b24 import errors, mapping
 from b24bot.b24.tokens import NeedsReauth
 from b24bot.bot import (
+    callbacks,
     commands,
     comments,
     keyboards,
@@ -316,7 +317,7 @@ async def _survey_start(ctx: ChatContext, tg_user_id: int) -> Reply:
                                   owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
                                   payload={"template_id": template_id},
                                   ttl=timedelta(minutes=30))
-        rows.append([{"text": title, "callback_data": f"s:{token}"}])
+        rows.append([keyboards.cb("s", token, title)])
     return Reply(texts.MSG_SURVEY_CHOOSE, markup={"inline_keyboard": rows})
 
 
@@ -347,7 +348,7 @@ async def _survey_kb(ctx: ChatContext, tg_user_id: int, session_id: int,
                                   payload={"session_id": session_id, "index": i},
                                   ttl=timedelta(minutes=30))
         label = str(option.get("label") or option.get("value") or "—")
-        rows.append([{"text": label[:60], "callback_data": f"p:{token}"}])
+        rows.append([keyboards.cb("p", token, label[:60])])
 
     row = []
     if not q.required:
@@ -355,12 +356,12 @@ async def _survey_kb(ctx: ChatContext, tg_user_id: int, session_id: int,
                                   owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
                                   payload={"session_id": session_id},
                                   ttl=timedelta(minutes=30))
-        row.append({"text": "⏭ Пропустить", "callback_data": f"k:{token}"})
+        row.append(keyboards.cb("k", token, "⏭ Пропустить"))
     cancel = await issue_token("survey_cancel", tenant_id=ctx.tenant_id,
                                owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
                                payload={"session_id": session_id},
                                ttl=timedelta(minutes=30))
-    row.append({"text": "❌ Отменить", "callback_data": f"x:{cancel}"})
+    row.append(keyboards.cb("x", cancel, "❌ Отменить"))
     rows.append(row)
     return {"inline_keyboard": rows}
 
@@ -563,7 +564,7 @@ async def _open_summary(ctx: ChatContext, tg_user_id: int, action: str) -> Reply
     back = await issue_token("menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
                              payload={"action": "status"}, single_use=False,
                              ttl=timedelta(days=7))
-    nav = [{"text": "◀️ Назад", "callback_data": f"m:{back}"}]
+    nav = [keyboards.cb("m", back, "◀️ Назад")]
     if app_url:
         nav.append(keyboards.url_button("🧩 Приложение", app_url))
     return Reply(views.render_list(tasks, title=title),
@@ -1053,8 +1054,8 @@ async def _pending_approvals(tenant_id: int, tg_user_id: int) -> Reply:
             "task_approval", tenant_id=tenant_id, owner_tg_id=tg_user_id,
             payload={"approval_id": item.id, "decision": "reject"}, ttl=timedelta(days=30))
         buttons.append([
-            {"text": f"✅ #{item.b24_task_id}", "callback_data": f"av:{confirm}"},
-            {"text": f"❌ #{item.b24_task_id}", "callback_data": f"av:{reject}"},
+            keyboards.cb("av", confirm, f"✅ #{item.b24_task_id}"),
+            keyboards.cb("av", reject, f"❌ #{item.b24_task_id}"),
         ])
 
     text = "\n".join(lines)
@@ -1230,8 +1231,8 @@ async def _bind_commands(ctx: ChatContext, name: str, tg_user_id: int) -> Reply:
             token = await issue_token("admin:bind", tenant_id=tenant_id,
                                       owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
                                       payload={"project_id": r["id"], "action": "unbind"})
-            buttons.append([{"text": f"{r['client_name']} · {r['name']}",
-                             "callback_data": f"b:{token}"}])
+            buttons.append([keyboards.cb("b", token,
+                                        f"{r['client_name']} · {r['name']}")])
         return Reply("Какую привязку снять?", buttons=buttons)
 
     # Список берём С ПОРТАЛА, а не из своей таблицы: показывать только уже
@@ -1272,7 +1273,7 @@ async def _bind_commands(ctx: ChatContext, name: str, tg_user_id: int) -> Reply:
                                   owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
                                   payload={"b24_group_id": gid, "name": title,
                                            "action": "bind"})
-        buttons.append([{"text": title[:60], "callback_data": f"b:{token}"}])
+        buttons.append([keyboards.cb("b", token, title[:60])])
 
     head = texts.MSG_BIND_CHOOSE
     if len(items) > BIND_PAGE:
@@ -1302,8 +1303,8 @@ async def _create_from(ctx: ChatContext, source: dict[str, Any], tg_user_id: int
                                       owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
                                       payload={"project_id": p.id,
                                                "source_message_id": source.get("message_id")})
-            buttons.append([{"text": f"{p.client_name} · {p.name}",
-                             "callback_data": f"p:{token}"}])
+            buttons.append([keyboards.cb("tp", token,
+                                        f"{p.client_name} · {p.name}")])
         return Reply(texts.MSG_CHOOSE_PROJECT, buttons=buttons)
 
     return await _do_create(ctx, ctx.projects[0], source, tg_user_id, b24_user_id)
@@ -1406,6 +1407,15 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
     if row is None:
         return Reply(texts.MSG_DIALOG_EXPIRED)
 
+    # Префикс и вид токена связаны взаимно однозначно (bot/callbacks.py). Расхождение
+    # означает либо наш разлад эмиттера с роутером, либо чужой токен под подставленным
+    # префиксом: токены меню выдаются без владельца и многоразовыми, то есть доступны
+    # любому участнику чата, а ветка под другим префиксом ждёт совсем другой payload.
+    # Отказ тот же, что у истёкшего токена: разный текст работал бы оракулом.
+    if row["kind"] != callbacks.kind_of(ns):
+        log.warning("токен вида %r приехал под префиксом %r", row["kind"], ns)
+        return Reply(texts.MSG_DIALOG_EXPIRED)
+
     payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
 
     if ns == "av":
@@ -1474,7 +1484,7 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
         return await _edit(ctx, tg_user_id, payload)
     if ns == "b":
         return await _apply_bind(ctx, tenant_id, payload, tg_user_id)
-    if ns == "p":
+    if ns == "tp":
         b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
         if b24_user_id is None:
             return Reply(texts.MSG_NOT_LINKED)
