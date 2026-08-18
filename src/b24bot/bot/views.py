@@ -47,6 +47,21 @@ def is_overdue(task: dict[str, Any]) -> bool:
     return bool(deadline and status != STATUS_DONE and deadline < _now())
 
 
+def fmt_duration(seconds: Any) -> str:
+    """«5 ч 30 мин». Ноль и пустое — прочерк, а не «0 ч».
+
+    Портал отдаёт секунды строкой, а у задачи без списаний поле приходит `null`,
+    и это ровно то же самое, что ноль: работали ноль времени.
+    """
+    total = as_int(seconds) or 0
+    if total <= 0:
+        return "—"
+    hours, minutes = divmod(round(total / 60), 60)
+    if hours and minutes:
+        return f"{hours} ч {minutes} мин"
+    return f"{hours} ч" if hours else f"{minutes} мин"
+
+
 def fmt_date(value: Any) -> str:
     dt = _parse(value)
     if dt is None:
@@ -256,6 +271,9 @@ def render_card(task: dict[str, Any], project: ProjectRef, *,
     rows.append(f"Ответственный: "
                 f"{esc_html((task.get('responsible') or {}).get('name') or '—')}")
     rows.append(f"Постановщик: {esc_html((task.get('creator') or {}).get('name') or '—')}")
+    # Сумма списаний по задаче. Второго запроса не нужно: портал держит её в самой
+    # задаче (docs/00-portal-facts.md §5.2), у задачи без списаний поле — null.
+    rows.append(f"Трудозатраты: {fmt_duration(task.get('timeSpentInLogs'))}")
     rows.append(f"Создана: {fmt_date(task.get('createdDate'))}")
     if task.get("deadline"):
         rows.append(f"Срок: {fmt_date(task.get('deadline'))}")
@@ -265,6 +283,56 @@ def render_card(task: dict[str, Any], project: ProjectRef, *,
         short = description[:400] + ("…" if len(description) > 400 else "")
         rows += ["", esc_html(short)]
     return "\n".join(rows)
+
+
+def render_timesheet(report: Any, projects: list[ProjectRef]) -> str:
+    """Отчёт по трудозатратам: два разреза одной суммы.
+
+    Разрезы обязаны сходиться между собой и с итогом — у задачи один статус и
+    одна стадия. Если когда-нибудь разойдутся, это будет означать потерю времени
+    по дороге, поэтому итог печатается один и считается один раз.
+    """
+    head = " · ".join(esc_html(p.name) for p in projects) or "проекты чата"
+    lines = [f"⏱ <b>Трудозатраты · {esc_html(report.title)}</b>", head, ""]
+
+    if not report.entry_count:
+        lines.append("За этот месяц списаний времени нет.")
+        return "\n".join(lines)
+
+    lines.append("<b>По статусам</b>")
+    for bucket in report.by_status:
+        lines.append(f"  {esc_html(bucket.title)} — {fmt_duration(bucket.seconds)}"
+                     f" · {_tasks_word(len(bucket.tasks))}")
+    lines += ["", "<b>По стадиям</b>"]
+    for bucket in report.by_stage:
+        lines.append(f"  {esc_html(bucket.title)} — {fmt_duration(bucket.seconds)}"
+                     f" · {_tasks_word(len(bucket.tasks))}")
+
+    lines += ["", f"<b>Итого: {fmt_duration(report.total_seconds)}</b> · "
+                  f"{_tasks_word(report.task_count)} · "
+                  f"{plural(report.entry_count, 'списание', 'списания', 'списаний')}"]
+    if not report.complete:
+        # Молчаливое усечение выглядит как баг продукта. Портал отдаёт не больше
+        # 50 записей за раз и не умеет листать (docs/00-portal-facts.md §5.2).
+        lines.append(f"\n⚠️ Портал отдал {report.seen} записей учёта времени из "
+                     f"{report.total_on_portal}. Сумма — это минимум, а не точное "
+                     f"значение.")
+    return "\n".join(lines)
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """«1 задача», «2 задачи», «5 задач». Русский счёт, а не «5 задача(и)»."""
+    tail = n % 100
+    if 11 <= tail <= 14:
+        return f"{n} {many}"
+    tail %= 10
+    if tail == 1:
+        return f"{n} {one}"
+    return f"{n} {few}" if 2 <= tail <= 4 else f"{n} {many}"
+
+
+def _tasks_word(n: int) -> str:
+    return plural(n, "задача", "задачи", "задач")
 
 
 def portal_task_url(domain: str, task_id: int, b24_user_id: int) -> str:

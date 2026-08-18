@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, ApiError } from '../api'
 import { Failure, Loading } from '../components/States'
-import { fromLocalInput, fullDate, shortDate, toLocalInput } from '../format'
+import { duration, fromLocalInput, fullDate, shortDate, toLocalInput } from '../format'
 import { tg } from '../telegram'
 import { PRIORITY_TITLES, type Comment, type Context, type Member, type TaskCard } from '../types'
 
@@ -111,6 +111,10 @@ export function TaskCardScreen({ context, taskId, onBack }: Props) {
         <div className="row">
           <span className="label">Приоритет</span>
           <span className="value">{PRIORITY_TITLES[task.priority] ?? '—'}</span>
+        </div>
+        <div className="row">
+          <span className="label">Трудозатраты</span>
+          <span className="value">{duration(task.time_spent)}</span>
         </div>
         <div className="row">
           <span className="label">Создана</span>

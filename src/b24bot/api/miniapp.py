@@ -309,6 +309,9 @@ def _card_json(task: dict[str, Any], project: ProjectRef, portal: str,
         "changed_date": task.get("changedDate"),
         # Своего названия стадии портал в задаче не отдаёт — только `stageId`.
         "stage_title": stage_title,
+        # Сумма списаний по задаче в секундах; у задачи без списаний портал
+        # отдаёт null, и это то же самое, что ноль.
+        "time_spent": mapping.as_int(task.get("timeSpentInLogs")) or 0,
         "portal_url": views.portal_task_url(portal, mapping.as_int(task.get("id")) or 0,
                                             b24_user_id),
     })

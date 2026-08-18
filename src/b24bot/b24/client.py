@@ -64,6 +64,24 @@ class B24Client:
     async def call(self, method: str, params: JsonDict | None = None, *,
                    lane: Lane = Lane.INTERACTIVE) -> Any:
         """Один REST-вызов с ретраями. Возвращает содержимое result."""
+        data = await self.call_envelope(method, params, lane=lane)
+        return data.get("result") if isinstance(data, dict) else data
+
+    async def call_total(self, method: str, params: JsonDict | None = None, *,
+                         lane: Lane = Lane.INTERACTIVE) -> int:
+        """Сколько записей у портала ВСЕГО по этому запросу.
+
+        Нужно там, где метод отдаёт меньше, чем есть: у `task.elapseditem.getlist`
+        постраничность сломана (docs/00-portal-facts.md §5.2), и `total` из
+        конверта — единственный способ отличить «показали всё» от «показали
+        первые 50 из трёхсот».
+        """
+        data = await self.call_envelope(method, params, lane=lane)
+        return int(data.get("total") or 0) if isinstance(data, dict) else 0
+
+    async def call_envelope(self, method: str, params: JsonDict | None = None, *,
+                            lane: Lane = Lane.INTERACTIVE) -> Any:
+        """Тот же вызов, но ответ целиком: снаружи `result` лежат `total` и `next`."""
         body = encode_params(params or {})
         last: Exception | None = None
 
@@ -94,7 +112,7 @@ class B24Client:
                     continue
                 raise failure  # auth, права, не найдено, прочее — ретрай бессмыслен
 
-            return data.get("result") if isinstance(data, dict) else data
+            return data
 
         raise last or errors.B24Error("UNKNOWN", "исчерпаны попытки", method)
 
