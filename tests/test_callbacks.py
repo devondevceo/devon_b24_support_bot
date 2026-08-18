@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from b24bot.bot import callbacks, handlers, survey, texts
+from b24bot.bot import callbacks, handlers, keyboards, survey, texts
 from b24bot.domain import context
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "b24bot"
@@ -34,11 +34,23 @@ REGISTERED = {n.ns for n in callbacks.NAMESPACES}
 
 
 def _emitted() -> dict[str, list[str]]:
-    """Префиксы, которые бот действительно шлёт: первый аргумент `cb()`."""
+    """Префиксы, которые бот действительно шлёт.
+
+    Обычно это литерал в `cb("m", …)`. Кнопки под уведомлением — исключение:
+    префикс им выбирает таблица `keyboards.NOTIFY_BUTTONS`, поэтому она читается
+    как данные, а не выкапывается регуляркой из собственного исходника.
+
+    Полноты этому списку не требуется: отправить незарегистрированный префикс
+    нельзя в принципе — `callbacks.data()` не соберёт такую кнопку. Список нужен
+    ради обратного вопроса, на который рантайм не отвечает: не объявлен ли
+    в реестре префикс, которого никто не шлёт.
+    """
     found: dict[str, list[str]] = {}
     for name, text in SOURCES.items():
         for ns in re.findall(r'\bcb\(\s*"([a-z]+)"', text):
             found.setdefault(ns, []).append(name)
+    for ns, _label in keyboards.NOTIFY_BUTTONS.values():
+        found.setdefault(ns, []).append("bot/keyboards.py:NOTIFY_BUTTONS")
     return found
 
 
@@ -91,19 +103,49 @@ def test_every_registered_kind_is_actually_issued() -> None:
     issued = set()
     for text in SOURCES.values():
         issued |= set(re.findall(r'issue_token\(\s*"([\w:]+)"', text))
-    missing = sorted(n.kind for n in callbacks.NAMESPACES if n.kind not in issued)
+    missing = sorted({kind for n in callbacks.NAMESPACES for kind in n.kinds
+                      if kind not in issued})
     assert not missing, f"вид токена объявлен, но не выдаётся: {missing}"
 
 
-def test_kind_is_unique_per_namespace() -> None:
-    """Пара `ns` ↔ `kind` взаимно однозначна — на этом стоит проверка на нажатии."""
-    kinds = [n.kind for n in callbacks.NAMESPACES]
-    assert len(kinds) == len(set(kinds)), f"один вид токена на два префикса: {kinds}"
+def test_kind_belongs_to_one_family_of_prefixes() -> None:
+    """Вид токена, кроме `notify`, живёт ровно под одним префиксом.
+
+    `notify` — осознанное исключение: уведомление выдаёт один вид токена на все
+    свои кнопки, а смысл нажатия несёт `payload`. Остальным видам делить префикс
+    не с кем, и общий вид у двух веток означал бы, что токен одной уедет в другую.
+    """
+    shared: dict[str, list[str]] = {}
+    for entry in callbacks.NAMESPACES:
+        for kind in entry.kinds:
+            shared.setdefault(kind, []).append(entry.ns)
+    spread = {kind: where for kind, where in shared.items()
+              if len(where) > 1 and kind != callbacks.NOTIFY}
+    assert not spread, f"один вид токена на несколько префиксов: {spread}"
+
+
+def test_notify_prefixes_match_the_notify_buttons() -> None:
+    """Две таблицы обязаны сходиться: кнопки уведомления и то, что принимает роутер.
+
+    `keyboards.NOTIFY_BUTTONS` решает, под каким префиксом уедет токен `notify`.
+    Разъедься они — кнопка уведомления получит отказ на нажатии, а выглядеть это
+    будет как истёкший токен.
+    """
+    from_buttons = {ns for ns, _label in keyboards.NOTIFY_BUTTONS.values()}
+    from_registry = {n.ns for n in callbacks.NAMESPACES if callbacks.NOTIFY in n.kinds}
+    assert from_buttons == from_registry
 
 
 def test_router_checks_the_kind_of_the_token() -> None:
     """Страж по исходнику ловит разлад до деплоя, эта проверка — во время работы."""
-    assert 'row["kind"] != callbacks.kind_of(ns)' in HANDLERS
+    assert 'callbacks.accepts(ns, str(row["kind"]))' in HANDLERS
+
+
+def test_unknown_prefix_accepts_nothing() -> None:
+    """Префикс не из реестра не принимает ни одного вида — разбирать его некому."""
+    assert not callbacks.accepts("zz", "menu")
+    assert callbacks.accepts("m", "menu")
+    assert not callbacks.accepts("m", "edit")
 
 
 # ------------------------------------------------------------- форма префиксов
@@ -111,6 +153,7 @@ def test_prefixes_fit_the_telegram_limit() -> None:
     """`callback_data` — 64 байта; токен занимает 22 символа, плюс двоеточие."""
     for entry in callbacks.NAMESPACES:
         assert re.fullmatch(r"[a-z]{1,3}", entry.ns), entry
+        assert entry.kinds, entry
         assert len(callbacks.data(entry.ns, "x" * 22).encode()) <= 64, entry
 
 
@@ -180,6 +223,14 @@ def _click(monkeypatch: pytest.MonkeyPatch, data: str,
     async def record(session: object, code: str, value: str) -> None:
         trail.append(("answer", value))
 
+    async def discussion(_ctx: object, task_id: int, tg_user_id: int) -> handlers.Reply:
+        trail.append(("discussion", task_id))
+        return handlers.Reply("обсуждение")
+
+    async def edit(_ctx: object, tg_user_id: int, payload: dict[str, object]) -> handlers.Reply:
+        trail.append(("edit", payload.get("act")))
+        return handlers.Reply("меню правки")
+
     monkeypatch.setattr(handlers, "consume_token", consume)
     monkeypatch.setattr(handlers, "load_chat_context", ctx)
     monkeypatch.setattr(handlers.access, "linked_b24_user", linked)
@@ -188,6 +239,8 @@ def _click(monkeypatch: pytest.MonkeyPatch, data: str,
     monkeypatch.setattr(handlers.survey, "active_for", active_for)
     monkeypatch.setattr(handlers.survey, "questions", questions)
     monkeypatch.setattr(handlers.survey, "record", record)
+    monkeypatch.setattr(handlers, "_discussion_for", discussion)
+    monkeypatch.setattr(handlers, "_edit", edit)
 
     click = {"data": data, "from": {"id": 77},
              "message": {"message_id": 1, "chat": {"id": -100500}}}
@@ -214,4 +267,25 @@ def test_survey_pick_still_answers_the_question(monkeypatch: pytest.MonkeyPatch)
 def test_token_under_a_borrowed_prefix_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     """Тот же токен под чужим префиксом уводит нажатие в ветку, ждущую другой payload."""
     trail = _click(monkeypatch, "tp:token", _row("survey_pick", {"session_id": 9, "index": 0}))
+    assert trail == [("reply", texts.MSG_DIALOG_EXPIRED)]
+
+
+def test_notify_button_reaches_its_own_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Кнопки уведомления носят общий вид `notify`, а расходятся по четырём префиксам."""
+    trail = _click(monkeypatch, "d:token",
+                   _row("notify", {"task_id": 233, "notify": True}))
+    assert ("discussion", 233) in trail
+
+    trail = _click(monkeypatch, "e:token",
+                   _row("notify", {"task_id": 233, "notify": True, "act": "stage_menu"}))
+    assert ("edit", "stage_menu") in trail
+
+
+def test_menu_token_cannot_borrow_the_edit_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Токены `m:` выдаются без владельца и многоразовыми — их видит весь чат.
+
+    Отправленный под префиксом `e:`, такой токен увёл бы нажатие в ветку правки
+    с чужим `payload`. Набор видов у префикса это запрещает.
+    """
+    trail = _click(monkeypatch, "e:token", _row("menu", {"action": "status"}))
     assert trail == [("reply", texts.MSG_DIALOG_EXPIRED)]

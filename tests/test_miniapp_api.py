@@ -17,7 +17,7 @@ from b24bot.api import miniapp as api_miniapp
 from b24bot.api.main import app
 from b24bot.b24 import errors
 from b24bot.bot import task_create, views
-from b24bot.domain import access
+from b24bot.domain import access, sync
 from b24bot.domain import events as b24_events
 from b24bot.domain import miniapp as domain_miniapp
 from b24bot.domain.context import TASK_NOT_FOUND, ChatContext, ProjectRef
@@ -111,7 +111,9 @@ def portal(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
     monkeypatch.setattr(api_miniapp, "remember_task", noop)
     monkeypatch.setattr(b24_events, "suppress_echo", noop)
     monkeypatch.setattr(api_miniapp, "_client", lambda actor: _ready(client))
-    for module in (api_miniapp, views, task_create):
+    # `sync` — потому что карточка разрешает название стадии, а незнакомая стадия
+    # тянет за собой точечное обновление справочника (views.resolve_stage_title).
+    for module in (api_miniapp, views, task_create, sync):
         monkeypatch.setattr(module, "pool", lambda: FakePool())
     return client
 
@@ -340,6 +342,31 @@ async def test_create_passes_full_form(portal: FakeClient) -> None:
     # И-6: квадратные скобки в тексте человека Битрикс съедает как BBCode.
     assert "[тут]" not in fields["DESCRIPTION"]
     assert "［тут］" in fields["DESCRIPTION"]
+
+
+async def test_card_carries_the_stage_name(portal: FakeClient) -> None:
+    """Портал отдаёт только `stageId`, поэтому название разрешает сервер.
+
+    Без него в приложении стояло бы «335» — номер колонки человеку ничего не
+    говорит, а перенести задачу, не понимая, где она сейчас, нельзя.
+    """
+    resp = await request("GET", f"/api/miniapp/tasks/100?chat_ref={CHAT_REF}",
+                         auth=init_data())
+    assert resp.status_code == 200
+    card = resp.json()
+    assert "stage_title" in card, "поле обязано быть всегда, иначе экран падает"
+    # Справочник в тесте пуст — и это честная строка «стадия не опознана»,
+    # а не молчание и не «вне канбана»: смыслы разные.
+    assert card["stage_title"] == views.UNKNOWN_STAGE
+    assert card["stage_id"] == 335
+
+
+async def test_stage_can_be_moved_through_the_api(portal: FakeClient) -> None:
+    """Правка стадии кнопкой в приложении — та же PATCH, что срок и приоритет."""
+    resp = await request("PATCH", f"/api/miniapp/tasks/100?chat_ref={CHAT_REF}",
+                         auth=init_data(), json_body={"stage_id": 337})
+    assert resp.status_code == 200
+    assert portal.params_of("tasks.task.update")["fields"]["STAGE_ID"] == 337
 
 
 # --------------------------------------------------------------- комментарии

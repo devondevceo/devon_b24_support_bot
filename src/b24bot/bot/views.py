@@ -81,6 +81,41 @@ async def stages_of(tenant_id: int, project_id: int) -> list[tuple[int, str]]:
     return [(int(r["b24_stage_id"]), r["title"]) for r in rows]
 
 
+OUTSIDE_KANBAN = "Вне канбана"
+UNKNOWN_STAGE = "Стадия не опознана"
+
+
+def stage_label(stage_id: Any, titles: dict[int, str]) -> str:
+    """Название стадии по справочнику. Два разных смысла — две разные строки.
+
+    `STAGE_ID=0` значит «задача не разложена по колонкам» и это нормальное
+    состояние. Стадия, которой нет в справочнике, — уже наш разлад с порталом,
+    и молчать о нём значит показывать неверную сводку с уверенным видом.
+    """
+    sid = as_int(stage_id) or 0
+    if not sid:
+        return OUTSIDE_KANBAN
+    return titles.get(sid) or UNKNOWN_STAGE
+
+
+async def resolve_stage_title(tenant_id: int, project: ProjectRef,
+                              stage_id: Any) -> str:
+    """То же самое, но со справочником из базы и починкой на месте.
+
+    Незнакомая стадия почти всегда означает колонку, заведённую в Битриксе после
+    нашей последней синхронизации. Ждать суточного прохода нельзя — человек
+    смотрит на карточку сейчас.
+    """
+    sid = as_int(stage_id) or 0
+    if not sid:
+        return OUTSIDE_KANBAN
+    titles = dict(await stages_of(tenant_id, project.id))
+    if sid not in titles and await sync.ensure_fresh(tenant_id, project.id,
+                                                     project.b24_group_id):
+        titles = dict(await stages_of(tenant_id, project.id))
+    return stage_label(sid, titles)
+
+
 def _unknown_stages(tasks: list[dict[str, Any]], stages: list[tuple[int, str]]) -> set[int]:
     """Стадии задач, которых нет в нашем справочнике. Ноль не считается: это «вне канбана»."""
     known = {stage_id for stage_id, _ in stages}
@@ -123,10 +158,10 @@ async def render_summary(tenant_id: int, projects: list[ProjectRef],
         # о нём значит показывать неверную сводку с уверенным видом.
         outside = sum(1 for t in mine if not as_int(t.get("stageId")))
         if outside:
-            lines.append(f"  Вне канбана — {outside}")
+            lines.append(f"  {OUTSIDE_KANBAN} — {outside}")
         unresolved = len(mine) - counted - outside
         if unresolved:
-            lines.append(f"  Стадия не опознана — {unresolved}")
+            lines.append(f"  {UNKNOWN_STAGE} — {unresolved}")
 
         overdue = sum(1 for t in mine if is_overdue(t))
         if overdue:
@@ -166,7 +201,8 @@ def order_by_hierarchy(tasks: list[dict[str, Any]]) -> list[tuple[dict[str, Any]
     return out
 
 
-def render_list(tasks: list[dict[str, Any]], *, title: str, page: int = 0) -> str:
+def render_list(tasks: list[dict[str, Any]], *, title: str, page: int = 0,
+                domain: str | None = None, b24_user_id: Any = None) -> str:
     if not tasks:
         return f"<b>{esc_html(title)}</b>\n\nНичего не найдено."
 
@@ -182,7 +218,8 @@ def render_list(tasks: list[dict[str, Any]], *, title: str, page: int = 0) -> st
         deadline = fmt_date(t.get("deadline")) if t.get("deadline") else "без срока"
         pad = "    " * depth
         branch = "└ " if depth else ""
-        lines.append(f"{pad}{mark} <b>{i}.</b> {branch}#{t.get('id')} "
+        ref = task_ref(t.get("id"), domain=domain, b24_user_id=b24_user_id)
+        lines.append(f"{pad}{mark} <b>{i}.</b> {branch}{ref} "
                      f"{esc_html(t.get('title') or '')}")
         lines.append(f"{pad}     {esc_html(who)} · {esc_html(deadline)}")
     return "\n".join(lines)
@@ -195,20 +232,27 @@ def flatten_for_buttons(tasks: list[dict[str, Any]], page: int = 0
     return ordered[page * PAGE:(page + 1) * PAGE]
 
 
-def render_card(task: dict[str, Any], project: ProjectRef) -> str:
+def render_card(task: dict[str, Any], project: ProjectRef, *,
+                domain: str | None = None, b24_user_id: Any = None,
+                stage_title: str | None = None) -> str:
+    """`stage_title` — уже разрешённое название стадии (`resolve_stage_title`).
+
+    Своего названия портал в задаче не отдаёт: в ответе только `stageId`, и без
+    справочника в карточке стоял голый номер колонки.
+    """
     status = as_int(task.get("status"))
-    stage = task.get("stageId")
     overdue = is_overdue(task)
+    ref = task_ref(task.get("id"), domain=domain, b24_user_id=b24_user_id)
 
     rows = [
-        f"<b>#{task.get('id')} · {esc_html(task.get('title') or '')}</b>",
+        f"<b>{ref} · {esc_html(task.get('title') or '')}</b>",
         f"Клиент: {esc_html(project.client_name)} · Проект: {esc_html(project.name)}",
         f"Статус: {STATUS_EMOJI.get(status or 0, '•')} "
         f"{esc_html(STATUS_TITLES.get(status or 0, '—'))}"
         + (" 🔥 просрочена" if overdue else ""),
     ]
-    if stage and as_int(stage):
-        rows.append(f"Стадия: {esc_html(str(task.get('stageTitle') or stage))}")
+    if stage_title:
+        rows.append(f"Стадия: {esc_html(stage_title)}")
     rows.append(f"Ответственный: "
                 f"{esc_html((task.get('responsible') or {}).get('name') or '—')}")
     rows.append(f"Постановщик: {esc_html((task.get('creator') or {}).get('name') or '—')}")
@@ -224,4 +268,33 @@ def render_card(task: dict[str, Any], project: ProjectRef) -> str:
 
 
 def portal_task_url(domain: str, task_id: int, b24_user_id: int) -> str:
+    """Канонический адрес задачи на портале.
+
+    Портал понимает две формы — личную (`/company/personal/user/<id>/tasks/…`) и
+    групповую (`/workgroups/group/<id>/tasks/…`): проверено 18.08.2026 запросом,
+    у обеих в редиректе на авторизацию сохраняется параметр `any=` с разобранным
+    путём, а у выдуманного пути его нет (docs/00-portal-facts.md §12.2). Берём
+    личную: это та же форма, что Битрикс24 ставит в собственные уведомления,
+    поэтому её точно ловит мобильное приложение.
+    """
     return f"https://{domain}/company/personal/user/{b24_user_id}/tasks/task/view/{task_id}/"
+
+
+def task_ref(task_id: Any, *, domain: str | None = None,
+             b24_user_id: Any = None) -> str:
+    """«#233» ссылкой на задачу портала — или тем же текстом, если контекста нет.
+
+    Пользователь в адресе — это контекст раздела, а не проверка прав: доступ к
+    самой задаче портал проверяет отдельно. Поэтому подставляем того, кто ближе
+    всего к читателю: в карточке и списке — его самого, в уведомлении в чат —
+    ответственного по задаче.
+
+    Без домена или без пользователя ссылки не выйдет — тогда остаётся обычный
+    номер. Молча пропасть номер не имеет права: по нему открывают карточку.
+    """
+    number = f"#{task_id}"
+    uid = as_int(b24_user_id)
+    tid = as_int(task_id)
+    if not domain or not uid or not tid:
+        return number
+    return f'<a href="{esc_html(portal_task_url(domain, tid, uid))}">{number}</a>'

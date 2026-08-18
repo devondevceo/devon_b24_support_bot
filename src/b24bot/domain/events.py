@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -23,11 +24,16 @@ from b24bot.b24.limiter import Lane
 from b24bot.core.text import esc_html
 from b24bot.db.pool import pool
 from b24bot.domain import access
+from b24bot.domain.context import issue_token
 
 log = logging.getLogger(__name__)
 
 NOT_OURS_TTL = timedelta(days=7)
 ECHO_TTL = timedelta(seconds=60)
+# Уведомление остаётся в истории чата надолго, и кнопки под ним обязаны жить
+# столько же: протухший токен отвечает «диалог устарел», а человек видит обычное
+# сообщение с обычными кнопками и не понимает, почему они мертвы.
+NOTIFY_TOKEN_TTL = timedelta(days=30)
 
 # «Поле не передавали» и «поле сбросили в пустое» — разные вещи: снятый срок это
 # осмысленное значение None, и None как признак отсутствия здесь не годится.
@@ -47,6 +53,36 @@ DEFAULTS = {
 STATUS_VERB = {
     2: "вернул в ожидание", 3: "взял в работу", 4: "отправил на контроль",
     5: "завершил", 6: "отложил",
+}
+
+# Какие кнопки уместны под каким уведомлением. Смысл кнопки задаёт событие:
+# на новую задачу отвечают «беру», на комментарий — читают обсуждение, на смену
+# ответственного — передают дальше. Виды кнопок описаны в `keyboards.NOTIFY_BUTTONS`.
+#
+# У удалённой задачи кнопок нет вовсе: открывать, комментировать и менять уже
+# нечего, а кнопка, ведущая в никуда, выглядит как поломка бота.
+NOTIFY_ACTIONS: dict[str, tuple[str, ...]] = {
+    "task.created": ("card", "start"),
+    "task.status_changed": ("card", "stage"),
+    "task.stage_changed": ("card", "stage"),
+    "task.comment_added": ("discussion", "card"),
+    "task.responsible_changed": ("card", "edit"),
+    "task.deadline_changed": ("card", "deadline"),
+    "task.completed": ("card", "renew"),
+    "task.deleted": (),
+}
+
+# Полезная нагрузка кнопки: тот же формат, что у кнопок карточки и меню, плюс
+# признак `notify`. По нему обработчик понимает, что нажали под уведомлением, и
+# отвечает НОВЫМ сообщением, не затирая само уведомление (docs/30-bot-spec.md §7.3).
+NOTIFY_PAYLOAD: dict[str, dict[str, Any]] = {
+    "card": {},
+    "discussion": {},
+    "start": {"act": "start"},
+    "renew": {"act": "renew"},
+    "edit": {"act": "menu"},
+    "deadline": {"act": "deadline_menu"},
+    "stage": {"act": "stage_menu"},
 }
 
 
@@ -193,27 +229,63 @@ async def process_one(row: Any) -> None:
         await _finish(row["id"], "dropped", "не наш проект")
         return
 
-    changes = await _diff(tenant_id, int(task_id), task, known, actor)
+    domain = await _tenant_domain(tenant_id)
+    changes = await _diff(tenant_id, int(task_id), task, known, actor, domain)
     await _upsert_cache(tenant_id, int(task_id), project["id"], group_id, task)
 
+    portal_url = _portal_url(domain, int(task_id), task)
     for code, text in changes:
         if not await is_enabled(tenant_id, int(project["id"]), code):
             continue
-        await _queue(tenant_id, int(project["id"]), int(task_id), code, text)
+        await _queue(tenant_id, int(project["id"]), int(task_id), code, text,
+                     portal_url=portal_url)
 
     await _finish(row["id"], "done")
 
 
+def _portal_url(domain: str, task_id: int, task: dict[str, Any]) -> str | None:
+    """Адрес задачи на портале для кнопки-ссылки и для номера в тексте.
+
+    Раздел в адресе — это контекст, а не проверка прав, поэтому подставляем
+    ответственного: он ближе всех к тем, кто читает уведомление в чате проекта.
+    """
+    from b24bot.bot.views import portal_task_url
+
+    owner = (mapping.as_int(task.get("responsibleId"))
+             or mapping.as_int(task.get("createdBy")))
+    return portal_task_url(domain, task_id, owner) if domain and owner else None
+
+
+async def _tenant_domain(tenant_id: int) -> str:
+    async with pool().acquire() as conn:
+        value = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
+                                    tenant_id)
+    return str(value or "")
+
+
 async def _diff(tenant_id: int, task_id: int, task: dict[str, Any], known: Any,
-                actor: int | None) -> list[tuple[str, str]]:
+                actor: int | None, domain: str = "") -> list[tuple[str, str]]:
     """Что изменилось. Событие этого не сообщает — сравниваем с кэшем."""
+    from b24bot.bot.views import task_ref
+
     who = (task.get("changedBy") and (task.get("creator") or {}).get("name")) or ""
     actor_name = esc_html(who or f"пользователь {actor}" if actor else "Битрикс24")
     title = esc_html(task.get("title") or "")
+    # Номер — ссылка на задачу: из чата в неё уходят чаще, чем куда-либо ещё.
+    ref = task_ref(task_id, domain=domain,
+                   b24_user_id=(mapping.as_int(task.get("responsibleId"))
+                                or mapping.as_int(task.get("createdBy"))))
     out: list[tuple[str, str]] = []
 
+    # Стадия канбана — то, чем в чате меряют ход работы (docs/00-portal-facts.md §3.2),
+    # и по одному статусу её не восстановить: они независимы. Поэтому она стоит
+    # строкой в каждом уведомлении, кроме того, где и так названа.
+    stage = mapping.as_int(task.get("stageId"))
+    stage_line = "\n" + stage_note(await _stage_title(tenant_id, stage) if stage else "")
+
     if known is None:
-        return [("task.created", f"🆕 <b>#{task_id}</b> {title}\nСоздана задача")]
+        return [("task.created",
+                 f"🆕 <b>{ref}</b> {title}\nСоздана задача{stage_line}")]
 
     status = mapping.as_int(task.get("status"))
     if (status is not None and status != known["status"]
@@ -222,14 +294,14 @@ async def _diff(tenant_id: int, task_id: int, task: dict[str, Any], known: Any,
             code = "task.completed" if status == mapping.STATUS_DONE \
                 else "task.status_changed"
             emoji = mapping.STATUS_EMOJI.get(status, "•")
-            out.append((code, f"{emoji} <b>#{task_id}</b> {title}\n{actor_name} {verb}"))
+            out.append((code, f"{emoji} <b>{ref}</b> {title}\n"
+                              f"{actor_name} {verb}{stage_line}"))
 
-    stage = mapping.as_int(task.get("stageId"))
     if (stage not in (None, 0) and stage != known["stage_id"]
             and not await _is_echo(tenant_id, task_id, "STAGE", stage, actor)):
             stage_title = await _stage_title(tenant_id, stage)
             out.append(("task.stage_changed",
-                        f"📂 <b>#{task_id}</b> {title}\n"
+                        f"📂 <b>{ref}</b> {title}\n"
                         f"{actor_name} перенёс в «{esc_html(stage_title)}»"))
 
     resp = mapping.as_int(task.get("responsibleId"))
@@ -237,7 +309,8 @@ async def _diff(tenant_id: int, task_id: int, task: dict[str, Any], known: Any,
             and not await _is_echo(tenant_id, task_id, "RESPONSIBLE", resp, actor)):
             name = esc_html((task.get("responsible") or {}).get("name") or resp)
             out.append(("task.responsible_changed",
-                        f"👤 <b>#{task_id}</b> {title}\nОтветственный: {name}"))
+                        f"👤 <b>{ref}</b> {title}\n"
+                        f"Ответственный: {name}{stage_line}"))
 
     # Сравнивать надо ОДИНАКОВЫЕ типы: из портала приходит строка ISO, в кэше лежит
     # timestamptz. Сравнение через str() не совпадало никогда, и «изменён срок»
@@ -248,8 +321,21 @@ async def _diff(tenant_id: int, task_id: int, task: dict[str, Any], known: Any,
             from b24bot.bot.views import fmt_date
             when = fmt_date(deadline) if deadline else "снят"
             out.append(("task.deadline_changed",
-                        f"⏰ <b>#{task_id}</b> {title}\nСрок: {esc_html(when)}"))
+                        f"⏰ <b>{ref}</b> {title}\n"
+                        f"Срок: {esc_html(when)}{stage_line}"))
     return out
+
+
+def stage_note(stage_title: str) -> str:
+    """Строка о стадии для уведомления.
+
+    Пустое название означает `STAGE_ID=0` — задача не разложена по канбану. Это
+    нормальное состояние, и назвать его надо прямо: пропущенная строка читалась бы
+    как «мы не знаем», а это другой смысл (`views.UNKNOWN_STAGE`).
+    """
+    from b24bot.bot.views import OUTSIDE_KANBAN
+
+    return f"Стадия: {esc_html(stage_title or OUTSIDE_KANBAN)}"
 
 
 async def _on_deleted(tenant_id: int, task_id: int, known: Any,
@@ -337,8 +423,34 @@ def _dt(value: Any) -> datetime | None:
         return None
 
 
+async def notify_markup(tenant_id: int, chat_ref: int, task_id: int, code: str,
+                        portal_url: str | None) -> dict[str, Any] | None:
+    """Кнопки под уведомлением. Токены свои на каждый чат: они его и авторизуют.
+
+    Владельца у кнопки нет — нажать может любой участник чата, как у кнопок меню.
+    Ни одна проверка на этом не экономится: обработчик заново сверяет привязку
+    аккаунта, принадлежность задачи чату (И-3) и права в самом Битриксе.
+    """
+    from b24bot.bot import keyboards
+
+    kinds = NOTIFY_ACTIONS.get(code, ())
+    if not kinds:
+        # Пустой набор — это решение «кнопок тут не место» (удалённая задача),
+        # и ссылка на портал тогда тоже лишняя: открывать уже нечего.
+        return None
+
+    tokens: list[tuple[str, str]] = []
+    for kind in kinds:
+        token = await issue_token(
+            "notify", tenant_id=tenant_id, chat_ref=chat_ref,
+            payload={"task_id": task_id, "notify": True, **NOTIFY_PAYLOAD[kind]},
+            single_use=False, ttl=NOTIFY_TOKEN_TTL)
+        tokens.append((kind, token))
+    return keyboards.notify_task(tokens, portal_url)
+
+
 async def _queue(tenant_id: int, project_id: int, task_id: int, code: str,
-                 text: str) -> None:
+                 text: str, *, portal_url: str | None = None) -> None:
     """Разложить уведомление по всем чатам, к которым привязан проект."""
     async with pool().acquire() as conn:
         targets = await conn.fetch(
@@ -350,14 +462,22 @@ async def _queue(tenant_id: int, project_id: int, task_id: int, code: str,
              WHERE b.tenant_id = $1 AND b.project_id = $2 AND b.status = 'active'
             """, tenant_id, project_id)
 
-        for t in targets:
-            if t["bot_ref"] is None:
-                continue
+    for t in targets:
+        if t["bot_ref"] is None:
+            continue
+        # Токены выдаются ДО вставки: если строка не вставится из-за дедупликации,
+        # неиспользованные токены просто протухнут. Обратный порядок хуже — между
+        # вставкой и записью клавиатуры воркер успел бы отправить уведомление
+        # без кнопок.
+        markup = await notify_markup(tenant_id, int(t["chat_ref"]), task_id, code,
+                                     portal_url)
+        async with pool().acquire() as conn:
             await conn.execute(
                 "INSERT INTO outbox (tenant_id, bot_ref, chat_ref, thread_id, kind, "
-                "text, dedup_key) VALUES ($1,$2,$3,$4,$5,$6,$7) "
+                "text, markup, dedup_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) "
                 "ON CONFLICT DO NOTHING",
                 tenant_id, t["bot_ref"], t["chat_ref"], t["thread_id"], code, text,
+                json.dumps(markup, ensure_ascii=False) if markup else None,
                 f"{code}:{task_id}:{t['chat_ref']}:{_now():%Y%m%d%H%M}")
     log.info("уведомление %s по задаче %s поставлено в %d чат(ов)",
              code, task_id, len(targets))

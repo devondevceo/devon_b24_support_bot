@@ -641,7 +641,7 @@ Telegram при каждом обращении. Своей сессии нет 
 | `GET /bootstrap` | кто я, портал, контекст чата. Непривязанный аккаунт — не ошибка, а состояние `not_linked` |
 | `GET /contexts` | чаты на выбор (личный режим) |
 | `GET /tasks?chat_ref=&filter=&q=&project_id=` | список; `filter` = `all\|mine\|overdue\|closed` |
-| `GET /tasks/{id}` | карточка, включая блок `allowed` из ответа портала |
+| `GET /tasks/{id}` | карточка, включая блок `allowed` из ответа портала и `stage_title` |
 | `POST /tasks/{id}/action` | `complete\|start\|pause\|defer\|renew` спец-методами |
 | `PATCH /tasks/{id}` | заголовок, описание, срок, приоритет, ответственный, стадия |
 | `GET /tasks/{id}/comments` · `POST` | обсуждение задачи |
@@ -653,6 +653,12 @@ Telegram при каждом обращении. Своей сессии нет 
 Коды ошибок: `401 unauthenticated`, `403 not_linked` / `forbidden` / `needs_reauth` /
 `b24_forbidden`, `404 not_found`, `409 no_project`, `429 rate_limited`,
 `400 validation`, `502 upstream_error`.
+
+**`stage_title` считает сервер, а не приложение** (18.08.2026). Портал в задаче отдаёт
+только `stageId`, поэтому в карточке стояло бы «335». Название разрешается по справочнику
+`project_stages` тем же кодом, что и в боте (`views.resolve_stage_title`), с точечным
+обновлением справочника, если стадия незнакома. Форма правки при этом берёт список колонок
+живьём с портала (`GET /projects/{id}/stages`): справочник — для показа, портал — для выбора.
 
 Правила, действующие в каждом обработчике:
 
