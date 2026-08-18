@@ -88,6 +88,16 @@ jobs:
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
+          # Ключ, которого нет в authorized_keys сервера, даёт ровно одну строку:
+          # «Permission denied (publickey,password)». Больше не видно ничего —
+          # sshd на LogLevel INFO отвергнутые ключи не пишет в журнал вовсе
+          # (проверено на боевом сервере 18.08.2026 пробным ключом). Поэтому
+          # печатаем отпечаток здесь: он не секрет, а сверить его с
+          # `ssh-keygen -lf ~/.ssh/authorized_keys` на сервере — дело одной минуты.
+          ssh-keygen -y -f ~/.ssh/deploy_key > ~/.ssh/deploy_key.pub \
+            || { echo "DEPLOY_SSH_KEY не читается как приватный ключ OpenSSH"; exit 1; }
+          echo "ключ выкатки: $(ssh-keygen -lf ~/.ssh/deploy_key.pub)"
+
       # Никакого StrictHostKeyChecking=no: ключ сервера пришпилен секретом.
       - name: доставка compose и скриптов
         env:
@@ -118,6 +128,25 @@ jobs:
           printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$USER@$HOST" \
             "APP_DIR='$DIR' IMAGE='$IMAGE' GHCR_USER='${{ github.actor }}' \
              GIT_SHA='${{ github.sha }}' bash '$DIR/scripts/deploy.sh'"
+
+      # Сервер не пустил — печатаем ровно то, что надо установить. Публичный ключ
+      # секретом не является, а без него человек остаётся с «Permission denied»
+      # и без единой подсказки, чей ключ и куда его класть.
+      - name: сервер отверг ключ — что делать
+        if: failure()
+        run: |
+          {
+            echo "## Сервер не принял ключ выкатки"
+            echo
+            echo "Добавьте эту строку в \`~/.ssh/authorized_keys\` пользователя выкатки:"
+            echo
+            echo '```'
+            cat ~/.ssh/deploy_key.pub 2>/dev/null || echo "(ключ не прочитался)"
+            echo '```'
+            echo
+            echo "Проверить, что он там: \`ssh-keygen -lf ~/.ssh/authorized_keys\`."
+            echo "Либо положите в секрет \`DEPLOY_SSH_KEY\` тот ключ, который уже разрешён."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: итог
         if: always()
