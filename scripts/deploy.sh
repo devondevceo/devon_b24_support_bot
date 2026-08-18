@@ -126,7 +126,12 @@ docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB
   | gzip > "$dump" || fail "pg_dump не отработал"
 [ -s "$dump" ] || fail "дамп пустой: $dump"
 # Оборванный дамп выглядит как нормальный файл — проверяем хвост, а не размер.
-{ gzip -dc "$dump" || true; } | tail -3 | grep -q 'PostgreSQL database dump complete' \
+# Хвост в 20 строк, а не в 3: pg_dump 16.13 дописывает ПОСЛЕ маркера завершения
+# строку `\unrestrict <токен>` (защита от подмены команд при восстановлении,
+# добавлена патчами 2025 года) и пустые строки. Проверка по трём последним
+# строкам объявляла целый дамп оборванным и роняла выкатку — поймано на первом
+# же прогоне с рабочим ключом, 19.08.2026.
+{ gzip -dc "$dump" || true; } | tail -20 | grep -q 'PostgreSQL database dump complete' \
   || fail "дамп оборван: $dump"
 log "дамп снят: $dump ($(du -h "$dump" | cut -f1))"
 
