@@ -1,0 +1,139 @@
+# Выкатка на боевой сервер при мердже в main.
+#
+# Порядок: проверки (ci.yml) → сборка образа в CI и публикация в GHCR → выкатка по ssh.
+# На сервере ничего не собирается (docs/10-architecture.md §10): туда приезжает только
+# docker-compose.yml, скрипты и тег образа. Это же убирает целый класс аварий с tar-ом,
+# который молча не обновлял существующие файлы (CLAUDE.md, «Где что лежит»).
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Две выкатки одновременно уже ломали сервер: образ подменялся чужим, а compose падал
+# с «No such container». Очередь, а не отмена: прервать выкатку на середине хуже,
+# чем подождать. На сервере тот же запрет продублирован через flock.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: сборка образа
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${repo}:sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "latest=ghcr.io/${repo}:latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Без provenance-манифеста: выкатка сверяет digest запущенного контейнера
+          # с digest выкаченного образа, и мультиплатформенный индекс тут только мешает.
+          provenance: false
+
+  deploy:
+    name: выкатка на прод
+    needs: build
+    runs-on: ubuntu-latest
+    # Environment «production» существует ради двух вещей: журнал выкаток в интерфейсе
+    # GitHub и возможность включить обязательное подтверждение человеком, не трогая код.
+    environment:
+      name: production
+      url: https://b24sdbot.devondev.ru/health
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ключ и known_hosts
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$KEY" || { echo "нет секрета DEPLOY_SSH_KEY"; exit 1; }
+          test -n "$KNOWN_HOSTS" || { echo "нет секрета DEPLOY_KNOWN_HOSTS"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # Никакого StrictHostKeyChecking=no: ключ сервера пришпилен секретом.
+      - name: доставка compose и скриптов
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          DIR: ${{ vars.DEPLOY_DIR || '/opt/b24sdbot' }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$USER@$HOST" \
+            "test -f $DIR/.env || { echo 'нет $DIR/.env — сервер не развёрнут'; exit 1; }; mkdir -p $DIR/scripts"
+          scp -i ~/.ssh/deploy_key -o BatchMode=yes \
+            docker-compose.yml "$USER@$HOST:$DIR/docker-compose.yml"
+          scp -i ~/.ssh/deploy_key -o BatchMode=yes \
+            scripts/deploy.sh scripts/rollback.sh "$USER@$HOST:$DIR/scripts/"
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$USER@$HOST" \
+            "chmod 750 $DIR/scripts/deploy.sh $DIR/scripts/rollback.sh"
+
+      # Токен реестра уходит на сервер через stdin, а не аргументом команды: аргументы
+      # видны в ps любому процессу на машине, а машина общая с чужим продом.
+      # GITHUB_TOKEN живёт только до конца job-а, и скрипт делает docker logout за собой.
+      - name: выкатка
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          DIR: ${{ vars.DEPLOY_DIR || '/opt/b24sdbot' }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$USER@$HOST" \
+            "APP_DIR='$DIR' IMAGE='$IMAGE' GHCR_USER='${{ github.actor }}' \
+             GIT_SHA='${{ github.sha }}' bash '$DIR/scripts/deploy.sh'"
+
+      - name: итог
+        if: always()
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          {
+            echo "## Выкатка"
+            echo
+            echo "- образ: \`$IMAGE\`"
+            echo "- коммит: \`${{ github.sha }}\`"
+            echo "- результат: **${{ job.status }}**"
+            if [ "${{ job.status }}" != "success" ]; then
+              echo
+              echo "Скрипт откатывает **только образ**. База остаётся на новой схеме —"
+              echo "миграции вперёд-совместимы, старый код с новой схемой живёт."
+              echo "Полный откат с базой: \`scripts/rollback.sh --with-db <дамп>\` на сервере."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

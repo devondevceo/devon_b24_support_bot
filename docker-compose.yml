@@ -65,8 +65,15 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
+  # Образ один на api, bot и worker; собирается в CI и приезжает из GHCR.
+  # `build:` здесь намеренно НЕТ: на сервере лежит копия дерева, которая может
+  # разойтись с main, и `docker compose up -d` тихо собрал бы из неё старый код —
+  # ровно та авария 16.08, когда контейнеры были healthy со вчерашним main.py.
+  # Точный тег пишет в .env выкатка (APP_IMAGE), см. scripts/deploy.sh.
+  # Аварийная сборка на месте, если CI недоступен:
+  #   docker build -t "$(grep ^APP_IMAGE= .env | cut -d= -f2-)" .
   api:
-    build: .
+    image: ${APP_IMAGE:-ghcr.io/devondevceo/devon_b24_support_bot:latest}
     container_name: b24sdbot-api
     restart: always
     mem_limit: 256m
@@ -127,7 +134,7 @@ services:
   # Telegram не могут достучаться до этого хоста, а хост — до api.telegram.org.
   # Исходящие вызовы идут через SOCKS5 (TG_PROXY_URL).
   bot:
-    build: .
+    image: ${APP_IMAGE:-ghcr.io/devondevceo/devon_b24_support_bot:latest}
     container_name: b24sdbot-bot
     restart: always
     mem_limit: 320m
@@ -154,7 +161,7 @@ services:
   # Отдельно от бота: обработка события ходит в портал и может занять секунды,
   # а поллер обязан быстро крутить getUpdates.
   worker:
-    build: .
+    image: ${APP_IMAGE:-ghcr.io/devondevceo/devon_b24_support_bot:latest}
     container_name: b24sdbot-worker
     restart: always
     mem_limit: 320m
