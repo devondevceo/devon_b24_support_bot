@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -138,13 +140,50 @@ async def on_message(bot: dict[str, Any], msg: dict[str, Any]) -> Reply | None:
     return None
 
 
-async def _resolve_task_arg(ctx: ChatContext, arg: str) -> int | None:
+def _task_number(arg: str) -> int | None:
     """Номер задачи из аргумента команды или из ссылки на портал."""
-    import re
-
     text = arg.strip()
     match = re.search(r"/task/view/(\d+)", text) or re.match(r"#?(\d+)", text)
     return int(match.group(1)) if match else None
+
+
+@dataclass
+class CommentInput:
+    """Что именно уйдёт в комментарий задачи."""
+
+    task_id: int | None
+    text: str
+    quoted_author: str  # пусто, когда текст набрал сам отправитель команды
+    attachments: list[tg_files.Attachment]
+
+
+def comment_input(arg: str, msg: dict[str, Any]) -> CommentInput:
+    """Разбор `/comment`: свой текст, а если его нет — текст сообщения, на которое
+    ответили.
+
+    Ответить «/comment 233» на чужую реплику — обычный жест в переписке, и он
+    избавляет от переписывания этой реплики руками. Файлы из процитированного
+    сообщения едут вместе с текстом: разделять их означало бы терять половину
+    смысла сообщения без единого слова об этом.
+    """
+    text = arg.split(" ", 1)[1].strip() if " " in arg else ""
+    reply_to = msg.get("reply_to_message") or {}
+    quoted_author = ""
+    attachments = tg_files.extract(msg)
+
+    if not text and reply_to:
+        quoted_text = _text_of(reply_to).strip()
+        quoted_files = tg_files.extract(reply_to)
+        # Пустой реплай — это не цитата. В форуме Telegram сам подставляет ответ
+        # на служебное сообщение о создании топика: сославшись на него, мы бы
+        # приписали комментарий тому, кто завёл топик, и ничего не сказали бы
+        # о содержимом.
+        if quoted_text or quoted_files:
+            text = quoted_text
+            quoted_author = _author(reply_to.get("from") or {})
+            seen = {a.file_id for a in attachments}
+            attachments += [a for a in quoted_files if a.file_id not in seen]
+    return CommentInput(_task_number(arg), text, quoted_author, attachments)
 
 
 async def _import_project(tenant_id: int, b24_user_id: int, b24_group_id: int,
@@ -219,16 +258,20 @@ async def _authorize_live(ctx: ChatContext, task_id: int, b24_user_id: int,
 
 async def _comment_command(ctx: ChatContext, msg: dict[str, Any], arg: str,
                            tg_user_id: int) -> Reply:
-    """/comment <номер> текст — комментарий в задачу."""
+    """/comment <номер> [текст] — комментарий в задачу.
+
+    Без текста команда работает реплаем: в задачу уходит сообщение, на которое
+    ответили, вместе с его файлами.
+    """
     if ctx.tenant_id is None:
         return Reply(texts.MSG_NOT_CLAIMED)
     b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
     if b24_user_id is None:
         return Reply(texts.MSG_NOT_LINKED)
 
-    task_id = await _resolve_task_arg(ctx, arg)
-    rest = arg.split(" ", 1)[1].strip() if " " in arg else ""
-    if task_id is None or not rest:
+    data = comment_input(arg, msg)
+    task_id = data.task_id
+    if task_id is None or not (data.text or data.attachments):
         return Reply(texts.MSG_COMMENT_USAGE)
 
     project = await _authorize_live(ctx, task_id, b24_user_id, tg_user_id)
@@ -240,14 +283,16 @@ async def _comment_command(ctx: ChatContext, msg: dict[str, Any], arg: str,
         client = await access.client_for_user(ctx.tenant_id, b24_user_id,
                                               actor_tg_user_id=tg_user_id)
         async with client:
-            await comments.add(client, task_id, rest, author=author,
-                               chat_title=ctx.title)
+            # Сообщение без текста, но с файлами — не пустой комментарий: в задаче
+            # должна остаться строка о том, откуда взялись вложения.
+            await comments.add(client, task_id, data.text or texts.MSG_COMMENT_FILES,
+                               author=author, chat_title=ctx.title,
+                               quoted_from=data.quoted_author)
             note = ""
-            attachments = tg_files.extract(msg)
-            if attachments:
+            if data.attachments:
                 count, rejected = await comments.transfer_files(
                     client, await _bot_token(ctx), ctx.tenant_id, task_id,
-                    project.b24_group_id, b24_user_id, attachments,
+                    project.b24_group_id, b24_user_id, data.attachments,
                     f"comment-{ctx.chat_ref}-{msg.get('message_id')}")
                 if count:
                     note = f"\nФайлов приложено: {count}"
@@ -261,7 +306,12 @@ async def _comment_command(ctx: ChatContext, msg: dict[str, Any], arg: str,
         log.warning("комментарий не добавлен: %s", exc)
         return Reply(texts.MSG_B24_UNAVAILABLE)
 
-    return Reply(texts.MSG_COMMENT_ADDED.format(task_id=task_id) + note)
+    domain = await _tenant_domain(ctx.tenant_id)
+    ref = views.task_ref(task_id, domain=domain, b24_user_id=b24_user_id)
+    if data.quoted_author:
+        note = texts.MSG_COMMENT_QUOTED.format(
+            author=esc_html(data.quoted_author)) + note
+    return Reply(texts.MSG_COMMENT_ADDED.format(task=ref) + note)
 
 
 async def _bot_token(ctx: ChatContext) -> str:
@@ -276,6 +326,14 @@ async def _bot_token(ctx: ChatContext) -> str:
 
 
 async def _discussion(ctx: ChatContext, arg: str, tg_user_id: int) -> Reply:
+    """/discussion <номер>. Номер можно дать числом или ссылкой на портал."""
+    task_id = _task_number(arg)
+    if task_id is None:
+        return Reply(texts.MSG_DISCUSSION_USAGE)
+    return await _discussion_for(ctx, task_id, tg_user_id)
+
+
+async def _discussion_for(ctx: ChatContext, task_id: int, tg_user_id: int) -> Reply:
     """Показать обсуждение задачи. Комментарии лежат в чате задачи, не в форуме."""
     if ctx.tenant_id is None:
         return Reply(texts.MSG_NOT_CLAIMED)
@@ -283,9 +341,6 @@ async def _discussion(ctx: ChatContext, arg: str, tg_user_id: int) -> Reply:
     if b24_user_id is None:
         return Reply(texts.MSG_NOT_LINKED)
 
-    task_id = await _resolve_task_arg(ctx, arg)
-    if task_id is None:
-        return Reply(texts.MSG_COMMENT_USAGE)
     if await _authorize_live(ctx, task_id, b24_user_id, tg_user_id) is None:
         return Reply(texts.MSG_TASK_NOT_FOUND)
 
@@ -298,7 +353,10 @@ async def _discussion(ctx: ChatContext, arg: str, tg_user_id: int) -> Reply:
         return Reply(texts.MSG_NEEDS_REAUTH)
     except errors.B24Error:
         return Reply(texts.MSG_B24_UNAVAILABLE)
-    return Reply(comments.render_discussion(task_id, items))
+
+    domain = await _tenant_domain(ctx.tenant_id)
+    ref = views.task_ref(task_id, domain=domain, b24_user_id=b24_user_id)
+    return Reply(comments.render_discussion(task_id, items, ref=ref))
 
 
 async def _survey_start(ctx: ChatContext, tg_user_id: int) -> Reply:
@@ -479,11 +537,13 @@ async def _survey_create(ctx: ChatContext, tg_user_id: int, session_id: int,
         return Reply(texts.MSG_B24_UNAVAILABLE)
 
     await survey.finish(session_id, "done")
+    ref = views.task_ref(task.get("id"), domain=await _tenant_domain(ctx.tenant_id),
+                         b24_user_id=b24_user_id)
     if not created:
         return Reply(texts.MSG_TASK_EXISTS.format(
-            task_id=task.get("id"), title=esc_html(task.get("title") or "")))
+            task=ref, title=esc_html(task.get("title") or "")))
     return Reply(texts.MSG_TASK_CREATED.format(
-        task_id=task.get("id"), title=esc_html(task.get("title") or ""),
+        task=ref, title=esc_html(task.get("title") or ""),
         project=esc_html(project.name),
         responsible=esc_html((task.get("responsible") or {}).get("name") or b24_user_id)))
 
@@ -566,7 +626,9 @@ async def _open_summary(ctx: ChatContext, tg_user_id: int, action: str) -> Reply
     nav = [{"text": "◀️ Назад", "callback_data": f"m:{back}"}]
     if app_url:
         nav.append(keyboards.url_button("🧩 Приложение", app_url))
-    return Reply(views.render_list(tasks, title=title),
+    return Reply(views.render_list(tasks, title=title,
+                                   domain=await _tenant_domain(ctx.tenant_id),
+                                   b24_user_id=b24_user_id),
                  markup=keyboards.task_list(numbers, nav), edit=True)
 
 
@@ -630,7 +692,10 @@ async def _render_card(ctx: ChatContext, tg_user_id: int, b24_user_id: int,
     domain = await _tenant_domain(ctx.tenant_id)
     app_url = await miniapp.link_for_chat(ctx.tenant_id, ctx.chat_ref,
                                           thread_id=ctx.thread_id, task_id=task_id)
-    text = views.render_card(task, project)
+    stage_title = await views.resolve_stage_title(ctx.tenant_id, project,
+                                                  task.get("stageId"))
+    text = views.render_card(task, project, domain=domain, b24_user_id=b24_user_id,
+                             stage_title=stage_title)
     return Reply(f"{note}\n\n{text}" if note else text,
                  markup=keyboards.task_card(
                      tokens, allowed=allowed,
@@ -653,13 +718,18 @@ async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
     b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
     if b24_user_id is None:
         return Reply(texts.MSG_NOT_LINKED)
+    # Тот же набор, что у мини-аппа (api/miniapp.py): одно действие обязано
+    # называться одинаково во всех точках входа, иначе кнопка в чате и кнопка
+    # в приложении делают разное под одним именем.
     method = {"complete": "tasks.task.complete", "start": "tasks.task.start",
-              "pause": "tasks.task.pause"}.get(act)
+              "pause": "tasks.task.pause", "defer": "tasks.task.defer",
+              "renew": "tasks.task.renew"}.get(act)
     if method is None:
         return Reply(texts.MSG_DIALOG_EXPIRED)
 
     # Своё же изменение не должно вернуться уведомлением в этот же чат.
-    expected_status = {"complete": 5, "start": 3, "pause": 2}.get(act)
+    expected_status = {"complete": 5, "start": 3, "pause": 2, "defer": 6,
+                       "renew": 2}.get(act)
     if expected_status is not None:
         await b24_events.suppress_echo(ctx.tenant_id, task_id, "STATUS",
                                        expected_status, b24_user_id)
@@ -695,6 +765,7 @@ PRIORITY_LABELS = {0: "низкий", 1: "средний", 2: "высокий"}
 DEADLINE_LABELS = {"today": "сегодня", "tomorrow": "завтра", "in3": "через 3 дня",
                    "week": "через неделю", "clear": "снят"}
 ASSIGNEE_PAGE = 12  # больше кнопок в один экран телефона всё равно не влезает
+STAGE_PAGE = 12     # столько же: колонок канбана обычно 3–5, но предел нужен и тут
 
 
 async def _edit_token(ctx: ChatContext, tg_user_id: int, task_id: int, act: str,
@@ -750,6 +821,13 @@ async def _edit(ctx: ChatContext, tg_user_id: int, payload: dict[str, Any]) -> R
                 members = await task_service.group_members(client,
                                                            project.b24_group_id)
                 return await _assignee_menu(ctx, tg_user_id, task_id, members)
+            if act == "stage_menu":
+                # Список берём С ПОРТАЛА, а не из своего справочника: колонку могли
+                # завести пять минут назад, и показать неполный список — значит
+                # оставить человека гадать, по какому принципу её тут нет.
+                stages = await task_service.stages_of_group(client,
+                                                            project.b24_group_id)
+                return await _stage_menu(ctx, tg_user_id, task_id, stages, task)
 
             built = _edit_patch(act, payload.get("value"), task)
             if built is None:
@@ -777,7 +855,11 @@ async def _edit(ctx: ChatContext, tg_user_id: int, payload: dict[str, Any]) -> R
                            detail={"field": field, "not_applied": missed,
                                    "source": "bot"})
 
-    note = texts.MSG_EDIT_DONE.format(what=esc_html(_edit_summary(act, payload, patch)))
+    what = _edit_summary(act, payload, patch)
+    if act == "set_stage":
+        what += " — " + await views.resolve_stage_title(ctx.tenant_id, project,
+                                                        fresh.get("stageId"))
+    note = texts.MSG_EDIT_DONE.format(what=esc_html(what))
     if missed:
         note += texts.MSG_EDIT_NOT_APPLIED.format(fields=esc_html(", ".join(missed)))
     return await _render_card(ctx, tg_user_id, b24_user_id, fresh, project, note)
@@ -794,6 +876,8 @@ def _edit_patch(act: str, value: Any, task: dict[str, Any]) -> dict[str, Any] | 
         return task_service.validate_patch({"priority": value})
     if act == "set_responsible":
         return task_service.validate_patch({"responsible_id": value})
+    if act == "set_stage":
+        return task_service.validate_patch({"stage_id": value})
     return None
 
 
@@ -802,6 +886,10 @@ def _edit_summary(act: str, payload: dict[str, Any], patch: dict[str, Any]) -> s
         return f"срок — {DEADLINE_LABELS.get(str(payload.get('value')), 'изменён')}"
     if act == "set_priority":
         return f"приоритет — {PRIORITY_LABELS.get(int(patch['priority']), '?')}"
+    if act == "set_stage":
+        # Название стадии подставляет вызывающий: здесь его взять неоткуда,
+        # а «стадия — 337» человеку ничего не говорит.
+        return "стадия"
     return "ответственный"
 
 
@@ -812,7 +900,7 @@ async def _edit_menu(ctx: ChatContext, tg_user_id: int, task_id: int, act: str,
     if act == "menu":
         tokens = {name: await _edit_token(ctx, tg_user_id, task_id, name)
                   for name in ("deadline_menu", "assignee_menu", "priority_menu",
-                               "back")}
+                               "stage_menu", "back")}
         return Reply(texts.MSG_EDIT_MENU.format(task_id=task_id),
                      markup=keyboards.edit_menu(tokens, app_url), edit=True)
 
@@ -856,6 +944,34 @@ async def _assignee_menu(ctx: ChatContext, tg_user_id: int, task_id: int,
     app_url = await miniapp.link_for_chat(ctx.tenant_id or 0, ctx.chat_ref,
                                           thread_id=ctx.thread_id, task_id=task_id)
     return Reply(text, markup=keyboards.people_menu(people, back, app_url), edit=True)
+
+
+async def _stage_menu(ctx: ChatContext, tg_user_id: int, task_id: int,
+                      stages: list[dict[str, Any]], task: dict[str, Any]) -> Reply:
+    """Колонки канбана проекта кнопками.
+
+    Стадия и статус независимы (docs/00-portal-facts.md §3.2): «Сделаны» в канбане
+    не завершает задачу, поэтому меню отдельное, а не спрятано под «Завершить».
+    """
+    if not stages:
+        return Reply(texts.MSG_EDIT_NO_STAGES)
+
+    shown = stages[:STAGE_PAGE]
+    current = mapping.as_int(task.get("stageId")) or 0
+    items = []
+    for st in shown:
+        token = await _edit_token(ctx, tg_user_id, task_id, "set_stage", st["id"])
+        # Текущую колонку помечаем: иначе непонятно, откуда двигаем.
+        mark = "✅ " if int(st["id"]) == current else ""
+        items.append((token, f"{mark}{st['title']}"))
+    back = await _edit_token(ctx, tg_user_id, task_id, "menu")
+
+    text = texts.MSG_EDIT_STAGE.format(task_id=task_id)
+    if len(stages) > len(shown):
+        text += texts.MSG_EDIT_TRUNCATED.format(shown=len(shown), total=len(stages))
+    app_url = await miniapp.link_for_chat(ctx.tenant_id or 0, ctx.chat_ref,
+                                          thread_id=ctx.thread_id, task_id=task_id)
+    return Reply(text, markup=keyboards.stage_menu(items, back, app_url), edit=True)
 
 
 async def _tenant_domain(tenant_id: int) -> str:
@@ -1019,7 +1135,9 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
     else:
         tasks = [t for t in tasks if str(t.get("responsibleId")) == str(b24_user_id)]
         title = "📊 Мои задачи"
-    return Reply(views.render_list(tasks, title=title),
+    return Reply(views.render_list(tasks, title=title,
+                                   domain=await _tenant_domain(tenant_id),
+                                   b24_user_id=b24_user_id),
                  markup=_private_kb())
 
 
@@ -1041,10 +1159,16 @@ async def _pending_approvals(tenant_id: int, tg_user_id: int) -> Reply:
     if not items:
         return Reply(texts.MSG_APPROVAL_PENDING_EMPTY, markup=_private_kb())
 
+    # Домен и свой номер в Битриксе спрашиваем один раз на весь список, а не на
+    # каждую строку: строк тут до пятнадцати.
+    domain = await _tenant_domain(tenant_id)
+    b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
+
     lines = ["<b>🙋 Ожидают вашего подтверждения</b>", ""]
     buttons: list[list[dict[str, str]]] = []
     for item in items:
-        lines.append(f"#{item.b24_task_id} · {esc_html(item.task_title)}")
+        ref = views.task_ref(item.b24_task_id, domain=domain, b24_user_id=b24_user_id)
+        lines.append(f"{ref} · {esc_html(item.task_title)}")
         lines.append(f"    {esc_html(item.client_name)} · {esc_html(item.project_name)}")
         confirm = await issue_token(
             "task_approval", tenant_id=tenant_id, owner_tg_id=tg_user_id,
@@ -1073,18 +1197,20 @@ async def _approval_vote(tenant_id: int, tg_user_id: int, payload: dict[str, Any
 
     result = await approvals.resolve(tenant_id, int(payload["approval_id"]), decision,
                                      tg_user_id)
+    ref = views.task_ref(result.task_id, domain=await _tenant_domain(tenant_id),
+                         b24_user_id=await access.linked_b24_user(tenant_id, tg_user_id))
 
     if result.outcome == "confirmed":
         text = texts.MSG_APPROVAL_CONFIRMED.format(
-            task_id=result.task_id, title=esc_html(result.title),
+            task=ref, title=esc_html(result.title),
             stage=esc_html(result.stage_title))
     elif result.outcome == "rejected":
         text = texts.MSG_APPROVAL_REJECTED.format(
-            task_id=result.task_id, title=esc_html(result.title),
+            task=ref, title=esc_html(result.title),
             stage=esc_html(result.stage_title))
     elif result.outcome == "already_done":
         text = texts.MSG_APPROVAL_ALREADY_DONE.format(
-            task_id=result.task_id, title=esc_html(result.title))
+            task=ref, title=esc_html(result.title))
     elif result.outcome == "needs_reauth":
         text = texts.MSG_NEEDS_REAUTH
     elif result.outcome == "b24_error":
@@ -1335,9 +1461,11 @@ async def _do_create(ctx: ChatContext, project: ProjectRef, source: dict[str, An
         log.warning("создание задачи не удалось: %s", exc)
         return Reply(texts.MSG_B24_UNAVAILABLE)
 
+    ref = views.task_ref(task.get("id"), domain=await _tenant_domain(ctx.tenant_id),
+                         b24_user_id=b24_user_id)
     if not created:
         return Reply(texts.MSG_TASK_EXISTS.format(
-            task_id=task.get("id"), title=esc_html(task.get("title") or "")))
+            task=ref, title=esc_html(task.get("title") or "")))
 
     async with pool().acquire() as conn:
         await conn.execute(
@@ -1351,7 +1479,7 @@ async def _do_create(ctx: ChatContext, project: ProjectRef, source: dict[str, An
 
     responsible = task.get("responsible") or {}
     text = texts.MSG_TASK_CREATED.format(
-        task_id=task.get("id"), title=esc_html(task.get("title") or ""),
+        task=ref, title=esc_html(task.get("title") or ""),
         project=esc_html(project.name),
         responsible=esc_html(responsible.get("name") or b24_user_id))
     return Reply(text + files_note)
@@ -1394,6 +1522,20 @@ async def _transfer(ctx: ChatContext, source: dict[str, Any], task_id: int,
 
 
 # --------------------------------------------------------------------- кнопки
+def _keep_source(payload: dict[str, Any], reply: Reply) -> Reply:
+    """Не затирать сообщение, под которым нажали кнопку, если это уведомление.
+
+    Списки и карточки живут в одном сообщении и редактируются на месте — так чат
+    не превращается в ленту. С уведомлением так нельзя: оно пришло само, это
+    запись о событии, и заменить её карточкой значит стереть из истории чата то,
+    о чём было сообщение. Признак `notify` ставится при постановке уведомления
+    в очередь (`domain/events.py`).
+    """
+    if payload.get("notify"):
+        reply.edit = False
+    return reply
+
+
 async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
     data = str(cb.get("data") or "")
     user = cb.get("from") or {}
@@ -1466,12 +1608,18 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
             return await _survey_start(ctx, tg_user_id)
         return await _open_summary(ctx, tg_user_id, action)
     if ns == "t":
-        return await _open_card(ctx, tg_user_id, int(payload["task_id"]))
+        return _keep_source(payload,
+                            await _open_card(ctx, tg_user_id, int(payload["task_id"])))
+    if ns == "d":
+        return _keep_source(payload,
+                            await _discussion_for(ctx, int(payload["task_id"]),
+                                                  tg_user_id))
     if ns == "a":
-        return await _task_action(ctx, tg_user_id, int(payload["task_id"]),
-                                  str(payload.get("act") or "refresh"))
+        return _keep_source(payload,
+                            await _task_action(ctx, tg_user_id, int(payload["task_id"]),
+                                               str(payload.get("act") or "refresh")))
     if ns == "e":
-        return await _edit(ctx, tg_user_id, payload)
+        return _keep_source(payload, await _edit(ctx, tg_user_id, payload))
     if ns == "b":
         return await _apply_bind(ctx, tenant_id, payload, tg_user_id)
     if ns == "p":

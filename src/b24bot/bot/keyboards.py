@@ -146,6 +146,7 @@ def edit_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, A
         [cb("e", tokens["deadline_menu"], "⏰ Срок")],
         [cb("e", tokens["assignee_menu"], "👤 Ответственный")],
         [cb("e", tokens["priority_menu"], "⚡ Приоритет")],
+        [cb("e", tokens["stage_menu"], "📂 Стадия")],
     ]
     if app_url:
         rows.append([url_button("🧩 Изменить в приложении", app_url)])
@@ -174,6 +175,20 @@ def priority_menu(tokens: dict[str, str]) -> dict[str, Any]:
     ])
 
 
+def stage_menu(stages: list[tuple[str, str]], back_token: str,
+               app_url: str | None = None) -> dict[str, Any]:
+    """Колонки канбана по одной в ряд: названия задаёт владелец проекта, они длинные.
+
+    Список приходит с портала живьём, поэтому в чате видно ровно то же, что
+    в Битриксе, — включая колонку, заведённую пять минут назад.
+    """
+    rows: Rows = [[cb("e", token, label[:60])] for token, label in stages]
+    if app_url:
+        rows.append([url_button("🧩 Открыть в приложении", app_url)])
+    rows.append([cb("e", back_token, "◀️ Назад")])
+    return inline(rows)
+
+
 def people_menu(people: list[tuple[str, str]], back_token: str,
                 app_url: str | None = None) -> dict[str, Any]:
     """Список людей по одному в ряд: имена длинные, в два столбца не читаются."""
@@ -187,3 +202,34 @@ def people_menu(people: list[tuple[str, str]], back_token: str,
 def confirm(token_yes: str, token_no: str, *, yes: str = "✅ Создать",
             no: str = "❌ Отмена") -> dict[str, Any]:
     return inline([[cb("c", token_yes, yes), cb("x", token_no, no)]])
+
+
+# ------------------------------------------------------ кнопки под уведомлением
+# Уведомление приходит само, без чьего-либо нажатия, поэтому владельца у кнопок
+# нет: нажать может любой участник чата, а права режет Битрикс в момент действия —
+# ровно так же, как у кнопок меню (docs/30-bot-spec.md §7.3).
+NOTIFY_BUTTONS: dict[str, tuple[str, str]] = {
+    "card":       ("t", "📋 Карточка"),
+    "discussion": ("d", "💬 Обсуждение"),
+    "start":      ("a", "▶️ В работу"),
+    "renew":      ("a", "↩️ Вернуть в работу"),
+    "edit":       ("e", "✏️ Изменить"),
+    "deadline":   ("e", "⏰ Срок"),
+    "stage":      ("e", "📂 Стадия"),
+}
+
+
+def notify_task(tokens: list[tuple[str, str]],
+                portal_url: str | None = None) -> dict[str, Any] | None:
+    """Действия под уведомлением: сами действия в ряд, ссылка на портал — отдельно.
+
+    `tokens` — пары (вид кнопки, токен) в порядке показа. Неизвестный вид молча
+    не пропускается: клавиатура собирается из кода, а не из данных, и опечатка в
+    ней должна быть видна на тестах, а не в чате у клиента.
+    """
+    row = [cb(NOTIFY_BUTTONS[kind][0], token, NOTIFY_BUTTONS[kind][1])
+           for kind, token in tokens]
+    rows: Rows = [row] if row else []
+    if portal_url:
+        rows.append([url_button("🔗 Открыть в Битрикс24", portal_url)])
+    return inline(rows) if rows else None
