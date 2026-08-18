@@ -20,6 +20,7 @@ GIT_SHA=${GIT_SHA:-неизвестен}
 SERVICES=(api bot worker)
 ALL_CONTAINERS=(b24sdbot-postgres b24sdbot-api b24sdbot-bot b24sdbot-worker)
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-300}
+PUBLIC_TIMEOUT=${PUBLIC_TIMEOUT:-90}   # сколько ждём, пока Traefik переключит маршрут
 DISK_MAX_PCT=${DISK_MAX_PCT:-85}
 KEEP_DUMPS=${KEEP_DUMPS:-10}
 
@@ -176,8 +177,16 @@ while :; do
 done
 log "все четыре контейнера healthy"
 
-curl -fsS --max-time 15 "$HEALTH_URL" | grep -q '"status":"ok"' \
-  || fail "$HEALTH_URL не отвечает ok"
+# Публичный адрес спрашиваем С ПОВТОРОМ. «Контейнер healthy» и «Traefik уже знает
+# про новый контейнер» — разные события: маршрут обновляется по событию Docker,
+# с задержкой в секунду-другую. Одиночный curl поймал этот зазор 19.08.2026 и
+# откатил совершенно рабочий релиз — то есть проверка навредила ровно там, где
+# должна была защитить. Ждём до PUBLIC_TIMEOUT, а не спрашиваем один раз.
+deadline=$((SECONDS + PUBLIC_TIMEOUT))
+until curl -fsS --max-time 15 "$HEALTH_URL" 2>/dev/null | grep -q '"status":"ok"'; do
+  [ "$SECONDS" -lt "$deadline" ] || fail "$HEALTH_URL не отвечает ok за ${PUBLIC_TIMEOUT} с"
+  sleep 3
+done
 log "$HEALTH_URL отвечает ok"
 
 # --- 9. уборка --------------------------------------------------------------
