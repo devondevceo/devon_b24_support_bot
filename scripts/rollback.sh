@@ -66,7 +66,9 @@ mkdir -p backups .deploy
 safety="backups/pre-rollback-$(date +%Y%m%d-%H%M%S).sql.gz"
 docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' \
   | gzip > "$safety" || fail "pg_dump не отработал"
-{ gzip -dc "$safety" || true; } | tail -3 | grep -q 'PostgreSQL database dump complete' \
+# Хвост в 20 строк по той же причине, что в deploy.sh: у pg_dump 16.13 после
+# маркера завершения идёт строка `\unrestrict <токен>`.
+{ gzip -dc "$safety" || true; } | tail -20 | grep -q 'PostgreSQL database dump complete' \
   || fail "страховочный дамп оборван: $safety"
 log "страховочный дамп: $safety"
 
