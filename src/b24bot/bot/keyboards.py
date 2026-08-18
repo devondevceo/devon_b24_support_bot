@@ -121,9 +121,16 @@ def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str,
     rows: Rows = []
     if first:
         rows.append(first)
+
+    # Стадия — отдельная кнопка карточки, а не пункт внутри «Изменить»: в чате
+    # работу меряют колонками канбана, и прятать самое частое действие на второй
+    # уровень меню значит делать его вдвое дороже. Право то же, что у правки, —
+    # перенос идёт через `tasks.task.update`, поэтому и условие показа общее.
     second: list[Button] = [cb("a", tokens["refresh"], "🔄 Обновить")]
     if "edit" in allowed and "edit" in tokens:
         second.insert(0, cb("e", tokens["edit"], "✏️ Изменить"))
+    if "edit" in allowed and "stage" in tokens:
+        second.insert(0, cb("e", tokens["stage"], "📂 Стадия"))
     rows.append(second)
     links: list[Button] = [url_button("🔗 Открыть в Б24", portal_url)]
     if app_url:
@@ -138,6 +145,10 @@ def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str,
 def edit_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, Any]:
     """Что можно поменять кнопками. Всё остальное — в приложении.
 
+    Стадии здесь нет намеренно: она вынесена кнопкой на саму карточку (`task_card`).
+    Одно действие живёт в одном месте — иначе меню растёт, а человек всё равно не
+    знает, каким из двух путей идти.
+
     Свободного ввода тут нет намеренно: в группе бот не может «ждать ответа» от
     одного человека, не перехватывая чужие реплики. Произвольная дата, чек-лист и
     прочее живут в мини-аппе, где для этого есть форма.
@@ -146,7 +157,6 @@ def edit_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, A
         [cb("e", tokens["deadline_menu"], "⏰ Срок")],
         [cb("e", tokens["assignee_menu"], "👤 Ответственный")],
         [cb("e", tokens["priority_menu"], "⚡ Приоритет")],
-        [cb("e", tokens["stage_menu"], "📂 Стадия")],
     ]
     if app_url:
         rows.append([url_button("🧩 Изменить в приложении", app_url)])

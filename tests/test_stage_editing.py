@@ -61,12 +61,38 @@ def test_notifications_carry_the_stage_button() -> None:
     assert keyboards.NOTIFY_BUTTONS["stage"][0] == "e", "меню правки живёт в ns e"
 
 
-def test_edit_menu_offers_the_stage() -> None:
+def test_stage_is_a_button_of_the_card_itself() -> None:
+    """Самое частое действие не должно лежать на втором уровне меню."""
+    labels = _card_labels(allowed={"edit", "complete"})
+    assert "📂 Стадия" in labels
+    assert labels.index("📂 Стадия") < labels.index("✏️ Изменить"), \
+        "стадия стоит раньше общей правки: ею пользуются чаще"
+
+
+def test_stage_button_follows_the_edit_right() -> None:
+    """Перенос идёт через `tasks.task.update`, значит право то же, что у правки.
+
+    Показать кнопку тому, кому Битрикс откажет, — это обещание, которого мы не
+    можем выполнить (та же логика, что у набора действий по блоку `action`).
+    """
+    assert "📂 Стадия" not in _card_labels(allowed={"complete"})
+
+
+def test_edit_menu_no_longer_duplicates_the_stage() -> None:
+    """Одно действие — одно место, иначе меню растёт, а выбор пути неочевиден."""
     tokens = {"deadline_menu": "d", "assignee_menu": "a", "priority_menu": "p",
-              "stage_menu": "s", "back": "b"}
+              "back": "b"}
     labels = [b["text"] for row in keyboards.edit_menu(tokens)["inline_keyboard"]
               for b in row]
-    assert "📂 Стадия" in labels
+    assert "📂 Стадия" not in labels
+
+
+def _card_labels(*, allowed: set[str]) -> list[str]:
+    tokens = {"complete": "c", "start": "s", "pause": "p", "refresh": "r",
+              "edit": "e", "stage": "st", "back": "b"}
+    markup = keyboards.task_card(tokens, allowed=allowed,
+                                 portal_url="https://p.example/task/1/")
+    return [b["text"] for row in markup["inline_keyboard"] for b in row]
 
 
 def test_stage_menu_marks_where_we_are_and_leads_back() -> None:

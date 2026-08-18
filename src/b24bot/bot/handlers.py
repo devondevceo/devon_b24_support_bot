@@ -685,6 +685,7 @@ async def _render_card(ctx: ChatContext, tg_user_id: int, b24_user_id: int,
             chat_ref=ctx.chat_ref, payload={"task_id": task_id, "act": act},
             single_use=(act != "refresh"), ttl=timedelta(hours=12))
     tokens["edit"] = await _edit_token(ctx, tg_user_id, task_id, "menu")
+    tokens["stage"] = await _edit_token(ctx, tg_user_id, task_id, "stage_menu")
     tokens["back"] = await issue_token(
         "menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
         payload={"action": "all"}, single_use=False, ttl=timedelta(days=7))
@@ -900,7 +901,7 @@ async def _edit_menu(ctx: ChatContext, tg_user_id: int, task_id: int, act: str,
     if act == "menu":
         tokens = {name: await _edit_token(ctx, tg_user_id, task_id, name)
                   for name in ("deadline_menu", "assignee_menu", "priority_menu",
-                               "stage_menu", "back")}
+                               "back")}
         return Reply(texts.MSG_EDIT_MENU.format(task_id=task_id),
                      markup=keyboards.edit_menu(tokens, app_url), edit=True)
 
@@ -964,7 +965,9 @@ async def _stage_menu(ctx: ChatContext, tg_user_id: int, task_id: int,
         # Текущую колонку помечаем: иначе непонятно, откуда двигаем.
         mark = "✅ " if int(st["id"]) == current else ""
         items.append((token, f"{mark}{st['title']}"))
-    back = await _edit_token(ctx, tg_user_id, task_id, "menu")
+    # Назад — к карточке, откуда кнопка и нажата: меню правки к стадии больше
+    # не ведёт, и возвращать туда значило бы уводить человека в сторону.
+    back = await _edit_token(ctx, tg_user_id, task_id, "back")
 
     text = texts.MSG_EDIT_STAGE.format(task_id=task_id)
     if len(stages) > len(shown):
