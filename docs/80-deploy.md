@@ -391,3 +391,35 @@ cd /opt/b24sdbot && docker build -t "$(grep ^APP_IMAGE= .env | cut -d= -f2-)" . 
 
 Дерево на сервере при этом обязано соответствовать `main`, а это ровно то допущение,
 которое дважды оказывалось ложным. Проверять контрольные суммы (CLAUDE.md, «Где что лежит»).
+
+### 8.5 Если выкатка падает на «Permission denied (publickey)»
+
+Так выглядит ключ, которого нет в `~/.ssh/authorized_keys` на сервере. Больше ничего
+увидеть не получится: **sshd на `LogLevel INFO` отвергнутые ключи в журнал не пишет
+вовсе** — проверено 18.08.2026 пробным ключом, в `journalctl -u ssh` от такой попытки
+остаётся только `Connection closed by authenticating user root <ip> [preauth]`, без
+отпечатка и без слова `publickey`.
+
+Поэтому `deploy.yml` печатает отпечаток ключа выкатки в лог шага, а при отказе кладёт
+в summary прогона готовую строку для `authorized_keys`. Публичный ключ секретом
+не является — установить надо ровно его.
+
+Сверить, что ключ на месте:
+
+```bash
+ssh-keygen -lf ~/.ssh/authorized_keys
+```
+
+Отпечаток из лога прогона обязан быть в этом списке. Если его там нет — либо добавьте
+строку из summary, либо положите в секрет `DEPLOY_SSH_KEY` тот ключ, который уже разрешён.
+
+**Пока ключ не установлен, выкатка руками идёт аварийным путём** (он же описан
+комментарием в `docker-compose.yml`): образ собирается на сервере с тем же тегом,
+что дал бы CI, и дальше обычные шаги — дамп, миграции из нового образа, `up -d`.
+
+```bash
+IMAGE=ghcr.io/devondevceo/devon_b24_support_bot:sha-$(git rev-parse HEAD | cut -c1-12)
+docker build -t "$IMAGE" . && sed -i "/^APP_IMAGE=/d" .env && echo "APP_IMAGE=$IMAGE" >> .env
+docker run --rm --network b24sdbot-internal --env-file .env "$IMAGE" alembic upgrade head
+docker compose up -d --no-build api bot worker
+```
