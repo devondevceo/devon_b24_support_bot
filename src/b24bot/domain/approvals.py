@@ -36,6 +36,7 @@ from typing import Any, Literal
 
 from b24bot.b24 import errors
 from b24bot.b24.tokens import NeedsReauth
+from b24bot.bot import keyboards
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
@@ -230,10 +231,10 @@ async def _notify(tenant_id: int, approval_id: int, project: ProjectRef, task_id
     text = (f"🙋 <b>Требуется подтверждение</b>\n\n"
            f"<b>{ref} · {esc_html(title)}</b>\n"
            f"Клиент: {esc_html(project.client_name)} · Проект: {esc_html(project.name)}")
-    markup = {"inline_keyboard": [[
-        {"text": "✅ Подтвердить", "callback_data": f"av:{confirm}"},
-        {"text": "❌ Отклонить", "callback_data": f"av:{reject}"},
-    ]]}
+    markup = keyboards.inline([[
+        keyboards.cb("av", confirm, "✅ Подтвердить"),
+        keyboards.cb("av", reject, "❌ Отклонить"),
+    ]])
     try:
         await tg.send_message(token, tg_user_id, text, reply_markup=markup)
     except tg.TelegramError as exc:
