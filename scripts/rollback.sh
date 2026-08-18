@@ -127,8 +127,14 @@ while :; do
   sleep 5
 done
 
-curl -fsS --max-time 15 "$HEALTH_URL" | grep -q '"status":"ok"' \
-  || fail "$HEALTH_URL не отвечает ok"
+# С повтором, по той же причине, что в deploy.sh: Traefik узнаёт о новом контейнере
+# по событию Docker, а не мгновенно. Здесь одиночный curl был бы даже вреднее —
+# он объявил бы неудачным откат, который на самом деле прошёл, посреди аварии.
+deadline=$((SECONDS + ${PUBLIC_TIMEOUT:-90}))
+until curl -fsS --max-time 15 "$HEALTH_URL" 2>/dev/null | grep -q '"status":"ok"'; do
+  [ "$SECONDS" -lt "$deadline" ] || fail "$HEALTH_URL не отвечает ok"
+  sleep 3
+done
 
 printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$target" "откат" "—" >> .deploy/history
 log "откат выполнен: $target"
