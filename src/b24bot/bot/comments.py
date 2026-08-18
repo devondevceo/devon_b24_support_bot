@@ -31,10 +31,17 @@ DISCUSSION_LIMIT = 10
 
 
 async def add(client: B24Client, task_id: int, text: str, *, author: str,
-              chat_title: str) -> int | None:
-    """Комментарий от имени действующего пользователя (ходим его токеном)."""
+              chat_title: str, quoted_from: str = "") -> int | None:
+    """Комментарий от имени действующего пользователя (ходим его токеном).
+
+    `quoted_from` — автор сообщения, на которое ответили командой. Текст в задачу
+    уехал его, и подпись обязана это сказать: иначе в задаче окажется чужая
+    реплика за подписью того, кто нажал команду.
+    """
+    who = (f"сообщение {esc_bbcode(quoted_from)}, добавил {esc_bbcode(author)}"
+           if quoted_from else esc_bbcode(author))
     body = (f"{esc_bbcode(text)}\n\n"
-            f"[i]— из Telegram, чат «{esc_bbcode(chat_title)}», {esc_bbcode(author)}[/i]")
+            f"[i]— из Telegram, чат «{esc_bbcode(chat_title)}», {who}[/i]")
     result = await client.call("task.commentitem.add", {
         "TASKID": task_id, "FIELDS": {"POST_MESSAGE": body}})
     return int(result) if isinstance(result, int | str) and str(result).isdigit() else None
@@ -83,11 +90,14 @@ async def read_discussion(client: B24Client, task_id: int, *,
     return out[-limit:]
 
 
-def render_discussion(task_id: int, items: list[dict[str, Any]]) -> str:
+def render_discussion(task_id: int, items: list[dict[str, Any]], *,
+                      ref: str | None = None) -> str:
+    """`ref` — готовый номер задачи, обычно ссылкой на портал (`views.task_ref`)."""
+    head = ref or f"#{task_id}"
     if not items:
-        return (f"<b>#{task_id}</b> · обсуждение\n\n"
+        return (f"<b>{head}</b> · обсуждение\n\n"
                 "Пока никто ничего не написал.")
-    rows = [f"<b>#{task_id}</b> · обсуждение, последние {len(items)}", ""]
+    rows = [f"<b>{head}</b> · обсуждение, последние {len(items)}", ""]
     for m in items:
         rows.append(f"<b>{esc_html(m['author'])}</b>")
         rows.append(esc_html(m["text"][:500]))

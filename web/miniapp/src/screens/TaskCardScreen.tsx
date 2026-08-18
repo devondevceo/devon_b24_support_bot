@@ -91,6 +91,10 @@ export function TaskCardScreen({ context, taskId, onBack }: Props) {
           </span>
         </div>
         <div className="row">
+          <span className="label">Стадия</span>
+          <span className="value">{task.stage_title || '—'}</span>
+        </div>
+        <div className="row">
           <span className="label">Ответственный</span>
           <span className="value">{task.responsible.name || '—'}</span>
         </div>
@@ -161,7 +165,7 @@ export function TaskCardScreen({ context, taskId, onBack }: Props) {
   )
 }
 
-/** Редактирование срока, ответственного и приоритета — то, чего нет в чате. */
+/** Редактирование срока, стадии, ответственного и приоритета. */
 function EditForm({
   context,
   task,
@@ -176,8 +180,10 @@ function EditForm({
   const [deadline, setDeadline] = useState(toLocalInput(task.deadline))
   const [priority, setPriority] = useState(task.priority)
   const [responsible, setResponsible] = useState(task.responsible.id ?? 0)
+  const [stage, setStage] = useState(task.stage_id ?? 0)
   const [members, setMembers] = useState<Member[] | null>(null)
   const [membersError, setMembersError] = useState<unknown>(null)
+  const [stages, setStages] = useState<{ id: number; title: string }[] | null>(null)
 
   const projectId = task.project?.id
   useEffect(() => {
@@ -188,12 +194,23 @@ function EditForm({
       .catch(setMembersError)
   }, [context.chat_ref, projectId])
 
+  // Колонки берём с портала живьём: заведённую пять минут назад человек должен
+  // увидеть здесь, а не после суточной синхронизации справочника.
+  useEffect(() => {
+    if (!projectId) return
+    api
+      .stages(context.chat_ref, projectId)
+      .then((res) => setStages(res.items))
+      .catch(() => setStages([]))
+  }, [context.chat_ref, projectId])
+
   const changed: Record<string, unknown> = {}
   if (toLocalInput(task.deadline) !== deadline) {
     changed.deadline = deadline ? fromLocalInput(deadline) : ''
   }
   if (priority !== task.priority) changed.priority = priority
   if (responsible && responsible !== task.responsible.id) changed.responsible_id = responsible
+  if (stage !== (task.stage_id ?? 0)) changed.stage_id = stage
   const nothing = Object.keys(changed).length === 0
 
   return (
@@ -210,6 +227,26 @@ function EditForm({
             снять срок
           </button>
         ) : null}
+      </label>
+
+      <label className="field">
+        <span>Стадия</span>
+        {stages === null ? (
+          <div className="muted">загружаем колонки канбана…</div>
+        ) : stages.length === 0 ? (
+          <div className="muted">у проекта нет колонок канбана</div>
+        ) : (
+          <select value={stage} onChange={(e) => setStage(Number(e.target.value))}>
+            {/* Стадия и статус независимы: «вне канбана» — нормальное состояние
+                задачи, а не отсутствие выбора, поэтому пункт настоящий. */}
+            <option value={0}>Вне канбана</option>
+            {stages.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.title}
+              </option>
+            ))}
+          </select>
+        )}
       </label>
 
       <label className="field">
