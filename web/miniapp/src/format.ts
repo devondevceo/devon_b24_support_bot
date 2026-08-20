@@ -1,4 +1,6 @@
 /** Форматирование дат. Всё показываем в часовом поясе устройства человека. */
+import type { Tone } from './status'
+import type { IconName } from './ui/Icon'
 
 const TIME = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' })
 const DAY = new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: '2-digit' })
@@ -60,9 +62,35 @@ export function fromLocalInput(value: string): string {
   return `${local.toISOString().slice(0, 19)}${sign}${pad(offset / 60)}:${pad(offset % 60)}`
 }
 
-export function deadlineLabel(value: string | null | undefined, overdue: boolean): string {
-  if (!value) return 'без срока'
-  return overdue ? `просрочено ${shortDate(value)}` : `до ${shortDate(value)}`
+export type DeadlineView = { text: string; tone: Tone | 'plain'; icon: IconName | undefined }
+
+/**
+ * Срок одной плашкой: текст, тон и значок.
+ *
+ * Три разных состояния — «просрочено», «горит сегодня» и «когда-нибудь» —
+ * различаются НЕ только цветом: у просроченного свой значок и своё слово.
+ * Красная строка сама по себе не читается ни при дальтонизме, ни в списке,
+ * где рядом нет зелёной для сравнения.
+ */
+export function deadlineView(
+  value: string | null | undefined,
+  overdue: boolean,
+): DeadlineView {
+  const date = parse(value)
+  if (!date) return { text: 'без срока', tone: 'plain', icon: undefined }
+  if (overdue) return { text: `просрочено ${shortDate(value)}`, tone: 'danger', icon: 'alert' }
+
+  const now = new Date()
+  const days = Math.round(
+    (startOfDay(date).getTime() - startOfDay(now).getTime()) / 86400000,
+  )
+  if (days === 0) return { text: `сегодня ${TIME.format(date)}`, tone: 'warn', icon: 'clock' }
+  if (days === 1) return { text: `завтра ${TIME.format(date)}`, tone: 'muted', icon: 'clock' }
+  return { text: `до ${shortDate(value)}`, tone: 'muted', icon: 'clock' }
+}
+
+function startOfDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
 }
 
 /** Идентификатор формы для идемпотентности создания задачи (инвариант И-10). */
@@ -80,4 +108,14 @@ export function duration(seconds: number | null | undefined): string {
   const minutes = total % 60
   if (hours && minutes) return `${hours} ч ${minutes} мин`
   return hours ? `${hours} ч` : `${minutes} мин`
+}
+
+/**
+ * Инициалы автора комментария. Аватары портал в обсуждении не отдаёт, а место
+ * под автора нужно: без него реплики разных людей сливаются в сплошной текст.
+ */
+export function initials(name: string): string {
+  const words = name.trim().split(/\s+/).filter(Boolean).slice(0, 2)
+  if (words.length === 0) return '?'
+  return words.map((w) => [...w][0]!.toUpperCase()).join('')
 }

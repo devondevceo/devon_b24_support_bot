@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Аудит вёрстки мини-аппа</title>
+    <!--
+      Стенд для измерений: контраст, размеры целей касания, переполнение.
+      В сборку не входит — входная точка Vite одна, /index.html (vite.config.ts),
+      поэтому этот каталог живёт только в dev-режиме и в образ не едет.
+
+      Заглушка SDK ставится ОБЫЧНЫМ скриптом до модульного: telegram.ts читает
+      window.Telegram один раз на импорте, а импорты модулей поднимаются наверх.
+    -->
+    <script>
+      const DARK = new URLSearchParams(location.search).get('theme') === 'dark'
+
+      // Настоящие палитры клиента Telegram, а не выдуманные: мерить контраст
+      // имеет смысл ровно против тех цветов, которые увидит человек.
+      const THEMES = {
+        light: {
+          bg_color: '#ffffff',
+          secondary_bg_color: '#efeff4',
+          section_bg_color: '#ffffff',
+          text_color: '#000000',
+          hint_color: '#999999',
+          subtitle_text_color: '#999999',
+          link_color: '#2481cc',
+          button_color: '#2481cc',
+          button_text_color: '#ffffff',
+        },
+        dark: {
+          bg_color: '#17212b',
+          secondary_bg_color: '#0e1621',
+          section_bg_color: '#17212b',
+          text_color: '#f5f5f5',
+          hint_color: '#708499',
+          subtitle_text_color: '#708499',
+          link_color: '#6ab3f3',
+          button_color: '#5288c1',
+          button_text_color: '#ffffff',
+        },
+      }
+
+      const params = THEMES[DARK ? 'dark' : 'light']
+      for (const [key, value] of Object.entries(params)) {
+        document.documentElement.style.setProperty('--tg-theme-' + key.replace(/_/g, '-'), value)
+      }
+
+      const noop = () => undefined
+      window.Telegram = {
+        WebApp: {
+          initData: 'query_id=stub',
+          initDataUnsafe: {},
+          version: '7.10',
+          colorScheme: DARK ? 'dark' : 'light',
+          themeParams: params,
+          isExpanded: true,
+          ready: noop,
+          expand: noop,
+          close: noop,
+          openLink: noop,
+          showAlert: (m) => console.log('alert:', m),
+          showConfirm: (m, cb) => cb(true),
+          onEvent: noop,
+          offEvent: noop,
+          disableVerticalSwipes: noop,
+          BackButton: { show: noop, hide: noop, onClick: noop, offClick: noop },
+          MainButton: {
+            setText: noop, show: noop, hide: noop, enable: noop, disable: noop,
+            showProgress: noop, hideProgress: noop, onClick: noop, offClick: noop,
+          },
+          HapticFeedback: {
+            impactOccurred: noop, notificationOccurred: noop, selectionChanged: noop,
+          },
+        },
+      }
+    </script>
+    <style>
+      body { margin: 0; }
+      .gallery { display: flex; align-items: flex-start; gap: 24px; padding: 24px; }
+      .frame {
+        flex: 0 0 auto;
+        width: var(--frame-width, 375px);
+        /* transform создаёт содержащий блок для position: fixed — иначе лист
+           правки лёг бы поверх всей галереи, а не своего экрана, и померить
+           его в ряду с остальными было бы нельзя. */
+        transform: translateZ(0);
+      }
+      .frame > .cap {
+        font: 600 12px/1.4 system-ui, sans-serif;
+        color: var(--tg-theme-hint-color);
+        padding: 4px 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="gallery" class="gallery"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

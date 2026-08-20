@@ -13,11 +13,16 @@ import type {
   Comment,
   Context,
   ContextListItem,
+  Me,
   Member,
   Stage,
+  Summary,
+  SurveyQuestion,
+  SurveyTemplate,
   Task,
   TaskCard,
   TaskFilter,
+  Timesheet as TimesheetReport,
 } from './types'
 
 export class ApiError extends Error {
@@ -148,6 +153,67 @@ export const api = {
       `/projects/${projectId}/stages`,
       { query: { chat_ref: chatRef } },
     ),
+
+  /* ------------------------------------------------ паритет с ботом */
+
+  summary: (chatRef: number) =>
+    request<Summary>('/summary', { query: { chat_ref: chatRef } }),
+
+  timesheet: {
+    months: () =>
+      request<{ items: { value: string; title: string }[]; current: string }>(
+        '/timesheet/months',
+      ),
+    report: (chatRef: number, month: string) =>
+      request<TimesheetReport>('/timesheet', { query: { chat_ref: chatRef, month } }),
+  },
+
+  surveys: {
+    list: (chatRef: number) =>
+      request<{ items: SurveyTemplate[] }>('/surveys', { query: { chat_ref: chatRef } }),
+    form: (chatRef: number, templateId: number) =>
+      request<{ items: SurveyQuestion[] }>(`/surveys/${templateId}`, {
+        query: { chat_ref: chatRef },
+      }),
+  },
+
+  /**
+   * Загрузка файлов в задачу.
+   *
+   * Единственный запрос не в JSON: файл идёт как есть, multipart-ом. Заголовок
+   * Content-Type НЕ ставим руками — его вместе с boundary проставляет браузер,
+   * а заданный вручную обрывает разбор на стороне сервера.
+   */
+  upload: async (chatRef: number, taskId: number, files: File[]) => {
+    const form = new FormData()
+    for (const file of files) form.append('files', file, file.name)
+    const url = new URL(`${BASE}/tasks/${taskId}/files`, window.location.origin)
+    url.searchParams.set('chat_ref', String(chatRef))
+
+    let response: Response
+    try {
+      response = await fetch(url.toString(), {
+        method: 'POST',
+        headers: { Authorization: `tma ${tg.initData()}` },
+        body: form,
+      })
+    } catch {
+      throw new ApiError(0, 'network', 'Нет связи с сервером. Проверьте интернет.')
+    }
+    const payload = await response.json().catch(() => null)
+    if (!response.ok) {
+      const error = (payload as { error?: { code?: string; message?: string } })?.error
+      throw new ApiError(response.status, error?.code ?? 'unknown',
+                         error?.message ?? 'Файл не загрузился.')
+    }
+    return payload as TaskCard & {
+      attached: number
+      attached_names: string[]
+      rejected: string[]
+    }
+  },
+
+  me: () => request<Me>('/me'),
 
   approvals: {
     // Не привязано к чату: решение ответственного касается всего теннанта,
