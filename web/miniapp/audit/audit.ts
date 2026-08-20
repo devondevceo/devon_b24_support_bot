@@ -206,6 +206,59 @@ function audit(): { findings: Finding[]; checked: Record<string, number> } {
     }
   }
 
+  // -------------------------------------------------- перекрытие текста
+  /*
+   * Значок, наехавший на текст поля.
+   *
+   * Ловится это только измерением: и значок, и поле по отдельности выглядят
+   * правильно, а видно беду лишь там, где их прямоугольники пересеклись.
+   * Причина всегда одна и та же — отступ поля, зарезервированный под значок,
+   * перебит другим правилом. Разбирается по СОДЕРЖИМОМУ полю (rect минус
+   * рамка и внутренний отступ): отступ и есть то место, куда значку можно.
+   */
+  for (const field of Array.from(
+    document.querySelectorAll<HTMLElement>('.app input, .app textarea'),
+  )) {
+    const style = getComputedStyle(field)
+    if (style.display === 'none' || style.visibility === 'hidden') continue
+    if (field.getAttribute('aria-hidden') === 'true') continue
+    const rect = field.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) continue
+
+    const px = (v: string) => parseFloat(v) || 0
+    const box = {
+      left: rect.left + px(style.borderLeftWidth) + px(style.paddingLeft),
+      right: rect.right - px(style.borderRightWidth) - px(style.paddingRight),
+      top: rect.top + px(style.borderTopWidth) + px(style.paddingTop),
+      bottom: rect.bottom - px(style.borderBottomWidth) - px(style.paddingBottom),
+    }
+
+    const host = field.closest('.searchbar, .composer, .field, .card') ?? field.parentElement
+    for (const other of Array.from(host?.querySelectorAll<HTMLElement>('*') ?? [])) {
+      if (other === field || other.contains(field)) continue
+      const pos = getComputedStyle(other).position
+      if (pos !== 'absolute' && pos !== 'fixed') continue
+      const over = other.getBoundingClientRect()
+      if (over.width === 0 || over.height === 0) continue
+      // Порог в 1px — на дробные пиксели раскладки, а не на настоящее наложение.
+      const hit =
+        over.left < box.right - 1 &&
+        over.right > box.left + 1 &&
+        over.top < box.bottom - 1 &&
+        over.bottom > box.top + 1
+      if (hit) {
+        findings.push({
+          kind: 'overlap',
+          screen: screenOf(field),
+          // getAttribute, а не className: у SVG это SVGAnimatedString,
+          // и в отчёт уезжало «[object SVGAnimatedString]».
+          detail: `${other.tagName.toLowerCase()}.${other.getAttribute('class') || '-'} поверх текста ${field.tagName.toLowerCase()}`,
+          value: `отступ поля не отведён под значок (${Math.round(px(style.paddingLeft))}px слева)`,
+        })
+      }
+    }
+  }
+
   // ----------------------------------------------------- переполнение
   for (const frame of Array.from(document.querySelectorAll<HTMLElement>('.frame'))) {
     counts.frames++
