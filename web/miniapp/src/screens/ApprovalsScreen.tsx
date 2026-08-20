@@ -9,6 +9,8 @@ import { api, ApiError } from '../api'
 import { Empty, Failure, Loading } from '../components/States'
 import { shortDate } from '../format'
 import { tg } from '../telegram'
+import { Icon } from '../ui/Icon'
+import { AppBar, Pill } from '../ui/parts'
 import type { Approval } from '../types'
 
 type Props = { onBack: () => void }
@@ -25,8 +27,8 @@ export function ApprovalsScreen({ onBack }: Props) {
 
   useEffect(() => {
     let cancelled = false
-    api
-      .approvals.list()
+    api.approvals
+      .list()
       .then((res) => {
         if (cancelled) return
         setItems(res.items)
@@ -39,7 +41,7 @@ export function ApprovalsScreen({ onBack }: Props) {
     }
   }, [reload])
 
-  const act = useCallback(async (id: number, decision: 'confirm' | 'reject') => {
+  const run = useCallback(async (id: number, decision: 'confirm' | 'reject') => {
     setBusyId(id)
     try {
       await api.approvals.act(id, decision)
@@ -55,18 +57,40 @@ export function ApprovalsScreen({ onBack }: Props) {
     }
   }, [])
 
+  /*
+   * Решение спрашивается подтверждением, и оба — и «да», и «нет».
+   *
+   * Отменить его нельзя: задача уже уехала на свою стадию канбана в портале,
+   * а тамошнее уведомление уже ушло автору. Раз отката нет, единственное место,
+   * где ошибку ещё можно поймать, — до нажатия (правило confirmation-dialogs).
+   */
+  const act = useCallback(
+    (item: Approval, decision: 'confirm' | 'reject') => {
+      const what = decision === 'confirm' ? 'Подтвердить' : 'Отклонить'
+      tg.confirm(
+        `${what} задачу #${item.task_id} «${item.title}»?\n\nОтменить решение будет нельзя.`,
+        (ok) => {
+          if (ok) void run(item.id, decision)
+        },
+      )
+    },
+    [run],
+  )
+
   return (
     <>
-      <div className="head">
-        <h1>Ожидают подтверждения</h1>
-      </div>
+      <AppBar
+        title="Ожидают подтверждения"
+        subtitle={items && items.length > 0 ? 'Решение уйдёт в Битрикс24 сразу' : undefined}
+      />
 
       {error ? (
         <Failure error={error} onRetry={() => setReload((n) => n + 1)} />
       ) : !items ? (
-        <Loading />
+        <Loading title="Смотрим, что ждёт решения…" />
       ) : items.length === 0 ? (
         <Empty
+          icon="checkCircle"
           title="Нечего подтверждать"
           hint="Здесь появятся задачи, для которых вас назначили ответственным за решение."
         />
@@ -74,39 +98,52 @@ export function ApprovalsScreen({ onBack }: Props) {
         <>
           {total > items.length ? (
             <div className="notice warn">
-              Показаны первые {items.length} из {total}.
+              <Icon name="alert" size={18} />
+              <span>
+                Показаны первые {items.length} из {total}.
+              </span>
             </div>
           ) : null}
+
+          {/* Та же вёрстка, что у шапки карточки задачи: одна и та же вещь —
+              номер, заголовок, признаки — обязана выглядеть одинаково.
+              Инлайн-стили здесь были и увели цвет мимо токенов: аудит поймал
+              номер задачи на 2.85:1. */}
           {items.map((item) => (
-            <div key={item.id} className="card">
-              <div className="task-head">
-                <span className="task-title">
-                  #{item.task_id} · {item.title}
-                </span>
-              </div>
-              <div className="task-meta">
-                <span>
+            <article className="task-hero" key={item.id}>
+              <div className="id">#{item.task_id}</div>
+              <h2>{item.title}</h2>
+              <div className="pill-row" style={{ marginBottom: 'var(--sp-6)' }}>
+                <Pill icon="folder">
                   {item.project.client} · {item.project.name}
-                </span>
-                <span>запрошено {shortDate(item.requested_at)}</span>
+                </Pill>
+                <Pill icon="clock" tone="plain">
+                  {shortDate(item.requested_at)}
+                </Pill>
               </div>
               <div className="actions">
                 <button
+                  type="button"
                   className="btn"
                   disabled={busyId === item.id}
-                  onClick={() => act(item.id, 'confirm')}
+                  onClick={() => act(item, 'confirm')}
                 >
-                  ✅ Подтвердить
+                  <Icon name="check" size={18} />
+                  Подтвердить
                 </button>
+                {/* Отказ — вторичный по виду и в опасном тоне: это не
+                    равнозначная альтернатива, а другой по последствиям шаг. */}
                 <button
+                  type="button"
                   className="btn danger"
                   disabled={busyId === item.id}
-                  onClick={() => act(item.id, 'reject')}
+                  onClick={() => act(item, 'reject')}
                 >
-                  ❌ Отклонить
+                  <Icon name="close" size={18} />
+                  Отклонить
                 </button>
               </div>
-            </div>
+            </article>
           ))}
         </>
       )}
