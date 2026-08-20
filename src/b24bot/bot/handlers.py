@@ -843,6 +843,19 @@ async def _render_card(ctx: ChatContext, tg_user_id: int, b24_user_id: int,
                  edit=True)
 
 
+# Действия карточки: метод портала, ожидаемый статус после него и имя в журнале.
+# Имена аудита общие с мини-аппом (`api/miniapp.py`): одно и то же действие обязано
+# называться одинаково, откуда бы его ни сделали, иначе журнал бесполезен для разбора.
+# Расхождение ловит тест-страж `tests/test_audit_names.py`.
+ACTION_METHODS = {"complete": "tasks.task.complete", "start": "tasks.task.start",
+                  "pause": "tasks.task.pause", "defer": "tasks.task.defer",
+                  "renew": "tasks.task.renew"}
+ACTION_STATUS = {"complete": 5, "start": 3, "pause": 2, "defer": 6, "renew": 2}
+ACTION_AUDIT = {"complete": "task.complete", "defer": "task.defer",
+                "start": "task.status.change", "pause": "task.status.change",
+                "renew": "task.status.change"}
+
+
 async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
                        act: str) -> Reply:
     """Смена состояния задачи спец-методами.
@@ -857,18 +870,12 @@ async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
     b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
     if b24_user_id is None:
         return Reply(texts.MSG_NOT_LINKED)
-    # Тот же набор, что у мини-аппа (api/miniapp.py): одно действие обязано
-    # называться одинаково во всех точках входа, иначе кнопка в чате и кнопка
-    # в приложении делают разное под одним именем.
-    method = {"complete": "tasks.task.complete", "start": "tasks.task.start",
-              "pause": "tasks.task.pause", "defer": "tasks.task.defer",
-              "renew": "tasks.task.renew"}.get(act)
+    method = ACTION_METHODS.get(act)
     if method is None:
         return Reply(texts.MSG_DIALOG_EXPIRED)
 
     # Своё же изменение не должно вернуться уведомлением в этот же чат.
-    expected_status = {"complete": 5, "start": 3, "pause": 2, "defer": 6,
-                       "renew": 2}.get(act)
+    expected_status = ACTION_STATUS.get(act)
     if expected_status is not None:
         await b24_events.suppress_echo(ctx.tenant_id, task_id, "STATUS",
                                        expected_status, b24_user_id)
@@ -880,9 +887,10 @@ async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
             check = await client.call("tasks.task.get",
                                       {"taskId": task_id, "select": ["ID", "GROUP_ID"]})
             checked = check.get("task", check) if isinstance(check, dict) else {}
-            if await authorize_task_for_chat(
-                    ctx.tenant_id, ctx.chat_ref, task_id,
-                    group_id_hint=mapping.as_int(checked.get("groupId"))) is None:
+            project = await authorize_task_for_chat(
+                ctx.tenant_id, ctx.chat_ref, task_id,
+                group_id_hint=mapping.as_int(checked.get("groupId")))
+            if project is None:
                 return Reply(texts.MSG_TASK_NOT_FOUND)
             await client.call(method, {"taskId": task_id})
     except NeedsReauth:
@@ -892,6 +900,12 @@ async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
     except errors.B24Error as exc:
         log.warning("действие %s над задачей %s не удалось: %s", act, task_id, exc)
         return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    # Пишется после `except`: запись о мутации, которой не было, хуже её отсутствия.
+    await audit.record(ctx.tenant_id, ACTION_AUDIT.get(act, "task.status.change"),
+                       actor_id=b24_user_id, actor_tg_id=tg_user_id,
+                       target=f"task:{task_id}", project_id=project.id,
+                       detail={"act": act, "source": "bot"})
 
     return await _open_card(ctx, tg_user_id, task_id)
 
