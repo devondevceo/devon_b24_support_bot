@@ -198,6 +198,45 @@ try {
         { expression: 'JSON.stringify(window.__audit())', returnByValue: true, awaitPromise: false },
         sessionId,
       )
+      // --shot <экран>: снимок одного кадра после проверки. Мерить полезнее,
+      // чем смотреть, но увидеть глазами иногда нужно — и лучше тем же стендом,
+      // чем пересобирая всё вручную.
+      const shot = argOf('--shot', '')
+      if (shot && theme === THEMES[0] && width === WIDTHS[0]) {
+        const box = await cdp.send(
+          'Runtime.evaluate',
+          {
+            // Сначала в начало страницы: полоса фильтров зовёт scrollIntoView
+            // и прокручивает документ вбок, а clip у CDP — в координатах
+            // страницы. Без сброса снимок уезжает на соседние кадры.
+            expression: `(() => {
+              window.scrollTo(0, 0)
+              const f = document.querySelector('[data-screen=${JSON.stringify(shot)}]')
+              if (!f) return null
+              const r = f.getBoundingClientRect()
+              return JSON.stringify({
+                x: r.x + window.scrollX,
+                y: r.y + window.scrollY,
+                width: r.width,
+                height: Math.min(r.height, 700),
+              })
+            })()`,
+            returnByValue: true,
+          },
+          sessionId,
+        )
+        if (box.result.value) {
+          const clip = { ...JSON.parse(box.result.value), scale: 2 }
+          const png = await cdp.send('Page.captureScreenshot',
+                                     { format: 'png', clip }, sessionId)
+          const file = join(HERE, 'shot.png')
+          writeFileSync(file, Buffer.from(png.data, 'base64'))
+          console.log(`снимок: ${file}`)
+        } else {
+          console.warn(`экрана «${shot}» на стенде нет`)
+        }
+      }
+
       const result = JSON.parse(out.result.value)
       totals.runs++
       totals.text += result.checked.text
