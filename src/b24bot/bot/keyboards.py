@@ -10,11 +10,14 @@
   меню группы, потому что закреплённое сообщение всегда под рукой.
 
 `callback_data` ограничен 64 байтами, поэтому туда уходит только `<ns>:<токен>`,
-а полезная нагрузка лежит в `callback_tokens` (docs/30-bot-spec.md §0.2).
+а полезная нагрузка лежит в `callback_tokens` (docs/30-bot-spec.md §0.2). Список
+префиксов — в `callbacks.py`, собирать `callback_data` руками нельзя.
 """
 from __future__ import annotations
 
 from typing import Any
+
+from b24bot.bot import callbacks
 
 Button = dict[str, str]
 Rows = list[list[Button]]
@@ -25,7 +28,8 @@ def inline(rows: Rows) -> dict[str, Any]:
 
 
 def cb(ns: str, token: str, text: str) -> Button:
-    return {"text": text, "callback_data": f"{ns}:{token}"}
+    """Инлайн-кнопка. `ns` обязан быть в реестре — см. `callbacks.data()`."""
+    return {"text": text, "callback_data": callbacks.data(ns, token)}
 
 
 def url_button(text: str, url: str) -> Button:
@@ -54,7 +58,7 @@ def persistent_private(app_url: str | None = None) -> dict[str, Any]:
         "keyboard": [
             [{"text": "📊 Мои задачи"}, {"text": "🔥 Просроченные"}],
             [{"text": "🔗 Мои чаты"}, {"text": "❓ Помощь"}],
-            [{"text": "🙋 Ожидают подтверждения"}],
+            [{"text": "🙋 Ожидают подтверждения"}, {"text": "⏱ Трудозатраты"}],
             *([app_row] if app_row else []),
         ],
         "resize_keyboard": True,
@@ -68,6 +72,7 @@ PRIVATE_LABELS = {
     "🔥 Просроченные": "overdue",
     "🔗 Мои чаты": "mychats",
     "🙋 Ожидают подтверждения": "pending",
+    "⏱ Трудозатраты": "timesheet",
     "❓ Помощь": "help",
 }
 
@@ -80,10 +85,26 @@ def help_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, A
          cb("m", tokens["overdue"], "🔥 Просроченные")],
         [cb("m", tokens["mine"], "👤 Мои задачи"),
          cb("m", tokens["all"], "📋 Все задачи")],
+        [cb("m", tokens["time"], "⏱ Трудозатраты")],
         [cb("m", tokens["new"], "➕ Создать задачу")],
     ]
     if app_url:
         rows.append([url_button("🧩 Приложение", app_url)])
+    return inline(rows)
+
+
+def month_menu(months: list[tuple[str, str]], back_token: str) -> dict[str, Any]:
+    """Месяцы по два в ряд: подписи короткие, а список всегда одной длины."""
+    rows: Rows = []
+    row: list[Button] = []
+    for token, label in months:
+        row.append(cb("m", token, label))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([cb("m", back_token, "◀️ Назад")])
     return inline(rows)
 
 
@@ -121,9 +142,16 @@ def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str,
     rows: Rows = []
     if first:
         rows.append(first)
+
+    # Стадия — отдельная кнопка карточки, а не пункт внутри «Изменить»: в чате
+    # работу меряют колонками канбана, и прятать самое частое действие на второй
+    # уровень меню значит делать его вдвое дороже. Право то же, что у правки, —
+    # перенос идёт через `tasks.task.update`, поэтому и условие показа общее.
     second: list[Button] = [cb("a", tokens["refresh"], "🔄 Обновить")]
     if "edit" in allowed and "edit" in tokens:
         second.insert(0, cb("e", tokens["edit"], "✏️ Изменить"))
+    if "edit" in allowed and "stage" in tokens:
+        second.insert(0, cb("e", tokens["stage"], "📂 Стадия"))
     rows.append(second)
     links: list[Button] = [url_button("🔗 Открыть в Б24", portal_url)]
     if app_url:
@@ -137,6 +165,10 @@ def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str,
 # ------------------------------------------------------- меню редактирования
 def edit_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, Any]:
     """Что можно поменять кнопками. Всё остальное — в приложении.
+
+    Стадии здесь нет намеренно: она вынесена кнопкой на саму карточку (`task_card`).
+    Одно действие живёт в одном месте — иначе меню растёт, а человек всё равно не
+    знает, каким из двух путей идти.
 
     Свободного ввода тут нет намеренно: в группе бот не может «ждать ответа» от
     одного человека, не перехватывая чужие реплики. Произвольная дата, чек-лист и
@@ -174,6 +206,20 @@ def priority_menu(tokens: dict[str, str]) -> dict[str, Any]:
     ])
 
 
+def stage_menu(stages: list[tuple[str, str]], back_token: str,
+               app_url: str | None = None) -> dict[str, Any]:
+    """Колонки канбана по одной в ряд: названия задаёт владелец проекта, они длинные.
+
+    Список приходит с портала живьём, поэтому в чате видно ровно то же, что
+    в Битриксе, — включая колонку, заведённую пять минут назад.
+    """
+    rows: Rows = [[cb("e", token, label[:60])] for token, label in stages]
+    if app_url:
+        rows.append([url_button("🧩 Открыть в приложении", app_url)])
+    rows.append([cb("e", back_token, "◀️ Назад")])
+    return inline(rows)
+
+
 def people_menu(people: list[tuple[str, str]], back_token: str,
                 app_url: str | None = None) -> dict[str, Any]:
     """Список людей по одному в ряд: имена длинные, в два столбца не читаются."""
@@ -187,3 +233,34 @@ def people_menu(people: list[tuple[str, str]], back_token: str,
 def confirm(token_yes: str, token_no: str, *, yes: str = "✅ Создать",
             no: str = "❌ Отмена") -> dict[str, Any]:
     return inline([[cb("c", token_yes, yes), cb("x", token_no, no)]])
+
+
+# ------------------------------------------------------ кнопки под уведомлением
+# Уведомление приходит само, без чьего-либо нажатия, поэтому владельца у кнопок
+# нет: нажать может любой участник чата, а права режет Битрикс в момент действия —
+# ровно так же, как у кнопок меню (docs/30-bot-spec.md §7.3).
+NOTIFY_BUTTONS: dict[str, tuple[str, str]] = {
+    "card":       ("t", "📋 Карточка"),
+    "discussion": ("d", "💬 Обсуждение"),
+    "start":      ("a", "▶️ В работу"),
+    "renew":      ("a", "↩️ Вернуть в работу"),
+    "edit":       ("e", "✏️ Изменить"),
+    "deadline":   ("e", "⏰ Срок"),
+    "stage":      ("e", "📂 Стадия"),
+}
+
+
+def notify_task(tokens: list[tuple[str, str]],
+                portal_url: str | None = None) -> dict[str, Any] | None:
+    """Действия под уведомлением: сами действия в ряд, ссылка на портал — отдельно.
+
+    `tokens` — пары (вид кнопки, токен) в порядке показа. Неизвестный вид молча
+    не пропускается: клавиатура собирается из кода, а не из данных, и опечатка в
+    ней должна быть видна на тестах, а не в чате у клиента.
+    """
+    row = [cb(NOTIFY_BUTTONS[kind][0], token, NOTIFY_BUTTONS[kind][1])
+           for kind, token in tokens]
+    rows: Rows = [row] if row else []
+    if portal_url:
+        rows.append([url_button("🔗 Открыть в Битрикс24", portal_url)])
+    return inline(rows) if rows else None

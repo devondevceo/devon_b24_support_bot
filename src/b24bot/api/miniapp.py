@@ -297,7 +297,7 @@ async def _authorized_task(actor: miniapp.Actor, ctx: miniapp.Context, client: A
 
 
 def _card_json(task: dict[str, Any], project: ProjectRef, portal: str,
-               b24_user_id: int) -> dict[str, Any]:
+               b24_user_id: int, stage_title: str = "") -> dict[str, Any]:
     card = _task_json(task, project)
     card.update({
         # Описание портал хранит в BBCode — человеку показываем текст.
@@ -307,10 +307,26 @@ def _card_json(task: dict[str, Any], project: ProjectRef, portal: str,
         "tags": mapping.parse_tags(task.get("tags")),
         "allowed": sorted(mapping.allowed_actions(task)),
         "changed_date": task.get("changedDate"),
+        # Своего названия стадии портал в задаче не отдаёт — только `stageId`.
+        "stage_title": stage_title,
+        # Сумма списаний по задаче в секундах; у задачи без списаний портал
+        # отдаёт null, и это то же самое, что ноль.
+        "time_spent": mapping.as_int(task.get("timeSpentInLogs")) or 0,
         "portal_url": views.portal_task_url(portal, mapping.as_int(task.get("id")) or 0,
                                             b24_user_id),
     })
     return card
+
+
+async def _card_payload(actor: miniapp.Actor, task: dict[str, Any],
+                        project: ProjectRef) -> dict[str, Any]:
+    """Карточка со всем, что требует базы: домен портала и название стадии."""
+    async with pool().acquire() as conn:
+        portal = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
+                                     actor.tenant_id)
+    stage_title = await views.resolve_stage_title(actor.tenant_id, project,
+                                                  task.get("stageId"))
+    return _card_json(task, project, str(portal or ""), actor.b24_user_id, stage_title)
 
 
 @router.get("/tasks/{task_id}")
@@ -318,10 +334,7 @@ async def task_card(task_id: int, bundle: CtxDep) -> JSONResponse:
     actor, ctx = bundle
     async with await _client(actor) as client:
         task, project = await _authorized_task(actor, ctx, client, task_id)
-    async with pool().acquire() as conn:
-        portal = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
-                                     actor.tenant_id)
-    return JSONResponse(_card_json(task, project, str(portal or ""), actor.b24_user_id))
+    return JSONResponse(await _card_payload(actor, task, project))
 
 
 @router.post("/tasks/{task_id}/action")
@@ -339,10 +352,7 @@ async def task_action(task_id: int, bundle: CtxDep, body: JsonBody) -> JSONRespo
         await client.call(method, {"taskId": task_id})
         task, project = await _authorized_task(actor, ctx, client, task_id)
     await _audit(actor, AUDIT_ACTIONS[act], task_id, project, {"act": act})
-    async with pool().acquire() as conn:
-        portal = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
-                                     actor.tenant_id)
-    return JSONResponse(_card_json(task, project, str(portal or ""), actor.b24_user_id))
+    return JSONResponse(await _card_payload(actor, task, project))
 
 
 async def miniapp_suppress(actor: miniapp.Actor, task_id: int, act: str) -> None:
@@ -395,10 +405,7 @@ async def task_patch(task_id: int, bundle: CtxDep, body: JsonBody) -> JSONRespon
         await _audit(actor, AUDIT_FIELDS.get(field, "task.edit"), task_id, project,
                      {"field": field, "not_applied": missed})
 
-    async with pool().acquire() as conn:
-        portal = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
-                                     actor.tenant_id)
-    card = _card_json(task, project, str(portal or ""), actor.b24_user_id)
+    card = await _card_payload(actor, task, project)
     # Битрикс молча игнорирует то, что не смог применить. Молчать вслед за ним —
     # значит показать «сохранено» там, где ничего не сохранилось.
     card["not_applied"] = missed

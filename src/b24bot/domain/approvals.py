@@ -36,6 +36,7 @@ from typing import Any, Literal
 
 from b24bot.b24 import errors
 from b24bot.b24.tokens import NeedsReauth
+from b24bot.bot import keyboards
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
@@ -199,9 +200,13 @@ async def _notify(tenant_id: int, approval_id: int, project: ProjectRef, task_id
                   title: str, responsible_user_id: int) -> None:
     async with pool().acquire() as conn:
         person = await conn.fetchrow(
-            "SELECT tg_user_id FROM users WHERE id = $1", responsible_user_id)
+            "SELECT u.tg_user_id, m.b24_user_id FROM users u "
+            "LEFT JOIN tenant_members m ON m.tenant_id = $2 AND m.user_id = u.id "
+            "WHERE u.id = $1", responsible_user_id, tenant_id)
         bot_row = await conn.fetchrow(
             "SELECT id, bot_id, token FROM tg_bots WHERE tenant_id = $1", tenant_id)
+        domain = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
+                                     tenant_id)
     if person is None or person["tg_user_id"] is None or bot_row is None:
         log.warning("запрос на подтверждение %s не отправлен: нет привязки Telegram "
                    "у ответственного или бот не подключён", approval_id)
@@ -219,13 +224,17 @@ async def _notify(tenant_id: int, approval_id: int, project: ProjectRef, task_id
                                owner_tg_id=tg_user_id,
                                payload={"approval_id": approval_id, "decision": "reject"},
                                ttl=timedelta(days=30))
+    # Номер — ссылка на задачу: решение принимают, посмотрев её целиком.
+    from b24bot.bot.views import task_ref
+    ref = task_ref(task_id, domain=str(domain or ""),
+                   b24_user_id=person["b24_user_id"])
     text = (f"🙋 <b>Требуется подтверждение</b>\n\n"
-           f"<b>#{task_id} · {esc_html(title)}</b>\n"
+           f"<b>{ref} · {esc_html(title)}</b>\n"
            f"Клиент: {esc_html(project.client_name)} · Проект: {esc_html(project.name)}")
-    markup = {"inline_keyboard": [[
-        {"text": "✅ Подтвердить", "callback_data": f"av:{confirm}"},
-        {"text": "❌ Отклонить", "callback_data": f"av:{reject}"},
-    ]]}
+    markup = keyboards.inline([[
+        keyboards.cb("av", confirm, "✅ Подтвердить"),
+        keyboards.cb("av", reject, "❌ Отклонить"),
+    ]])
     try:
         await tg.send_message(token, tg_user_id, text, reply_markup=markup)
     except tg.TelegramError as exc:

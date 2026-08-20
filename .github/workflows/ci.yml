@@ -1,0 +1,144 @@
+# Проверки кода. Запускаются на каждый pull request и вызываются деплоем как
+# reusable-workflow: выкатка начинается только после того, как все пять job зелёные.
+#
+# Отдельной среды у проекта нет, разработка идёт сразу на боевом сервере, поэтому
+# эти проверки — единственный рубеж между веткой и продом.
+
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# На pull request новый push отменяет предыдущий прогон, а вот вызов из деплоя
+# отменять нельзя: за ним стоит уже начатая выкатка.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check --output-format=github .
+
+  types:
+    name: mypy --strict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: mypy --strict
+
+  tests:
+    name: pytest
+    runs-on: ubuntu-latest
+    # Настоящая PostgreSQL, а не мок: тесты изоляции теннантов, синхронизации стадий
+    # и вся цепочка миграций upgrade → downgrade → upgrade без неё молча пропускаются
+    # (см. tests/conftest.py). Пропущенный тест изоляции нарушает docs/40-security.md §5.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q --junitxml=junit.xml
+      # Тесты изоляции и синхронизации пропускают сами себя без TEST_DATABASE_URL:
+      # опечатка в переменной дала бы зелёный CI без единой проверки изоляции.
+      - name: тесты на живой базе не пропущены
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          live = [
+              f"{c.get('classname', '')}::{c.get('name', '')}"
+              for c in ET.parse("junit.xml").getroot().iter("testcase")
+              if c.find("skipped") is not None
+              and ("test_isolation" in c.get("classname", "") or "test_stage_sync" in c.get("classname", ""))
+          ]
+          if live:
+              print("пропущены тесты на живой базе:", *live, sep="\n  ")
+              sys.exit(1)
+          print("тесты на живой базе отработали полностью")
+          PY
+
+  frontend:
+    name: miniapp build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/miniapp/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: web/miniapp
+      # build = tsc --noEmit && vite build. Отдельным job-ом, а не только внутри образа:
+      # ошибка TypeScript видна через минуту, а не через пять.
+      - run: npm run build
+        working-directory: web/miniapp
+
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # секрет ищется во всей истории, а не только в HEAD
+      - name: gitleaks detect
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:latest \
+            detect --source=. --config=.gitleaks.toml --redact --no-banner --verbose
+
+  image:
+    name: docker build
+    runs-on: ubuntu-latest
+    # На push в main образ собирает и публикует deploy.yml — здесь только проверка,
+    # что Dockerfile жив. Кеш общий, так что сборка при выкатке переиспользует слои.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -33,6 +33,10 @@ export type TaskCard = Task & {
   tags: string[]
   allowed: string[]
   changed_date: string | null
+  /** Название колонки канбана: своего названия портал в задаче не отдаёт, только id. */
+  stage_title: string
+  /** Сумма списаний времени по задаче, секунды. */
+  time_spent: number
   portal_url: string
   not_applied?: string[]
   created?: boolean

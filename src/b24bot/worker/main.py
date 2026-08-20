@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from b24bot.core import heartbeat
 from b24bot.core.config import get_settings
@@ -58,7 +60,8 @@ async def send_outbox() -> int:
                        WHERE s.chat_ref = o.chat_ref AND s.state = 'sent'
                          AND s.sent_at > now() - interval '1 minute') < $2
                ORDER BY o.created_at LIMIT $1 FOR UPDATE SKIP LOCKED
-            ) RETURNING id, tenant_id, bot_ref, chat_ref, thread_id, text, attempts
+            ) RETURNING id, tenant_id, bot_ref, chat_ref, thread_id, text, markup,
+                        attempts
             """, SEND_BATCH, CHAT_LIMIT_PER_MIN)
 
     for row in rows:
@@ -75,7 +78,8 @@ async def send_outbox() -> int:
                             box.aad("tg_bots", "token", bot["tenant_id"], bot["bot_id"]))
         try:
             await tg.send_message(token, int(bot["chat_id"]), row["text"],
-                                  thread_id=row["thread_id"])
+                                  thread_id=row["thread_id"],
+                                  reply_markup=_markup(row))
         except tg.TelegramError as exc:
             # 403 — бота выкинули из чата, повторять бессмысленно.
             final = exc.code in (400, 403) or row["attempts"] + 1 >= MAX_ATTEMPTS
@@ -86,6 +90,25 @@ async def send_outbox() -> int:
             await conn.execute(
                 "UPDATE outbox SET state='sent', sent_at=now() WHERE id=$1", row["id"])
     return len(rows)
+
+
+def _markup(row: Any) -> dict[str, Any] | None:
+    """Клавиатура из очереди. asyncpg отдаёт JSONB строкой, если нет кодека.
+
+    Сломанная разметка не имеет права задержать сообщение: текст уведомления —
+    главное, кнопки — удобство. Поэтому здесь глушим разбор, а не падаем.
+    """
+    raw = row["markup"]
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        log.warning("клавиатура сообщения %s не разобралась, шлю без кнопок", row["id"])
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 async def _fail(outbox_id: int, error: str, *, final: bool) -> None:

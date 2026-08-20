@@ -71,3 +71,13 @@ export function formId(): string {
   crypto.getRandomValues(bytes)
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
 }
+
+/** «5 ч 30 мин». Ноль — прочерк, а не «0 ч»: работали ноль времени. */
+export function duration(seconds: number | null | undefined): string {
+  const total = Math.max(0, Math.round((seconds ?? 0) / 60))
+  if (total === 0) return '—'
+  const hours = Math.floor(total / 60)
+  const minutes = total % 60
+  if (hours && minutes) return `${hours} ч ${minutes} мин`
+  return hours ? `${hours} ч` : `${minutes} мин`
+}
