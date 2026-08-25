@@ -39,7 +39,9 @@ NOTIFY_TOKEN_TTL = timedelta(days=30)
 # осмысленное значение None, и None как признак отсутствия здесь не годится.
 _UNSET: Any = object()
 
-DEFAULTS = {
+# События задачи: у каждого обязан быть набор кнопок в NOTIFY_ACTIONS, это
+# проверяется тестом-стражем.
+TASK_DEFAULTS = {
     "task.created": False,
     "task.status_changed": True,
     "task.stage_changed": True,
@@ -49,6 +51,22 @@ DEFAULTS = {
     "task.completed": True,
     "task.deleted": True,
 }
+
+# Проактивные сообщения (domain/reminders.py): их шлёт не событие портала, а
+# расписание, и клавиатуру каждое собирает себе само — общей таблицы кнопок у них
+# нет и быть не может, слишком разные адресаты.
+#
+# Напоминания включены: оба приходят лично тому, кого касаются, и оба следствие
+# уже сделанного выбора — включённого подтверждения задач и проставленного срока.
+# Утренняя сводка выключена: это сообщение в общем рабочем чате, которого никто
+# не звал, и появиться оно должно по решению человека, а не по умолчанию (`/digest`).
+PROACTIVE_DEFAULTS = {
+    "reminder.approval": True,
+    "reminder.deadline": True,
+    "digest.daily": False,
+}
+
+DEFAULTS = {**TASK_DEFAULTS, **PROACTIVE_DEFAULTS}
 
 STATUS_VERB = {
     2: "вернул в ожидание", 3: "взял в работу", 4: "отправил на контроль",
@@ -158,23 +176,29 @@ async def _is_echo(tenant_id: int, task_id: int, field: str, new_value: Any,
 
 
 # --------------------------------------------------------------- настройки
-async def is_enabled(tenant_id: int, project_id: int | None, code: str) -> bool:
-    """Разрешение по цепочке: проект → теннант → системный дефолт.
+async def is_enabled(tenant_id: int, project_id: int | None, code: str, *,
+                     binding_id: int | None = None) -> bool:
+    """Разрешение по цепочке: привязка → проект → теннант → системный дефолт.
 
     Отсутствие записи означает «наследовать выше», а не «выключено» — в mclick
     обратная трактовка стоила инцидента (инвариант И-9).
+
+    Уровень привязки читается только теми, кто умеет его различать: у уведомления
+    о задаче адресатов может быть несколько чатов сразу, и оно решает вопрос один
+    раз на проект. Утренняя сводка, наоборот, живёт ровно в одном чате — там
+    привязка и есть тот уровень, на котором её включают (`/digest`).
     """
     async with pool().acquire() as conn:
         rows = await conn.fetch(
             "SELECT scope_kind, enabled FROM notification_settings "
             "WHERE tenant_id = $1 AND code = $2 "
-            "AND ((scope_kind = 'project' AND scope_id = $3) OR scope_kind = 'tenant')",
-            tenant_id, code, project_id or 0)
+            "AND ((scope_kind = 'binding' AND scope_id = $4) "
+            "  OR (scope_kind = 'project' AND scope_id = $3) OR scope_kind = 'tenant')",
+            tenant_id, code, project_id or 0, binding_id or 0)
     by_scope = {r["scope_kind"]: r["enabled"] for r in rows}
-    if "project" in by_scope:
-        return bool(by_scope["project"])
-    if "tenant" in by_scope:
-        return bool(by_scope["tenant"])
+    for scope in ("binding", "project", "tenant"):
+        if scope in by_scope:
+            return bool(by_scope[scope])
     return DEFAULTS.get(code, False)
 
 
@@ -449,19 +473,43 @@ async def notify_markup(tenant_id: int, chat_ref: int, task_id: int, code: str,
     return keyboards.notify_task(tokens, portal_url)
 
 
-async def _queue(tenant_id: int, project_id: int, task_id: int, code: str,
-                 text: str, *, portal_url: str | None = None) -> None:
-    """Разложить уведомление по всем чатам, к которым привязан проект."""
+async def chat_targets(tenant_id: int, project_id: int) -> list[Any]:
+    """Чаты, куда идёт всё, что касается проекта: сам чат, топик и его бот."""
     async with pool().acquire() as conn:
-        targets = await conn.fetch(
+        return list(await conn.fetch(
             """
             SELECT b.chat_ref, t.thread_id, c.bot_ref, b.id AS binding_id
               FROM chat_bindings b
               JOIN tg_chats c ON c.id = b.chat_ref AND c.status IN ('claimed','active')
               LEFT JOIN tg_topics t ON t.id = b.topic_ref
              WHERE b.tenant_id = $1 AND b.project_id = $2 AND b.status = 'active'
-            """, tenant_id, project_id)
+            """, tenant_id, project_id))
 
+
+async def enqueue(tenant_id: int, *, bot_ref: int, chat_ref: int,
+                  thread_id: int | None, kind: str, text: str,
+                  markup: dict[str, Any] | None = None,
+                  dedup_key: str | None = None) -> None:
+    """Единственное место, где строка попадает в `outbox`.
+
+    Ключ дедупликации работает только против гонки: уникальный индекс накрывает
+    состояния `pending` и `sending`, а после отправки то же сообщение вставится
+    заново. Всё, что не должно повториться назавтра, обязано иметь свою отметку
+    (`reminder_marks`), а не надеяться на этот ключ.
+    """
+    async with pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO outbox (tenant_id, bot_ref, chat_ref, thread_id, kind, "
+            "text, markup, dedup_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) "
+            "ON CONFLICT DO NOTHING",
+            tenant_id, bot_ref, chat_ref, thread_id, kind, text,
+            json.dumps(markup, ensure_ascii=False) if markup else None, dedup_key)
+
+
+async def _queue(tenant_id: int, project_id: int, task_id: int, code: str,
+                 text: str, *, portal_url: str | None = None) -> None:
+    """Разложить уведомление по всем чатам, к которым привязан проект."""
+    targets = await chat_targets(tenant_id, project_id)
     for t in targets:
         if t["bot_ref"] is None:
             continue
@@ -471,14 +519,9 @@ async def _queue(tenant_id: int, project_id: int, task_id: int, code: str,
         # без кнопок.
         markup = await notify_markup(tenant_id, int(t["chat_ref"]), task_id, code,
                                      portal_url)
-        async with pool().acquire() as conn:
-            await conn.execute(
-                "INSERT INTO outbox (tenant_id, bot_ref, chat_ref, thread_id, kind, "
-                "text, markup, dedup_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) "
-                "ON CONFLICT DO NOTHING",
-                tenant_id, t["bot_ref"], t["chat_ref"], t["thread_id"], code, text,
-                json.dumps(markup, ensure_ascii=False) if markup else None,
-                f"{code}:{task_id}:{t['chat_ref']}:{_now():%Y%m%d%H%M}")
+        await enqueue(tenant_id, bot_ref=int(t["bot_ref"]), chat_ref=int(t["chat_ref"]),
+                      thread_id=t["thread_id"], kind=code, text=text, markup=markup,
+                      dedup_key=f"{code}:{task_id}:{t['chat_ref']}:{_now():%Y%m%d%H%M}")
     log.info("уведомление %s по задаче %s поставлено в %d чат(ов)",
              code, task_id, len(targets))
 

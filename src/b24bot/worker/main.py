@@ -1,4 +1,4 @@
-"""Фоновый обработчик: события Битрикса и отправка уведомлений.
+"""Фоновый обработчик: события Битрикса, отправка уведомлений и напоминания.
 
 Отдельный процесс, а не задача внутри бота: поллер обязан быстро крутить getUpdates,
 а обработка события ходит в портал и может занять секунды. Смешивать их — значит
@@ -18,7 +18,7 @@ from b24bot.core.config import get_settings
 from b24bot.core.logging import setup as log_setup
 from b24bot.crypto import box
 from b24bot.db.pool import close_pool, init_pool, pool
-from b24bot.domain import events, sync
+from b24bot.domain import events, reminders, sync
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -135,6 +135,7 @@ async def cleanup() -> None:
         await conn.execute(
             "DELETE FROM task_cache WHERE is_ours = false AND expires_at < now()")
         await conn.execute("DELETE FROM callback_tokens WHERE expires_at < now()")
+    await reminders.cleanup_marks()
 
 
 async def main() -> None:
@@ -152,6 +153,9 @@ async def main() -> None:
                 done = await process_events()
                 sent = await send_outbox()
                 heartbeat.beat("worker")
+                # Проактивные сообщения: напоминания, эскалации, утренняя сводка.
+                # Своё расписание у каждого прохода внутри, снаружи — один вызов.
+                await reminders.run_due()
                 if datetime.now(UTC) >= next_stage_pass:
                     # Отметка сдвигается ДО прохода: отказавший портал не должен
                     # превращать суточную синхронизацию в непрерывную.
