@@ -5,20 +5,27 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, ApiError } from './api'
 import { Empty, Failure, Loading } from './components/States'
+import { AboutScreen } from './screens/AboutScreen'
 import { ApprovalsScreen } from './screens/ApprovalsScreen'
 import { ContextPicker } from './screens/ContextPicker'
 import { CreateTask } from './screens/CreateTask'
+import { SummaryScreen } from './screens/SummaryScreen'
 import { TaskCardScreen } from './screens/TaskCardScreen'
 import { TaskList } from './screens/TaskList'
+import { TimesheetScreen } from './screens/TimesheetScreen'
 import { tg } from './telegram'
-import type { Bootstrap, Context } from './types'
+import { Icon } from './ui/Icon'
+import type { Bootstrap, Context, TaskFilter } from './types'
 
 type Screen =
-  | { name: 'list' }
+  | { name: 'list'; filter?: TaskFilter }
   | { name: 'card'; taskId: number }
   | { name: 'create' }
   | { name: 'pick' }
   | { name: 'approvals' }
+  | { name: 'summary' }
+  | { name: 'timesheet' }
+  | { name: 'about' }
 
 export function App() {
   const [boot, setBoot] = useState<Bootstrap | null>(null)
@@ -74,10 +81,12 @@ export function App() {
     return (
       <Shell>
         <Empty
+          icon="link"
           title="Telegram не привязан к Битрикс24"
           hint="Откройте в Битрикс24 приложение «Поддержка в Telegram» и нажмите «Привязать Telegram». Это одна кнопка и полминуты."
           action={
-            <button className="btn sec" onClick={() => setReload((n) => n + 1)}>
+            <button type="button" className="btn" onClick={() => setReload((n) => n + 1)}>
+              <Icon name="refresh" size={18} />
               Я привязал, проверить
             </button>
           }
@@ -122,13 +131,49 @@ export function App() {
     )
   }
 
+  if (screen.name === 'summary') {
+    return (
+      <Shell>
+        <SummaryScreen
+          context={context}
+          onBack={backToList}
+          // Число в сводке — это путь к задачам, которые за ним стоят.
+          onOpenFilter={(filter) => setScreen({ name: 'list', filter })}
+        />
+      </Shell>
+    )
+  }
+
+  if (screen.name === 'timesheet') {
+    return (
+      <Shell>
+        <TimesheetScreen context={context} onBack={backToList} />
+      </Shell>
+    )
+  }
+
+  if (screen.name === 'about') {
+    return (
+      <Shell>
+        <AboutScreen context={context} onBack={backToList} />
+      </Shell>
+    )
+  }
+
   return (
     <Shell>
       <TaskList
+        // Ключ по фильтру: приход из сводки с «просроченными» должен пересобрать
+        // список, а не оставить прежний с новым начальным значением в состоянии.
+        key={screen.filter ?? 'all'}
         context={context}
+        initialFilter={screen.filter}
         onOpen={(taskId) => setScreen({ name: 'card', taskId })}
         onCreate={() => setScreen({ name: 'create' })}
         onApprovals={() => setScreen({ name: 'approvals' })}
+        onSummary={() => setScreen({ name: 'summary' })}
+        onTimesheet={() => setScreen({ name: 'timesheet' })}
+        onAbout={() => setScreen({ name: 'about' })}
         // Чат, пришедший ссылкой из группы, менять нельзя: кнопка в чате одного
         // клиента не должна открывать задачи другого.
         onSwitchChat={context.pinned ? null : () => setScreen({ name: 'pick' })}

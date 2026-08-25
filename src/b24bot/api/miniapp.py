@@ -11,21 +11,22 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, File, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from b24bot.b24 import errors, mapping
+from b24bot.b24 import disk, errors, mapping
 from b24bot.b24.tokens import NeedsReauth
 from b24bot.bot import comments as comments_service
-from b24bot.bot import task_create, views
-from b24bot.core.text import bbcode_to_text
+from b24bot.bot import survey, task_create, views
+from b24bot.core.text import bbcode_to_text, safe_filename
 from b24bot.db.pool import pool
-from b24bot.domain import access, approvals, audit, miniapp
+from b24bot.domain import access, approvals, audit, miniapp, sync, timesheet
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
     TASK_NOT_FOUND,
@@ -33,6 +34,7 @@ from b24bot.domain.context import (
     authorize_task_for_chat,
     remember_task,
 )
+from b24bot.tg import files as tg_files
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/miniapp", tags=["miniapp"])
@@ -514,7 +516,16 @@ async def create_task(bundle: CtxDep, body: JsonBody) -> JSONResponse:
     if project is None:
         raise ApiError(400, "validation", "Не выбран проект.")
 
-    title = " ".join(str(body.get("title") or "").split())
+    # Задача по опроснику: заголовок, тело и поля собирает `survey.assemble` —
+    # ровно тот же код, что и в боте. Иначе один и тот же набор вопросов давал бы
+    # в чате и в приложении две разные задачи.
+    survey_fields: dict[str, Any] = {}
+    assembled = await _assemble_survey(actor, body)
+    if assembled is not None:
+        title = assembled.title
+        survey_fields = assembled.fields
+    else:
+        title = " ".join(str(body.get("title") or "").split())
     if len(title) < 3:
         raise ApiError(400, "validation", "Заголовок слишком короткий.")
 
@@ -526,10 +537,12 @@ async def create_task(bundle: CtxDep, body: JsonBody) -> JSONResponse:
     except task_service.Invalid as exc:
         raise ApiError(400, "validation", exc.message, {"field": exc.field}) from exc
 
-    description = _description(body, actor, ctx, project)
+    description = _description(body, actor, ctx, project,
+                               extra=assembled.description if assembled else "")
     draft = task_create.Draft(
         title=title[:task_service.TITLE_MAX], description=description,
         idem_key=f"tgapp-{ctx.chat_ref}-{form_id}", source_message_id=None,
+        fields=survey_fields,
         responsible_id=mapping.as_int(body.get("responsible_id")),
         deadline=deadline or None, priority=priority,
         stage_id=mapping.as_int(body.get("stage_id")),
@@ -553,16 +566,48 @@ async def create_task(bundle: CtxDep, body: JsonBody) -> JSONResponse:
     return JSONResponse(card, status_code=201 if created else 200)
 
 
+async def _assemble_survey(actor: miniapp.Actor,
+                           body: dict[str, Any]) -> survey.Assembled | None:
+    """Ответы опросника → заголовок, тело и поля задачи.
+
+    Разбирает `survey.assemble`, а не мы: там же лежит правило «ответ, который
+    поле не приняло, уходит в тело, а не пропадает». Продублировать его здесь
+    значило бы однажды потерять написанное человеком в одном из двух интерфейсов.
+    """
+    template_id = mapping.as_int(body.get("survey_template_id"))
+    if not template_id:
+        return None
+    raw = body.get("answers")
+    if not isinstance(raw, dict):
+        raise ApiError(400, "validation", "Ответы опросника не пришли.")
+
+    items = await survey.questions(actor.tenant_id, template_id)
+    if not items:
+        raise ApiError(404, "not_found", "Набор вопросов не найден.")
+
+    answers = {str(k): str(v) for k, v in raw.items() if v is not None}
+    missing = [q.text for q in items
+               if q.required and not (answers.get(q.code) or "").strip()]
+    if missing:
+        raise ApiError(400, "validation",
+                       f"Не отвечено обязательное: {missing[0]}",
+                       {"questions": missing})
+    return survey.assemble(items, answers)
+
+
 def _description(body: dict[str, Any], actor: miniapp.Actor, ctx: miniapp.Context,
-                 project: ProjectRef) -> str:
+                 project: ProjectRef, *, extra: str = "") -> str:
     """Описание плюс блок источника — тот же, что у задач из чата (И-6)."""
     from b24bot.core.text import esc_bbcode
 
+    del project
     text = esc_bbcode(str(body.get("description") or "").strip())
     meta = ["[b]— Источник —[/b]",
             f"Telegram: мини-апп, чат «{esc_bbcode(ctx.title)}»",
             f"Автор: {esc_bbcode(_author(actor))}"]
-    parts = [text] if text else []
+    # `extra` уже прошло esc_bbcode внутри survey.assemble — второй проход
+    # превратил бы разметку заголовков ответов в текст.
+    parts = [p for p in (extra, text) if p]
     parts.append("\n".join(meta))
     return "\n\n".join(parts)[:task_service.DESCRIPTION_MAX]
 
@@ -621,3 +666,311 @@ def portal_failure(exc: Exception) -> ApiError:
         return ApiError(429, "rate_limited",
                         "Битрикс24 ограничил частоту запросов. Повторите через минуту.")
     return ApiError(502, "upstream_error", "Битрикс24 не ответил.")
+
+
+# =====================================================================
+# Паритет с ботом
+#
+# Всё, что бот умеет командами и кнопками, обязан уметь и мини-апп: иначе
+# человек, привыкший к одному интерфейсу, упирается в другом в отсутствующую
+# функцию и не понимает, потерялась она или её не было.
+#
+# Логика везде ПЕРЕИСПОЛЬЗУЕТСЯ, а не переписывается: трудозатраты считает
+# `domain/timesheet`, сводку — `bot/views`, опросник разбирает `bot/survey`.
+# Разъедься реализации — одно и то же считалось бы в боте и в приложении
+# по-разному, а это худший вид расхождения: оба ответа выглядят уверенно.
+# =====================================================================
+
+
+# ------------------------------------------------------------------ сводка
+@router.get("/summary")
+async def summary(bundle: CtxDep) -> JSONResponse:
+    """Сводка по стадиям канбана — то же, что «📊 Сводка» в боте.
+
+    Отдаём структурой, а не готовым текстом: бот рисует строки, приложение —
+    полосы, и разметка HTML для Telegram здесь была бы мусором. Числа при этом
+    считаются тем же кодом и по тем же правилам.
+    """
+    actor, ctx = bundle
+    async with await _client(actor) as client:
+        tasks = await views.fetch_open(client, [p.b24_group_id for p in ctx.projects])
+
+    projects: list[dict[str, Any]] = []
+    for project in ctx.projects:
+        mine = [t for t in tasks
+                if mapping.as_int(t.get("groupId")) == project.b24_group_id]
+        stages = await views.stages_of(actor.tenant_id, project.id)
+
+        # Незнакомая стадия почти всегда значит одно: колонку завели в Битриксе
+        # после нашей последней синхронизации. Ждать суточного прохода нельзя —
+        # человек смотрит на сводку сейчас, и её задачи числились бы «вне канбана».
+        if _unknown_stage_ids(mine, stages) and await sync.ensure_fresh(
+                actor.tenant_id, project.id, project.b24_group_id):
+            stages = await views.stages_of(actor.tenant_id, project.id)
+
+        rows: list[dict[str, Any]] = []
+        counted = 0
+        for stage_id, title in stages:
+            n = sum(1 for t in mine if mapping.as_int(t.get("stageId")) == stage_id)
+            counted += n
+            if n:
+                rows.append({"id": stage_id, "title": title, "count": n})
+
+        # Две разные вещи, и путать их нельзя: «вне канбана» — нормальное
+        # состояние задачи, «стадия не опознана» — наш разлад с порталом.
+        outside = sum(1 for t in mine if not mapping.as_int(t.get("stageId")))
+        unresolved = len(mine) - counted - outside
+        projects.append({
+            "id": project.id, "name": project.name, "client": project.client_name,
+            "open": len(mine), "stages": rows,
+            "outside": outside, "outside_title": views.OUTSIDE_KANBAN,
+            "unresolved": max(0, unresolved), "unresolved_title": views.UNKNOWN_STAGE,
+            "overdue": sum(1 for t in mine if views.is_overdue(t)),
+            "mine": sum(1 for t in mine
+                        if mapping.as_int(t.get("responsibleId")) == actor.b24_user_id),
+        })
+
+    return JSONResponse({
+        "projects": projects,
+        "open": len(tasks),
+        "overdue": sum(1 for t in tasks if views.is_overdue(t)),
+        "mine": sum(1 for t in tasks
+                    if mapping.as_int(t.get("responsibleId")) == actor.b24_user_id),
+    })
+
+
+def _unknown_stage_ids(tasks: list[dict[str, Any]],
+                       stages: list[tuple[int, str]]) -> set[int]:
+    """Стадии задач, которых нет в справочнике. Ноль не в счёт: это «вне канбана»."""
+    known = {stage_id for stage_id, _ in stages}
+    seen = {mapping.as_int(t.get("stageId")) or 0 for t in tasks}
+    return {s for s in seen if s and s not in known}
+
+
+# ------------------------------------------------------------ трудозатраты
+@router.get("/timesheet/months")
+async def timesheet_months(actor: ActorDep) -> JSONResponse:
+    """Месяцы на выбор. Список всегда одной длины — как кнопки в боте."""
+    del actor
+    items = [{"value": f"{year}-{month:02d}", "title": timesheet.month_title(year, month)}
+             for year, month in timesheet.months_back(datetime.now(UTC).date())]
+    return JSONResponse({"items": items, "current": items[0]["value"] if items else ""})
+
+
+@router.get("/timesheet")
+async def timesheet_report(bundle: CtxDep,
+                           month: Annotated[str, Query()] = "") -> JSONResponse:
+    """Свод трудозатрат за месяц по проектам чата.
+
+    Ходим личным токеном человека: видно ровно то, что видно ему самому.
+    Границу задаёт список групп чата — тот же, что и у всех выборок (И-3).
+    """
+    actor, ctx = bundle
+    parsed = timesheet.parse_month(month) if month else None
+    if parsed is None:
+        today = datetime.now(UTC).date()
+        parsed = (today.year, today.month)
+    year, month_number = parsed
+
+    async with await _client(actor) as client:
+        snap = await timesheet.snapshot(client, actor.tenant_id,
+                                        [p.b24_group_id for p in ctx.projects])
+
+    # Названия стадий — из справочника проектов: в своде их может быть несколько,
+    # и колонки разных проектов встают в одном порядке с их канбаном.
+    stage_titles: dict[int, str] = {}
+    for project in ctx.projects:
+        stage_titles.update(dict(await views.stages_of(actor.tenant_id, project.id)))
+
+    report = timesheet.aggregate(
+        snap.entries, snap.tasks, stage_titles, year=year, month=month_number,
+        complete=snap.complete, seen=snap.seen, total_on_portal=snap.total_on_portal)
+
+    def bucket(b: timesheet.Bucket) -> dict[str, Any]:
+        return {"title": b.title, "seconds": b.seconds, "tasks": len(b.tasks)}
+
+    return JSONResponse({
+        "month": f"{report.year}-{report.month:02d}",
+        "title": report.title,
+        "by_status": [bucket(b) for b in report.by_status],
+        "by_stage": [bucket(b) for b in report.by_stage],
+        "total_seconds": report.total_seconds,
+        "task_count": report.task_count,
+        "entry_count": report.entry_count,
+        # Постраничность `task.elapseditem.getlist` на портале сломана, и полноту
+        # выборки приходится доказывать сверкой с `total` из конверта. Не сошлось —
+        # человеку говорится прямо, что сумма снизу (docs/00-portal-facts.md §5.2).
+        "complete": report.complete,
+        "seen": report.seen,
+        "total_on_portal": report.total_on_portal,
+        "projects": [{"id": p.id, "name": p.name, "client": p.client_name}
+                     for p in ctx.projects],
+    })
+
+
+# --------------------------------------------------------------- опросник
+@router.get("/surveys")
+async def survey_templates(bundle: CtxDep) -> JSONResponse:
+    """Наборы вопросов — те же, что предлагает `/ask` в боте."""
+    actor, _ = bundle
+    items = await survey.categories(actor.tenant_id)
+    return JSONResponse({"items": [{"id": tid, "title": title} for tid, title in items]})
+
+
+@router.get("/surveys/{template_id}")
+async def survey_form(template_id: int, bundle: CtxDep) -> JSONResponse:
+    """Вопросы набора — все сразу.
+
+    В этом и разница с ботом, и весь смысл: в чате вопросы задаются по одному,
+    потому что диалог линеен, а на экране их видно списком — можно вернуться,
+    исправить и понять, сколько осталось, ещё до того как начал отвечать.
+    """
+    actor, _ = bundle
+    items = await survey.questions(actor.tenant_id, template_id)
+    if not items:
+        raise ApiError(404, "not_found", "Набор вопросов не найден.")
+    return JSONResponse({"items": [
+        {"code": q.code, "text": q.text, "required": q.required, "kind": q.kind,
+         "options": [{"value": str(o.get("value") or ""),
+                      "label": str(o.get("label") or o.get("value") or "")}
+                     for o in q.options],
+         # Привязку к полю показываем: человек вправе знать, что его ответ
+         # станет сроком задачи, а не строкой в описании.
+         "field": q.b24_field or ""}
+        for q in items]})
+
+
+# --------------------------------------------------------------- вложения
+FILES_PER_REQUEST = 10
+
+
+@router.post("/tasks/{task_id}/files")
+async def upload_files(task_id: int, bundle: CtxDep,
+                       files: Annotated[list[UploadFile], File()]) -> JSONResponse:
+    """Прикрепить файлы к задаче — то же, что послать файл боту с `/comment`.
+
+    Отличается только источник: в чате файл берётся из Telegram по `file_id`,
+    здесь его присылает браузер. Предел, чёрный список расширений и запись в
+    `tg_attachments` — общие с ботом, чтобы «20 МБ» значило одно и то же в
+    обоих интерфейсах.
+    """
+    actor, ctx = bundle
+    rejected: list[str] = []
+
+    # Отсев ДО обращения к порталу: «.exe» и файл на 30 МБ отказываются одинаково
+    # и без хранилища, а искать папку ради того, чтобы ничего в неё не положить, —
+    # лишний поход к порталу против его же лимита частоты.
+    accepted: list[tuple[str, bytes]] = []
+    total = 0
+    for item in files[:FILES_PER_REQUEST]:
+        name = safe_filename(item.filename or "файл")
+        if tg_files.is_blocked(name):
+            rejected.append(f"«{name}» — этот тип файла не переносим")
+            continue
+        content = await item.read()
+        if len(content) > tg_files.MAX_SIZE:
+            rejected.append(f"«{name}» больше 20 МБ")
+            continue
+        total += len(content)
+        if total > tg_files.TOTAL_PER_TASK:
+            rejected.append(f"«{name}» — превышен общий объём на задачу")
+            break
+        accepted.append((name, content))
+
+    async with await _client(actor) as client:
+        task, project = await _authorized_task(actor, ctx, client, task_id)
+
+        uploaded: list[int] = []
+        names: list[str] = []
+
+        if accepted:
+            folder = await disk.group_folder(client, project.b24_group_id)
+            if folder is None:
+                folder = await disk.user_folder(client, actor.b24_user_id)
+            if folder is None:
+                raise ApiError(502, "upstream_error",
+                               "В Битрикс24 не нашлось хранилища для файлов.")
+
+            for name, content in accepted:
+                # Ключ идемпотентности — sha256 содержимого: `file_id` Telegram
+                # здесь взять неоткуда, а повторная отправка той же формы после
+                # таймаута не должна класть в задачу второй такой же файл (И-10).
+                digest = hashlib.sha256(content).hexdigest()
+                idem = f"tgapp-file-{task_id}"
+                async with pool().acquire() as conn:
+                    done = await conn.fetchval(
+                        "SELECT b24_file_id FROM tg_attachments WHERE tenant_id = $1 "
+                        "AND idem_key = $2 AND tg_file_id = $3 AND state = 'uploaded'",
+                        actor.tenant_id, idem, digest)
+                # `as_int`, а не `int()`: строка идемпотентности — подсказка,
+                # а не источник правды. Мусор в ней должен привести к повторной
+                # заливке, а не уронить весь запрос на полпути.
+                known = mapping.as_int(done)
+                if known:
+                    uploaded.append(known)
+                    names.append(name)
+                    continue
+
+                try:
+                    result = await disk.upload(client, folder, name, content)
+                except errors.B24Error as exc:
+                    log.warning("файл %s не загрузился: %s", name, exc)
+                    rejected.append(f"«{name}» не загрузился в Битрикс24")
+                    continue
+
+                file_id = mapping.as_int(result.get("ID")) or 0
+                if not file_id:
+                    rejected.append(f"«{name}» не загрузился в Битрикс24")
+                    continue
+
+                uploaded.append(file_id)
+                names.append(name)
+                async with pool().acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO tg_attachments (tenant_id, idem_key, tg_file_id, "
+                        "file_name, size_bytes, state, b24_file_id) "
+                        "VALUES ($1,$2,$3,$4,$5,'uploaded',$6) "
+                        "ON CONFLICT (tenant_id, idem_key, tg_file_id) DO UPDATE "
+                        "SET state = 'uploaded', b24_file_id = EXCLUDED.b24_file_id",
+                        actor.tenant_id, idem, digest, name, len(content), file_id)
+
+        if uploaded:
+            await disk.attach_to_task(client, task_id, uploaded)
+            await _audit(actor, "task.attach", task_id, project,
+                         {"files": len(uploaded)})
+
+        fresh = await task_service.read(client, task_id) or task
+        payload = await _card_payload(actor, fresh, project)
+
+    payload["attached"] = len(uploaded)
+    payload["attached_names"] = names
+    # Отказы не молчат: файл, который не уехал, человек считает уехавшим.
+    payload["rejected"] = rejected
+    return JSONResponse(payload)
+
+
+# ----------------------------------------------------------------- кто я
+@router.get("/me")
+async def whoami(actor: ActorDep) -> JSONResponse:
+    """`/whoami` бота: теннант, портал, роль, привязка.
+
+    Единственное место, где человек может проверить, ЧЕМ он в системе является,
+    когда что-то не работает. В боте оно есть — значит обязано быть и здесь.
+    """
+    async with pool().acquire() as conn:
+        portal = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
+                                     actor.tenant_id)
+        name = await conn.fetchval("SELECT name FROM tenants WHERE id = $1",
+                                   actor.tenant_id)
+        role = await conn.fetchval(
+            "SELECT role FROM tenant_users WHERE tenant_id = $1 AND b24_user_id = $2",
+            actor.tenant_id, actor.b24_user_id)
+    return JSONResponse({
+        "tenant": {"id": actor.tenant_id, "name": str(name or "")},
+        "portal": str(portal or ""),
+        "b24_user_id": actor.b24_user_id,
+        "tg_user_id": actor.tg_user_id,
+        "name": actor.init.full_name,
+        "username": actor.init.username or "",
+        "role": role or "user",
+    })

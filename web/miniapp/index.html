@@ -2,7 +2,15 @@
 <html lang="ru">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+    <!--
+      Щипковый зум НЕ запрещён. Раньше здесь стояли `maximum-scale=1,
+      user-scalable=no` — ими гасился самопроизвольный зум WKWebView при фокусе
+      в поле ввода. Но причина того зума была в другом: шрифт полей был 15px,
+      а iOS зумит всё, что мельче 16px. Поля увеличены до 16px (styles.css,
+      --fs-input), и запрет зума стал не нужен — а он ломал WCAG 1.4.4 для всех,
+      кому нужно увеличить мелкий текст.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Задачи Битрикс24</title>
     <!--
       Официальный SDK Telegram. Только отсюда: window.Telegram.WebApp создаёт

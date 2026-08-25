@@ -60,6 +60,72 @@ declare global {
 
 const webApp = window.Telegram?.WebApp
 
+/*
+ * Нативные кнопки клиента — стек, а не одна ячейка.
+ *
+ * `BackButton.onClick` в SDK ДОБАВЛЯЕТ обработчик, а не заменяет. Пока на
+ * экране жил ровно один компонент, это было незаметно; с листом правки поверх
+ * карточки одно нажатие «назад» закрыло бы лист И ушло к списку разом.
+ * Поэтому к SDK всегда подключён только верх стека, а размонтирование
+ * возвращает кнопку предыдущему владельцу.
+ */
+type BackEntry = { fn: (() => void) | null }
+type MainOptions = { text: string; onClick: () => void; busy?: boolean; enabled?: boolean }
+type MainEntry = { opts: MainOptions | null }
+
+const backStack: BackEntry[] = []
+const mainStack: MainEntry[] = []
+
+let backAttached: (() => void) | null = null
+let mainAttached: (() => void) | null = null
+
+function syncBack(): void {
+  const button = webApp?.BackButton
+  if (!button) return
+  const top = backStack.length ? backStack[backStack.length - 1]!.fn : null
+  if (backAttached && backAttached !== top) {
+    button.offClick(backAttached)
+    backAttached = null
+  }
+  if (top) {
+    if (backAttached !== top) {
+      button.onClick(top)
+      backAttached = top
+    }
+    button.show()
+  } else {
+    button.hide()
+  }
+}
+
+function syncMain(): void {
+  const button = webApp?.MainButton
+  if (!button) return
+  const top = mainStack.length ? mainStack[mainStack.length - 1]!.opts : null
+  if (mainAttached && mainAttached !== top?.onClick) {
+    button.offClick(mainAttached)
+    mainAttached = null
+  }
+  if (!top) {
+    button.hide()
+    return
+  }
+  button.setText(top.text)
+  if (mainAttached !== top.onClick) {
+    button.onClick(top.onClick)
+    mainAttached = top.onClick
+  }
+  button.show()
+  if (top.busy) {
+    button.showProgress(false)
+    button.disable()
+  } else {
+    button.hideProgress()
+    if (top.enabled === false) button.disable()
+    else button.enable()
+  }
+}
+
 export const tg = {
   available: Boolean(webApp?.initData),
 
@@ -84,47 +150,42 @@ export const tg = {
     return () => webApp?.offEvent('themeChanged', cb)
   },
 
-  /** Кнопка «назад» в шапке клиента. Возвращает функцию отписки. */
+  /**
+   * Кнопка «назад» в шапке клиента. Возвращает функцию отписки.
+   * `null` — «на этом экране кнопки нет»; это тоже позиция в стеке, иначе
+   * экран без кнопки унаследовал бы чужую.
+   */
   back(handler: (() => void) | null): () => void {
-    const button = webApp?.BackButton
-    if (!button) return () => undefined
-    if (!handler) {
-      button.hide()
-      return () => undefined
-    }
-    button.onClick(handler)
-    button.show()
+    const entry: BackEntry = { fn: handler }
+    backStack.push(entry)
+    syncBack()
     return () => {
-      button.offClick(handler)
-      button.hide()
+      const i = backStack.indexOf(entry)
+      if (i >= 0) backStack.splice(i, 1)
+      syncBack()
     }
   },
 
-  main(options: { text: string; onClick: () => void; busy?: boolean } | null): () => void {
-    const button = webApp?.MainButton
-    if (!button) return () => undefined
-    if (!options) {
-      button.hide()
-      return () => undefined
-    }
-    button.setText(options.text)
-    button.onClick(options.onClick)
-    button.show()
-    if (options.busy) {
-      button.showProgress(false)
-      button.disable()
-    } else {
-      button.hideProgress()
-      button.enable()
-    }
+  /** Нижняя кнопка клиента — главное действие экрана. Тот же стек. */
+  main(options: MainOptions | null): () => void {
+    const entry: MainEntry = { opts: options }
+    mainStack.push(entry)
+    syncMain()
     return () => {
-      button.offClick(options.onClick)
-      button.hide()
+      const i = mainStack.indexOf(entry)
+      if (i >= 0) mainStack.splice(i, 1)
+      syncMain()
     }
   },
 
+  /** Выбор изменился: фильтр, сегмент, пункт списка. */
   tap(): void {
     webApp?.HapticFeedback?.selectionChanged()
+  },
+
+  /** Нажали на что-то заметное: открыли задачу, открыли лист. */
+  press(): void {
+    webApp?.HapticFeedback?.impactOccurred('light')
   },
 
   done(): void {
@@ -133,6 +194,11 @@ export const tg = {
 
   fail(): void {
     webApp?.HapticFeedback?.notificationOccurred('error')
+  },
+
+  /** Получилось, но не полностью — например, портал принял не все поля. */
+  warn(): void {
+    webApp?.HapticFeedback?.notificationOccurred('warning')
   },
 
   alert(message: string): void {
