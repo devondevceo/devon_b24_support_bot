@@ -78,20 +78,21 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - run: pip install -r requirements-dev.txt
       - run: pytest -q --junitxml=junit.xml
-      # Тесты изоляции и синхронизации пропускают сами себя без TEST_DATABASE_URL:
+      # Тесты на живой базе пропускают сами себя без TEST_DATABASE_URL:
       # опечатка в переменной дала бы зелёный CI без единой проверки изоляции.
+      # Ищем по ПРИЧИНЕ пропуска, а не по именам модулей: список модулей пришлось
+      # бы дописывать руками, и первый же забытый молча выпал бы из проверки.
       - name: тесты на живой базе не пропущены
         run: |
           python - <<'PY'
           import sys
           import xml.etree.ElementTree as ET
 
-          live = [
-              f"{c.get('classname', '')}::{c.get('name', '')}"
-              for c in ET.parse("junit.xml").getroot().iter("testcase")
-              if c.find("skipped") is not None
-              and ("test_isolation" in c.get("classname", "") or "test_stage_sync" in c.get("classname", ""))
-          ]
+          live = []
+          for c in ET.parse("junit.xml").getroot().iter("testcase"):
+              skipped = c.find("skipped")
+              if skipped is not None and "TEST_DATABASE_URL" in (skipped.get("message") or ""):
+                  live.append(f"{c.get('classname', '')}::{c.get('name', '')}")
           if live:
               print("пропущены тесты на живой базе:", *live, sep="\n  ")
               sys.exit(1)

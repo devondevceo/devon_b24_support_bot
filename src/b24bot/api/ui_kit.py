@@ -252,6 +252,26 @@ stroke='%23667085' stroke-width='1.5' stroke-linecap='round' \
 stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
   background-repeat:no-repeat;background-position:right 11px center}
 .grid2{display:grid;gap:var(--s3);grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+
+/* Набор переключателей: подпись — часть цели нажатия, поэтому вся плашка
+   лежит внутри <label>. Флажок без подписи в цели — промах в половине случаев
+   на телефоне, а тут выключают уведомления, а не переключают вкладку. */
+.checks{display:grid;gap:var(--s2);
+        grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+.check{display:flex;gap:var(--s3);align-items:flex-start;min-height:44px;
+       padding:10px 12px;border:1px solid var(--border);border-radius:var(--r2);
+       background:var(--surface);cursor:pointer;
+       transition:border-color .15s ease,background-color .15s ease}
+.check:hover{background:var(--surface-2);border-color:var(--border-strong)}
+.check input{width:18px;height:18px;flex:none;margin:2px 0 0;
+             accent-color:var(--primary);cursor:pointer}
+/* display:block проставлен явно: внутри <label> тут спаны (див в спане —
+   невалидная вложенность), а без блочности подпись и пояснение склеиваются
+   в одну строку без пробела — этот же случай уже был на вкладке «Чаты». */
+.check-b{min-width:0}
+.check-t,.check-x{display:block}
+.check-t{font-size:13.5px;font-weight:500;line-height:1.35}
+.check-x{color:var(--text-3);font-size:12.5px;line-height:1.45;margin-top:2px}
 .hint{color:var(--text-3);font-size:12.5px;line-height:1.5;margin-top:var(--s2);
       max-width:72ch}
 .hint:first-child{margin-top:0}
@@ -442,6 +462,22 @@ def panel(title: str, body_html: str, *, icon_name: str = "", actions_html: str 
     ident = f' id="{esc_attr(id_attr)}"' if id_attr else ""
     return (f'<section class="panel"{ident}>{head}'
             f'<div class="{cls}">{body_html}</div>{foot}</section>')
+
+
+def checkbox(name: str, value: str, label: str, *, hint: str = "",
+             checked: bool = False) -> str:
+    """Переключатель с подписью и пояснением, целиком внутри <label>.
+
+    Пояснение здесь не украшение: «Создана задача» и «Изменён статус» человек
+    различает по названию, а вот почему одно включено, а другое нет — только
+    по тексту рядом.
+    """
+    sub = f'<span class="check-x">{esc_html(hint)}</span>' if hint else ""
+    mark = " checked" if checked else ""
+    return (f'<label class="check"><input type="checkbox" name="{esc_attr(name)}" '
+            f'value="{esc_attr(value)}"{mark}>'
+            f'<span class="check-b"><span class="check-t">{esc_html(label)}</span>'
+            f"{sub}</span></label>")
 
 
 def field(label: str, value_html: str) -> str:
