@@ -33,6 +33,10 @@ from b24bot.domain.notifications import (
 
 EVIL = "</span><script>alert(1)</script>\" ' & [b]"
 
+# Новости о задачах настраиваются на всех трёх уровнях; проактивные — не везде
+# (`Event.scopes`), поэтому в тестах уровня они берутся отдельно.
+EMITTED_TASK = frozenset(e.code for e in EVENTS if e.emitted and e.kind == "task")
+
 
 # ------------------------------------------------------------------- реестр
 def _codes_in_functions() -> set[str]:
@@ -384,21 +388,25 @@ async def test_saving_a_level_writes_explicit_false_for_every_event(db: object) 
     что только что выключил.
     """
     w = await _world(db)
+    codes = {e.code for e in notifications.settable("binding")}
     await notifications.save_events(w["tenant"], "binding", w["binding"],
-                                    dict.fromkeys(EMITTED, False))
+                                    dict.fromkeys(codes, False))
     rows = await db.fetch(  # type: ignore[attr-defined]
         "SELECT code, enabled FROM notification_settings "
         "WHERE tenant_id = $1 AND scope_kind = 'binding' AND scope_id = $2",
         w["tenant"], w["binding"])
-    assert {r["code"] for r in rows} == set(EMITTED)
+    assert {r["code"] for r in rows} == codes
     assert all(r["enabled"] is False for r in rows)
+    assert "reminder.approval" not in codes, (
+        "напоминание в личку адресовано человеку, а не чату: строка уровня чата "
+        "была бы записью, которую никто не читает")
 
 
 @live
 async def test_returning_a_level_to_inherit_removes_its_rows(db: object) -> None:
     w = await _world(db)
     await notifications.save_events(w["tenant"], "project", w["project"],
-                                    dict.fromkeys(EMITTED, True))
+                                    dict.fromkeys(EMITTED_TASK, True))
     await notifications.save_events(w["tenant"], "project", w["project"], None)
     assert await notifications.scope_events(w["tenant"], "project",
                                             w["project"]) is None
@@ -408,7 +416,7 @@ async def test_returning_a_level_to_inherit_removes_its_rows(db: object) -> None
 async def test_resolve_reads_the_whole_chain_from_the_database(db: object) -> None:
     w = await _world(db)
     await notifications.save_events(w["tenant"], "tenant", 0,
-                                    dict.fromkeys(EMITTED, False))
+                                    dict.fromkeys(EMITTED_TASK, False))
     await notifications.save_minutes(w["tenant"], "tenant", 0, 60)
     await notifications.save_minutes(w["tenant"], "binding", w["binding"], 5)
 
@@ -454,7 +462,7 @@ async def _drain(conn: object) -> None:
 async def test_disabled_event_never_reaches_the_queue(db: object) -> None:
     w = await _world(db)
     await notifications.save_events(w["tenant"], "binding", w["binding"],
-                                    dict.fromkeys(EMITTED, False))
+                                    dict.fromkeys(EMITTED_TASK, False))
     ch = events._change("task.status_changed", "🔁", "#1", "Задача", "Иван завершил")
     await events._deliver(w["tenant"], w["project"], 1, [ch])
     assert await db.fetchval(  # type: ignore[attr-defined]
