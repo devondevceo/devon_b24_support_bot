@@ -62,6 +62,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("discussion", "показать обсуждение задачи", (GROUPS, ADMINS), "Задачи",
             args="<номер>"),
     Command("cancel", "прервать начатый опрос", (GROUPS, ADMINS), "Задачи"),
+    Command("digest", "сводка сейчас и настройка утренней рассылки",
+            (GROUPS, ADMINS), "Задачи"),
 
     # ---------------------------------------------------------------- личка
     Command("mychats", "мои чаты и проекты", (PRIVATE,), "В личке"),

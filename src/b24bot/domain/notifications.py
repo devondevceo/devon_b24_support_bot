@@ -41,6 +41,14 @@ class Event:
     очередь, в системе ещё нет. Такой переключатель в интерфейсе не показывается:
     выключатель, ничего не выключающий, — то же обещание, что команда в меню,
     которой не знает роутер.
+
+    `scopes` — уровни, на которых настройка действительно читается. У напоминаний
+    в личку адресата нет чата вовсе: `reminders` спрашивает их по проекту, и
+    переключатель уровня чата остался бы таким же мёртвым выключателем.
+
+    `kind` — «task» для новостей о задачах (у каждой есть набор кнопок под
+    уведомлением) и «proactive» для сообщений по расписанию: их шлёт не событие
+    портала, а `domain/reminders.py`.
     """
 
     code: str
@@ -48,6 +56,8 @@ class Event:
     hint: str
     default: bool
     emitted: bool = True
+    kind: str = "task"
+    scopes: tuple[str, ...] = SCOPES
 
 
 EVENTS: tuple[Event, ...] = (
@@ -76,11 +86,35 @@ EVENTS: tuple[Event, ...] = (
     # Строка стоит здесь, чтобы переключатель не появился раньше самой рассылки.
     Event("task.comment_added", "Новый комментарий",
           "Комментарий к задаче на портале.", default=True, emitted=False),
+
+    # Проактивные сообщения (`domain/reminders.py`): их шлёт не событие портала,
+    # а расписание. Настройки те же самые и в той же таблице, поэтому и экран
+    # общий: человек ищет «где выключить, чтобы не писало» в одном месте, а не
+    # по признаку, который знаем только мы.
+    Event("reminder.approval", "Напоминание о подтверждении",
+          "Задача ждёт решения ответственного: личное напоминание через четыре "
+          "часа и разговор в чате проекта через сутки.",
+          default=True, kind="proactive", scopes=("tenant", "project")),
+    Event("reminder.deadline", "Напоминание о сроке",
+          "Личное сообщение ответственному за два часа до срока задачи.",
+          default=True, kind="proactive", scopes=("tenant", "project")),
+    Event("digest.daily", "Утренняя сводка в чат",
+          "Раз в сутки числами: просрочено, срок сегодня, ждут подтверждения, "
+          "без движения. Тот же переключатель, что команда «/digest» в чате.",
+          default=False, kind="proactive"),
 )
 
 BY_CODE: dict[str, Event] = {e.code: e for e in EVENTS}
 DEFAULTS: dict[str, bool] = {e.code: e.default for e in EVENTS}
 EMITTED: frozenset[str] = frozenset(e.code for e in EVENTS if e.emitted)
+TASK_DEFAULTS: dict[str, bool] = {e.code: e.default for e in EVENTS if e.kind == "task"}
+PROACTIVE_DEFAULTS: dict[str, bool] = {e.code: e.default for e in EVENTS
+                                       if e.kind == "proactive"}
+
+
+def settable(scope_kind: str) -> tuple[Event, ...]:
+    """Переключатели, которые на этом уровне действительно что-то решают."""
+    return tuple(e for e in EVENTS if e.emitted and scope_kind in e.scopes)
 
 # Допустимые интервалы группировки. Список закрытый: значение приезжает из формы
 # в браузере портала, и произвольное число здесь означало бы окно длиной в год.
@@ -112,8 +146,7 @@ class Resolved:
 
     enabled: dict[str, bool]
     minutes: int
-    events_from: str       # binding | project | tenant | default
-    minutes_from: str
+    minutes_from: str      # binding | project | tenant | default
 
 
 def resolve_rows(ev_rows: list[tuple[str, str, bool]],
@@ -122,21 +155,26 @@ def resolve_rows(ev_rows: list[tuple[str, str, bool]],
 
     Вынесена из запроса намеренно — цепочку наследования проверяют тесты, а не
     живая база: ошибка здесь не падает, а тихо шлёт в чат не то, что просили.
+
+    **Разрешение покодовое, а не уровнем целиком.** Первое желание было отдать
+    уровень целиком: «чат выключил всё» тогда означало бы «и то, что добавят
+    потом». Но в эту таблицу пишет не только экран настройки: `/digest` в чате
+    ставит ОДНУ строку `digest.daily` на уровне привязки (`reminders.set_digest`).
+    При правиле «уровень целиком» одна такая строка отменяла бы для этого чата
+    всю настройку проекта разом — молча и в сторону, о которой никто не просил.
+    Два писателя в одну таблицу обязаны читать её одинаково, и покодовое
+    разрешение — то, что записано в docs/20-data-model.md §9.
     """
     by_scope: dict[str, dict[str, bool]] = {}
     for kind, code, enabled in ev_rows:
         by_scope.setdefault(kind, {})[code] = enabled
 
-    # Набор событий берётся уровнем ЦЕЛИКОМ, а не по одному коду. Иначе чат,
-    # выключивший всё, получил бы новое событие из настройки проекта — то есть
-    # «выключил всё» означало бы «всё, кроме того, что добавят потом».
     enabled_map = dict(DEFAULTS)
-    events_from = "default"
-    for kind in CHAIN:
-        if kind in by_scope:
-            enabled_map = {**DEFAULTS, **by_scope[kind]}
-            events_from = kind
-            break
+    for code in DEFAULTS:
+        for kind in CHAIN:
+            if code in by_scope.get(kind, {}):
+                enabled_map[code] = by_scope[kind][code]
+                break
 
     minutes, minutes_from = DIGEST_DEFAULT, "default"
     by_digest = dict(dg_rows)
@@ -145,8 +183,30 @@ def resolve_rows(ev_rows: list[tuple[str, str, bool]],
             minutes, minutes_from = int(by_digest[kind]), kind
             break
 
-    return Resolved(enabled=enabled_map, minutes=minutes,
-                    events_from=events_from, minutes_from=minutes_from)
+    return Resolved(enabled=enabled_map, minutes=minutes, minutes_from=minutes_from)
+
+
+async def enabled_one(tenant_id: int, project_id: int | None, code: str, *,
+                      binding_id: int | None = None) -> bool:
+    """Разрешение одного кода одним запросом.
+
+    Живёт рядом с `resolve`, а не вместо неё: доставка новости о задаче
+    спрашивает разом всё, что применимо к чату, а напоминания ходят по проектам
+    поодиночке, и полное разрешение на каждый проект было бы лишней парой
+    запросов. Цепочка при этом одна и та же — здесь, а не в двух модулях.
+    """
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT scope_kind, enabled FROM notification_settings "
+            "WHERE tenant_id = $1 AND code = $2 "
+            "AND ((scope_kind = 'binding' AND scope_id = $4) "
+            "  OR (scope_kind = 'project' AND scope_id = $3) OR scope_kind = 'tenant')",
+            tenant_id, code, project_id or 0, binding_id or 0)
+    by_scope = {str(r["scope_kind"]): bool(r["enabled"]) for r in rows}
+    for kind in CHAIN:
+        if kind in by_scope:
+            return by_scope[kind]
+    return DEFAULTS.get(code, False)
 
 
 async def resolve(tenant_id: int, project_id: int | None,
@@ -178,26 +238,25 @@ async def resolve(tenant_id: int, project_id: int | None,
 async def scope_events(tenant_id: int, scope_kind: str,
                        scope_id: int) -> dict[str, bool] | None:
     """Явная настройка уровня. `None` — записи нет, уровень наследует."""
-    async with pool().acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT code, enabled FROM notification_settings "
-            "WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3",
-            tenant_id, scope_kind, scope_id)
-    if not rows:
-        return None
-    return {str(r["code"]): bool(r["enabled"]) for r in rows}
+    return (await all_scope_events(tenant_id, scope_kind)).get(scope_id)
 
 
 async def all_scope_events(tenant_id: int,
                            scope_kind: str) -> dict[int, dict[str, bool]]:
-    """Явные настройки всех уровней одного вида — экран строится одним запросом."""
+    """Явные настройки всех уровней одного вида — экран строится одним запросом.
+
+    Коды, которые на этом уровне не настраиваются, отбрасываются: строка чужого
+    или устаревшего кода не должна превращать уровень в «настроенный» на вид.
+    """
+    codes = {e.code for e in settable(scope_kind)}
     async with pool().acquire() as conn:
         rows = await conn.fetch(
             "SELECT scope_id, code, enabled FROM notification_settings "
             "WHERE tenant_id = $1 AND scope_kind = $2", tenant_id, scope_kind)
     out: dict[int, dict[str, bool]] = {}
     for r in rows:
-        out.setdefault(int(r["scope_id"]), {})[str(r["code"])] = bool(r["enabled"])
+        if str(r["code"]) in codes:
+            out.setdefault(int(r["scope_id"]), {})[str(r["code"])] = bool(r["enabled"])
     return out
 
 
@@ -213,17 +272,24 @@ async def save_events(tenant_id: int, scope_kind: str, scope_id: int,
                       enabled: dict[str, bool] | None) -> None:
     """Записать набор событий уровня. `None` — вернуть уровень к наследованию.
 
-    Пишутся ВСЕ известные коды, в том числе выключенные явным `false`: удалить
-    строку выключенного события нельзя, иначе оно вернётся с уровня выше и
-    человек получит ровно то, что только что выключил (И-9).
+    Пишутся ВСЕ коды, настраиваемые на этом уровне, в том числе выключенные явным
+    `false`: удалить строку выключенного события нельзя, иначе оно вернётся с
+    уровня выше и человек получит ровно то, что только что выключил (И-9).
+
+    Трогаются РОВНО те коды, которые уровень настраивает, — отсюда `code = ANY`
+    в удалении. Снести здесь всё по уровню значило бы вместе с показанными
+    переключателями стереть чужие строки в той же таблице: `digest.daily`
+    ставится ещё и командой `/digest` из чата, а завтра появится третий писатель.
     """
     if scope_kind not in SCOPES:
         raise ValueError(f"неизвестный уровень настройки: {scope_kind}")
+    codes = [e.code for e in settable(scope_kind)]
     async with pool().acquire() as conn, conn.transaction():
         await conn.execute(
             "DELETE FROM notification_settings "
-            "WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3",
-            tenant_id, scope_kind, scope_id)
+            "WHERE tenant_id = $1 AND scope_kind = $2 AND scope_id = $3 "
+            "AND code = ANY($4::text[])",
+            tenant_id, scope_kind, scope_id, codes)
         if enabled is None:
             return
         await conn.executemany(
@@ -231,7 +297,7 @@ async def save_events(tenant_id: int, scope_kind: str, scope_id: int,
             "code, enabled) VALUES ($1,$2,$3,$4,$5)",
             [(tenant_id, scope_kind, scope_id, e.code,
               bool(enabled.get(e.code, e.default)))
-             for e in EVENTS if e.emitted])
+             for e in settable(scope_kind)])
 
 
 async def save_minutes(tenant_id: int, scope_kind: str, scope_id: int,

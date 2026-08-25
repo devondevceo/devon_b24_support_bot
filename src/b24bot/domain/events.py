@@ -44,11 +44,19 @@ _UNSET: Any = object()
 # в одном месте на весь проект (`domain/notifications.py`): оттуда же строится
 # экран настройки. Разъедься эти два списка, в интерфейсе появился бы
 # переключатель, ничего не переключающий, — и заметить это было бы нечем.
+#
+# `TASK_DEFAULTS` — новости о задачах, у каждой обязан быть набор кнопок в
+# NOTIFY_ACTIONS (страж `tests/test_notify_buttons.py`). `PROACTIVE_DEFAULTS` —
+# сообщения по расписанию из `domain/reminders.py`: адресаты и клавиатуры у них
+# разные, общей таблицы кнопок нет и быть не может.
+TASK_DEFAULTS = notifications.TASK_DEFAULTS
+PROACTIVE_DEFAULTS = notifications.PROACTIVE_DEFAULTS
 DEFAULTS = notifications.DEFAULTS
 
 # Заголовок в строке сводки режется: двадцать строк по сто символов — это не
 # сводка, а та же простыня. Многоточие показывает, что заголовок длиннее.
 SHORT_TITLE = 48
+
 
 STATUS_VERB = {
     2: "вернул в ожидание", 3: "взял в работу", 4: "отправил на контроль",
@@ -196,6 +204,23 @@ def _change(code: str, emoji: str, ref: str, title: object, what: str,
         code=code,
         text=f"{emoji} <b>{ref}</b> {esc_html(title or '')}\n{what}{stage_line}",
         short=f"{emoji} {ref} {_short_title(title)} — {what}")
+
+# --------------------------------------------------------------- настройки
+async def is_enabled(tenant_id: int, project_id: int | None, code: str, *,
+                     binding_id: int | None = None) -> bool:
+    """Разрешение одного кода по цепочке: привязка → проект → теннант → дефолт.
+
+    Тонкая обёртка над `notifications.enabled_one`: сама цепочка живёт там же,
+    где экран настройки, и второго её прочтения в проекте нет (инвариант И-9).
+
+    Уровень привязки читается только теми, кто умеет его различать. Напоминание
+    в личку адресуется человеку, а не чату, и спрашивается по проекту; новость о
+    задаче и утренняя сводка живут в конкретном чате, и для них уровень привязки
+    и есть тот, на котором это включают — экраном настройки или `/digest`.
+    """
+    return await notifications.enabled_one(tenant_id, project_id, code,
+                                           binding_id=binding_id)
+
 
 
 # --------------------------------------------------------------- обработка
@@ -468,6 +493,48 @@ async def notify_markup(tenant_id: int, chat_ref: int, task_id: int, code: str,
     return keyboards.notify_task(tokens, portal_url)
 
 
+async def chat_targets(tenant_id: int, project_id: int) -> list[Any]:
+    """Чаты, куда идёт всё, что касается проекта: сам чат, топик и его бот."""
+    async with pool().acquire() as conn:
+        return list(await conn.fetch(
+            """
+            SELECT b.chat_ref, t.thread_id, c.bot_ref, b.id AS binding_id
+              FROM chat_bindings b
+              JOIN tg_chats c ON c.id = b.chat_ref AND c.status IN ('claimed','active')
+              LEFT JOIN tg_topics t ON t.id = b.topic_ref
+             WHERE b.tenant_id = $1 AND b.project_id = $2 AND b.status = 'active'
+            """, tenant_id, project_id))
+
+
+async def enqueue(tenant_id: int, *, bot_ref: int, chat_ref: int,
+                  thread_id: int | None, kind: str, text: str,
+                  markup: dict[str, Any] | None = None,
+                  dedup_key: str | None = None,
+                  digest_text: str | None = None,
+                  send_at: datetime | None = None) -> None:
+    """Единственное место, где строка попадает в `outbox`.
+
+    Ключ дедупликации работает только против гонки: уникальный индекс накрывает
+    состояния `pending` и `sending`, а после отправки то же сообщение вставится
+    заново. Всё, что не должно повториться назавтра, обязано иметь свою отметку
+    (`reminder_marks`), а не надеяться на этот ключ.
+
+    `send_at` вместе с `digest_text` делает строку накопительной: она ждёт своего
+    окна и уедет вместе с соседками одним сообщением (`worker.flush_digests`).
+    Отдельного хранилища для «ждущих» нет намеренно — это была бы вторая очередь
+    со своими повторами, ретенцией и своими же авариями.
+    """
+    async with pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO outbox (tenant_id, bot_ref, chat_ref, thread_id, kind, "
+            "text, markup, dedup_key, digest_text, digest, next_attempt_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,coalesce($11::timestamptz, now())) "
+            "ON CONFLICT DO NOTHING",
+            tenant_id, bot_ref, chat_ref, thread_id, kind, text,
+            json.dumps(markup, ensure_ascii=False) if markup else None, dedup_key,
+            digest_text, send_at is not None, send_at)
+
+
 async def _deliver(tenant_id: int, project_id: int, task_id: int,
                    changes: list[Change], *, portal_url: str | None = None) -> None:
     """Разложить новости по чатам проекта — по настройкам КАЖДОГО чата.
@@ -479,16 +546,7 @@ async def _deliver(tenant_id: int, project_id: int, task_id: int,
     """
     if not changes:
         return
-    async with pool().acquire() as conn:
-        targets = await conn.fetch(
-            """
-            SELECT b.chat_ref, t.thread_id, c.bot_ref, b.id AS binding_id
-              FROM chat_bindings b
-              JOIN tg_chats c ON c.id = b.chat_ref AND c.status IN ('claimed','active')
-              LEFT JOIN tg_topics t ON t.id = b.topic_ref
-             WHERE b.tenant_id = $1 AND b.project_id = $2 AND b.status = 'active'
-            """, tenant_id, project_id)
-
+    targets = await chat_targets(tenant_id, project_id)
     queued = 0
     for t in targets:
         if t["bot_ref"] is None:
@@ -511,38 +569,20 @@ async def _deliver(tenant_id: int, project_id: int, task_id: int,
             # отправке дороже, чем несколькими строками в `callback_tokens`.
             markup = await notify_markup(tenant_id, int(t["chat_ref"]), task_id,
                                          ch.code, portal_url)
-            await _insert(tenant_id, int(t["bot_ref"]), int(t["chat_ref"]),
-                          t["thread_id"], task_id, ch, markup, rules.minutes)
+            send_at = (await _digest_window(tenant_id, int(t["chat_ref"]),
+                                            t["thread_id"], rules.minutes)
+                       if rules.minutes else None)
+            await enqueue(
+                tenant_id, bot_ref=int(t["bot_ref"]), chat_ref=int(t["chat_ref"]),
+                thread_id=t["thread_id"], kind=ch.code, text=ch.text, markup=markup,
+                dedup_key=f"{ch.code}:{task_id}:{t['chat_ref']}:{_now():%Y%m%d%H%M}",
+                digest_text=ch.short if send_at else None, send_at=send_at)
             queued += 1
     log.info("новостей по задаче %s поставлено в очередь: %d (чатов: %d)",
              task_id, queued, len(targets))
 
 
-async def _insert(tenant_id: int, bot_ref: int, chat_ref: int, thread_id: Any,
-                  task_id: int, ch: Change, markup: dict[str, Any] | None,
-                  minutes: int) -> None:
-    """Строка очереди. Группировка задаёт время отправки, а не отдельную таблицу.
-
-    Накопительная строка — та же строка очереди, просто со временем отправки в
-    будущем и с краткой формой рядом. Отдельное хранилище для «ждущих» означало
-    бы вторую очередь со своими повторами, ретенцией и своими же авариями.
-    """
-    async with pool().acquire() as conn:
-        flush_at = (await _digest_window(conn, tenant_id, chat_ref, thread_id, minutes)
-                    if minutes else None)
-        await conn.execute(
-            "INSERT INTO outbox (tenant_id, bot_ref, chat_ref, thread_id, kind, "
-            "text, digest_text, digest, markup, dedup_key, next_attempt_at) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,"
-            "        coalesce($11::timestamptz, now())) "
-            "ON CONFLICT DO NOTHING",
-            tenant_id, bot_ref, chat_ref, thread_id, ch.code, ch.text,
-            ch.short if minutes else None, bool(minutes),
-            json.dumps(markup, ensure_ascii=False) if markup else None,
-            f"{ch.code}:{task_id}:{chat_ref}:{_now():%Y%m%d%H%M}", flush_at)
-
-
-async def _digest_window(conn: Any, tenant_id: int, chat_ref: int, thread_id: Any,
+async def _digest_window(tenant_id: int, chat_ref: int, thread_id: Any,
                          minutes: int) -> datetime:
     """Когда уедет сводка этого чата.
 
@@ -550,12 +590,13 @@ async def _digest_window(conn: Any, tenant_id: int, chat_ref: int, thread_id: An
     не заводит своё. Иначе при интервале в 15 минут события, идущие каждые пять,
     держали бы чат в постоянном ожидании, и сводка не уехала бы никогда.
     """
-    open_window = await conn.fetchval(
-        "SELECT min(next_attempt_at) FROM outbox "
-        "WHERE tenant_id = $1 AND chat_ref = $2 "
-        "AND thread_id IS NOT DISTINCT FROM $3 "
-        "AND digest AND state = 'pending' AND next_attempt_at > now()",
-        tenant_id, chat_ref, thread_id)
+    async with pool().acquire() as conn:
+        open_window = await conn.fetchval(
+            "SELECT min(next_attempt_at) FROM outbox "
+            "WHERE tenant_id = $1 AND chat_ref = $2 "
+            "AND thread_id IS NOT DISTINCT FROM $3 "
+            "AND digest AND state = 'pending' AND next_attempt_at > now()",
+            tenant_id, chat_ref, thread_id)
     if isinstance(open_window, datetime):
         return open_window
     return _now() + timedelta(minutes=minutes)

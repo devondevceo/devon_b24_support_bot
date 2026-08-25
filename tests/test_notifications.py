@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from b24bot.api import app_notify
-from b24bot.domain import events, notifications
+from b24bot.domain import events, notifications, reminders
 from b24bot.domain.notifications import (
     DEFAULTS,
     EMITTED,
@@ -36,21 +36,30 @@ EVIL = "</span><script>alert(1)</script>\" ' & [b]"
 
 # ------------------------------------------------------------------- реестр
 def _codes_in_functions() -> set[str]:
-    """Коды событий, которые `events.py` называет внутри кода, а не в таблицах.
+    """Коды, которые код действительно отправляет.
 
-    Разбор через `ast`, а не регуляркой по `_change(`: код события уезжает в
-    новость и через переменную (`task.completed` против `task.status_changed`
-    выбирается тернарником), и регулярка такие места не видит. Таблицы уровня
-    модуля — `NOTIFY_ACTIONS`, `NOTIFY_PAYLOAD` — сюда не попадают намеренно:
-    строка в таблице кнопок не означает, что уведомление кто-то отправляет.
+    Новости о задачах ищутся в теле функций `events.py`: разбор через `ast`, а не
+    регуляркой по `_change(`, потому что код события уезжает в новость и через
+    переменную (`task.completed` против `task.status_changed` выбирается
+    тернарником). Таблицы уровня модуля — `NOTIFY_ACTIONS`, `NOTIFY_PAYLOAD` —
+    сюда не попадают намеренно: строка в таблице кнопок не означает, что
+    уведомление кто-то отправляет.
+
+    Проактивные коды объявлены константами уровня модуля в `reminders.py`,
+    поэтому оттуда берутся все литералы: их наличие в этом модуле и означает
+    рассылку.
     """
-    tree = ast.parse(Path(events.__file__).read_text(encoding="utf-8"))
     out: set[str] = set()
+    tree = ast.parse(Path(events.__file__).read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             out |= {n.value for n in ast.walk(node)
                     if isinstance(n, ast.Constant) and isinstance(n.value, str)
                     and n.value.startswith("task.")}
+    proactive = ast.parse(Path(reminders.__file__).read_text(encoding="utf-8"))
+    out |= {n.value for n in ast.walk(proactive)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and n.value.startswith(("reminder.", "digest."))}
     return out
 
 
@@ -88,7 +97,10 @@ def test_every_emitted_event_has_a_button_set() -> None:
     Пропущенный код не падает, а тихо отдаёт уведомление без кнопок — то есть
     выглядит как решение «кнопок тут не место», принятое кем-то осознанно.
     """
-    assert set(EMITTED) <= set(events.NOTIFY_ACTIONS)
+    assert set(events.TASK_DEFAULTS) <= set(events.NOTIFY_ACTIONS)
+    # У проактивных сообщений общей таблицы кнопок нет и быть не может:
+    # адресаты разные — личка ответственного и чат проекта.
+    assert not set(events.PROACTIVE_DEFAULTS) & set(events.NOTIFY_ACTIONS)
 
 
 def test_defaults_are_the_registry_defaults() -> None:
@@ -113,14 +125,12 @@ def test_absent_row_means_inherit_not_off() -> None:
     """Инвариант И-9. В mclick обратная трактовка стоила инцидента."""
     r = resolve_rows([], [])
     assert r.enabled == DEFAULTS
-    assert r.events_from == "default"
     assert r.minutes == 0
 
 
 def test_explicit_false_beats_default_true() -> None:
     r = resolve_rows([_ev("tenant", "task.status_changed", False)], [])
     assert r.enabled["task.status_changed"] is False
-    assert r.events_from == "tenant"
 
 
 @pytest.mark.parametrize(("rows", "expected"), [
@@ -136,28 +146,27 @@ def test_chain_binding_beats_project_beats_tenant(
     assert resolve_rows(rows, []).enabled["task.completed"] is expected
 
 
-def test_level_is_taken_whole_not_merged_code_by_code() -> None:
-    """Уровень выигрывает целиком, а не по одному коду.
+def test_resolution_is_per_code_so_one_foreign_row_changes_nothing_else() -> None:
+    """Разрешение покодовое, и это не деталь, а условие сосуществования.
 
-    Иначе чат, выключивший всё, получал бы событие, которого на его уровне нет,
-    из настройки проекта — то есть «выключил всё» означало бы «всё, кроме того,
-    что добавят потом».
+    В ту же таблицу пишет не только экран настройки: `/digest` в чате ставит ОДНУ
+    строку `digest.daily` на уровне привязки. Отдавай мы уровень целиком, такая
+    строка отменяла бы для этого чата всю настройку проекта разом — молча и
+    в сторону, о которой никто не просил.
     """
-    rows = [_ev("project", "task.completed", True),
-            _ev("project", "task.deadline_changed", True),
-            _ev("binding", "task.completed", False)]
+    rows = [_ev("project", "task.completed", False),
+            _ev("project", "task.deadline_changed", False),
+            _ev("binding", "digest.daily", True)]
     r = resolve_rows(rows, [])
-    assert r.enabled["task.completed"] is False
-    # На уровне чата про срок ничего не сказано — берётся системный дефолт,
-    # а не значение проекта.
-    assert r.enabled["task.deadline_changed"] is DEFAULTS["task.deadline_changed"]
-    assert r.events_from == "binding"
+    assert r.enabled["digest.daily"] is True
+    assert r.enabled["task.completed"] is False, "настройка проекта осталась в силе"
+    assert r.enabled["task.deadline_changed"] is False
 
 
 def test_digest_inherits_independently_of_events() -> None:
     """Две ручки независимы: чат может брать события у проекта и группировать по-своему."""
-    r = resolve_rows([_ev("tenant", "task.completed", True)], [("binding", 15)])
-    assert r.events_from == "tenant"
+    r = resolve_rows([_ev("tenant", "task.completed", False)], [("binding", 15)])
+    assert r.enabled["task.completed"] is False
     assert (r.minutes, r.minutes_from) == (15, "binding")
 
 
@@ -250,8 +259,7 @@ def test_change_escapes_hostile_title_in_both_forms() -> None:
 
 # ---------------------------------------------------------------------- экран
 def _resolved(**over: object) -> Resolved:
-    base = Resolved(enabled=dict(DEFAULTS), minutes=0, events_from="default",
-                    minutes_from="default")
+    base = Resolved(enabled=dict(DEFAULTS), minutes=0, minutes_from="default")
     return Resolved(**{**base.__dict__, **over})  # type: ignore[arg-type]
 
 
@@ -308,9 +316,19 @@ def test_only_emitted_events_get_a_switch() -> None:
     assert 'value="task.status_changed"' in html
 
 
-def test_summary_counts_only_switchable_events() -> None:
-    line = app_notify._summary(_resolved(enabled=dict.fromkeys(DEFAULTS, True)))
-    assert f"из {len(EMITTED)}" in line
+@pytest.mark.parametrize("scope", ["tenant", "project", "binding"])
+def test_summary_counts_only_switches_that_work_on_this_level(scope: str) -> None:
+    """У напоминаний в личку уровня чата нет вовсе: включать их в «8 из 10»
+    значило бы обещать настройку, которой на этом экране не будет."""
+    line = app_notify._summary(_resolved(enabled=dict.fromkeys(DEFAULTS, True)), scope)
+    assert f"из {len(notifications.settable(scope))}" in line
+
+
+def test_personal_reminders_are_not_offered_at_chat_level() -> None:
+    codes = {e.code for e in notifications.settable("binding")}
+    assert "reminder.approval" not in codes
+    assert "digest.daily" in codes, "утренняя сводка живёт именно в чате"
+    assert "reminder.approval" in {e.code for e in notifications.settable("project")}
 
 
 # ----------------------------------------------------- живая база: хранение

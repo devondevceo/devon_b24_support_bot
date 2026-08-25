@@ -20,15 +20,20 @@ import pytest
 
 from b24bot.bot import keyboards
 from b24bot.bot.handlers import Reply, _keep_source
-from b24bot.domain.events import DEFAULTS, NOTIFY_ACTIONS, NOTIFY_PAYLOAD
+from b24bot.domain.events import NOTIFY_ACTIONS, NOTIFY_PAYLOAD, TASK_DEFAULTS
 
 HANDLERS = (Path(__file__).resolve().parents[1]
             / "src" / "b24bot" / "bot" / "handlers.py").read_text(encoding="utf-8")
 
 
 def test_every_notification_code_has_a_button_set() -> None:
-    """Новый тип уведомления без записи в таблице остался бы без кнопок молча."""
-    missing = sorted(set(DEFAULTS) - set(NOTIFY_ACTIONS))
+    """Новый тип уведомления без записи в таблице остался бы без кнопок молча.
+
+    Сверяется именно `TASK_DEFAULTS`, а не все настройки уведомлений: у
+    проактивных сообщений (`reminder.*`, `digest.*`) своя клавиатура на каждое,
+    потому что и адресаты у них разные — личка ответственного и чат проекта.
+    """
+    missing = sorted(set(TASK_DEFAULTS) - set(NOTIFY_ACTIONS))
     assert not missing, f"уведомления без набора кнопок: {missing}"
 
 

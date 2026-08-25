@@ -118,12 +118,16 @@ def _effective(tenant_ev: dict[str, bool] | None, project_ev: dict[str, bool] | 
     return notifications.resolve_rows(ev_rows, dg_rows)
 
 
-def _summary(rules: notifications.Resolved) -> str:
-    """Строка «что сейчас происходит в этом чате» — числами, а не словами."""
-    on = sum(1 for e in notifications.EVENTS
-             if e.emitted and rules.enabled.get(e.code, False))
-    total = len(notifications.EMITTED)
-    return (f"событий: {on} из {total} · "
+def _summary(rules: notifications.Resolved, scope_kind: str = "binding") -> str:
+    """Строка «что сейчас происходит в этом чате» — числами, а не словами.
+
+    Считаются только переключатели, которые на этом уровне что-то решают: у
+    напоминаний в личку уровня чата нет вовсе, и включать их в «6 из 10» значило
+    бы обещать настройку, которой на этом экране не будет.
+    """
+    events = notifications.settable(scope_kind)
+    on = sum(1 for e in events if rules.enabled.get(e.code, False))
+    return (f"включено: {on} из {len(events)} · "
             f"{notifications.interval_label(rules.minutes)}")
 
 
@@ -131,6 +135,15 @@ def _origin(kind: str) -> str:
     if kind == "default":
         return "системные значения"
     return f"настройка {_SCOPE_TITLE[kind]}"
+
+
+def _from_whom(scope_kind: str) -> str:
+    """От кого наследует уровень, если своей записи у него нет."""
+    if scope_kind == "binding":
+        return "от проекта"
+    if scope_kind == "project":
+        return "от теннанта"
+    return "из системных значений"
 
 
 def _project_block(session: str, active: str, project: asyncpg.Record,
@@ -149,7 +162,7 @@ def _project_block(session: str, active: str, project: asyncpg.Record,
     head = (f'<div class="chat-h"><div class="chat-meta">'
             f'<span class="chat-name">{esc_html(project["name"])}</span>'
             f'<span class="chat-id">клиент {esc_html(project["client"])} · '
-            f'{esc_html(_summary(rules))}</span></div>{badge}</div>')
+            f'{esc_html(_summary(rules, "project"))}</span></div>{badge}</div>')
 
     if not can_manage:
         return f'<div class="chat-block">{head}</div>'
@@ -172,7 +185,7 @@ def _project_block(session: str, active: str, project: asyncpg.Record,
             f'<div class="proj"><div class="proj-m">'
             f'<span class="proj-ico">{ui.icon("chat", 15)}</span>'
             f'<div><div class="proj-t">{esc_html(chat_name)}{esc_html(topic)}</div>'
-            f'<div class="proj-s">{esc_html(_summary(chat_rules))}</div></div>'
+            f'<div class="proj-s">{esc_html(_summary(chat_rules, "binding"))}</div></div>'
             f'</div><div class="item-a">{state}</div></div>'
             + _details(f"Настроить чат «{chat_name}»",
                        _scope_form(session, active, "binding", bid, b_ev, b_min,
@@ -205,10 +218,19 @@ def _scope_form(session: str, active: str, scope_kind: str, scope_id: int,
         return ui.hint("Настраивать уведомления может администратор теннанта.")
 
     ident = f"{scope_kind}-{scope_id}"
-    checks = "".join(
-        ui.checkbox("ev", e.code, e.label, hint=e.hint,
-                    checked=rules.enabled.get(e.code, e.default))
-        for e in notifications.EVENTS if e.emitted)
+
+    def group(kind: str) -> str:
+        return "".join(
+            ui.checkbox("ev", e.code, e.label, hint=e.hint,
+                        checked=rules.enabled.get(e.code, e.default))
+            for e in notifications.settable(scope_kind) if e.kind == kind)
+
+    # Два набора, а не один список: события задачи приходят в ответ на действие
+    # человека в Битриксе, а проактивные — по расписанию и, кроме сводки, в личку.
+    # Смешать их значило бы ответить на вопрос «почему бот пишет мне лично»
+    # в середине списка про задачи.
+    tasks_html = group("task")
+    proactive_html = group("proactive")
 
     if scope_kind == "tenant":
         mode_options = [("custom", "свой набор — отмеченный ниже"),
@@ -235,10 +257,12 @@ def _scope_form(session: str, active: str, scope_kind: str, scope_id: int,
     inherit_note = ""
     if inherited is not None:
         inherit_note = ui.hint(
-            f"Если наследовать: {_summary(inherited)}.")
+            f"Если наследовать: {_summary(inherited, scope_kind)}.")
+    own = ("своя настройка событий" if explicit is not None
+           else f"события наследуются {_from_whom(scope_kind)}")
     origin = ui.hint(
-        f"Сейчас применяется: {_summary(rules)}. Набор событий — "
-        f"{_origin(rules.events_from)}, интервал — {_origin(rules.minutes_from)}.")
+        f"Сейчас применяется: {_summary(rules, scope_kind)}. Здесь — {own}, "
+        f"интервал группировки — {_origin(rules.minutes_from)}.")
 
     return (
         f'<form method="post" action="/b24/app/notify">'
@@ -257,8 +281,11 @@ def _scope_form(session: str, active: str, scope_kind: str, scope_id: int,
         f'<select class="input" id="nd-{esc_attr(ident)}" name="digest">{digest_html}'
         f"</select></div></div>"
         f'<fieldset style="border:0;padding:0;margin:0 0 14px">'
-        f'<legend class="f-l" style="padding:0">О чём сообщать</legend>'
-        f'<div class="checks">{checks}</div></fieldset>'
+        f'<legend class="f-l" style="padding:0">Новости о задачах</legend>'
+        f'<div class="checks">{tasks_html}</div></fieldset>'
+        f'<fieldset style="border:0;padding:0;margin:0 0 14px">'
+        f'<legend class="f-l" style="padding:0">Напоминания и сводка</legend>'
+        f'<div class="checks">{proactive_html}</div></fieldset>'
         f'<div class="btn-row">'
         f'<button class="btn sec" type="submit">{ui.icon("check", 15)}'
         f"Сохранить</button></div>"
@@ -346,8 +373,12 @@ async def _apply(tenant_id: int, actor: int, scope_kind: str, scope_id: int,
     if mode == INHERIT:
         enabled = None
     else:
-        picked = {c for c in codes if c in notifications.EMITTED}
-        enabled = {code: code in picked for code in notifications.EMITTED}
+        # Принимаются только коды, настраиваемые на ЭТОМ уровне: форма приезжает
+        # из браузера, и чужой код лёг бы строкой, которую никто не читает, —
+        # мёртвая настройка, отличимая от рабочей только чтением кода.
+        settable = {e.code for e in notifications.settable(scope_kind)}
+        picked = {c for c in codes if c in settable}
+        enabled = {code: code in picked for code in settable}
 
     await notifications.save_events(tenant_id, scope_kind, scope_id, enabled)
     await notifications.save_minutes(tenant_id, scope_kind, scope_id, minutes)

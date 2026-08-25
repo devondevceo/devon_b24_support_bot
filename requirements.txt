@@ -11,4 +11,6 @@ cryptography>=43.0
 httpx[socks]>=0.28  # socks-экстра нужна: api.telegram.org
                      # недоступен с сервера напрямую, ходим через SOCKS5
 orjson>=3.10
+tzdata>=2024.2  # база часовых поясов: python:3.12-slim её не гарантирует,
+                # а ZoneInfo('Europe/Moscow') нужен утренней сводке
 python-multipart>=0.0.12

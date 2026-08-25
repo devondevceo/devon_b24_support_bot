@@ -61,6 +61,7 @@ NAMESPACES: tuple[Namespace, ...] = (
     Namespace("e", ("edit", NOTIFY), "изменение срока, ответственного, приоритета, стадии"),
     Namespace("b", ("admin:bind",), "привязка и отвязка проекта к чату"),
     Namespace("av", ("task_approval",), "решение ответственного по новой задаче"),
+    Namespace("dg", ("digest",), "включение и выключение утренней сводки в чате"),
 )
 
 BY_NS: dict[str, Namespace] = {n.ns: n for n in NAMESPACES}

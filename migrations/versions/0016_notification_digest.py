@@ -14,13 +14,13 @@
 строкой; собирается при постановке в очередь по той же причине, что и `markup`
 (миграция `0014`): в момент отправки воркер уже не знает ни задачи, ни чата.
 
-Revision ID: 0015_notification_digest
-Revises: 0014_outbox_markup
+Revision ID: 0016_notification_digest
+Revises: 0015_reminders
 """
 from alembic import op
 
-revision = "0015_notification_digest"
-down_revision = "0014_outbox_markup"
+revision = "0016_notification_digest"
+down_revision = "0015_reminders"
 branch_labels = None
 depends_on = None
 
