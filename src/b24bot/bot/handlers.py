@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from b24bot.b24 import errors, mapping
+from b24bot.b24.limiter import Lane
 from b24bot.b24.tokens import NeedsReauth
 from b24bot.bot import (
     callbacks,
@@ -23,7 +24,15 @@ from b24bot.bot import (
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access, approvals, audit, miniapp, sync, timesheet
+from b24bot.domain import (
+    access,
+    approvals,
+    audit,
+    miniapp,
+    reminders,
+    sync,
+    timesheet,
+)
 from b24bot.domain import events as b24_events
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
@@ -631,6 +640,80 @@ async def _open_summary(ctx: ChatContext, tg_user_id: int, action: str) -> Reply
                                    domain=await _tenant_domain(ctx.tenant_id),
                                    b24_user_id=b24_user_id),
                  markup=keyboards.task_list(numbers, nav), edit=True)
+
+
+async def _digest_command(ctx: ChatContext, tg_user_id: int) -> Reply:
+    """`/digest` — та же сводка, что уходит по утрам, но прямо сейчас.
+
+    Считается ЛИЧНЫМ токеном спросившего, а не сервисным, как утренняя рассылка:
+    здесь есть конкретный читатель, и показывать ему больше, чем ему позволяет
+    Битрикс, незачем. Числа поэтому могут честно отличаться от ночных — и это
+    свойство прав, а не расхождение данных.
+
+    Команда же и включает рассылку: экрана настроек уведомлений в системе нет, а
+    настройка, до которой нельзя дотянуться, равносильна её отсутствию.
+    """
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    if not ctx.has_binding:
+        return Reply(texts.MSG_NO_PROJECT)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            tasks, complete = await views.fetch_open_all(
+                client, [p.b24_group_id for p in ctx.projects], lane=Lane.INTERACTIVE)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24Error as exc:
+        log.warning("сводка по команде не собралась: %s", exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    tz = await reminders.tenant_tz(ctx.tenant_id)
+    now = datetime.now(UTC)
+    digest = reminders.build_digest(
+        tasks, now=now, tz=tz, complete=complete,
+        awaiting=await reminders.awaiting_count(
+            ctx.tenant_id, [p.id for p in ctx.projects]))
+    text = reminders.render_digest(digest, day=now.astimezone(tz).date(),
+                                   projects=[p.name for p in ctx.projects])
+
+    enabled = await reminders.digest_enabled(ctx.tenant_id, ctx.chat_ref)
+    text += "\n\n" + (texts.MSG_DIGEST_STATE_ON if enabled
+                       else texts.MSG_DIGEST_STATE_OFF)
+
+    markup = await reminders.digest_markup(ctx.tenant_id, ctx.chat_ref)
+    rows = list(markup["inline_keyboard"])
+    # Переключатель — только админу теннанта: рассылка идёт в чат клиента, и
+    # включать её вправе тот же, кто решает, какие проекты в этом чате видны.
+    if await access.is_tenant_admin(ctx.tenant_id, tg_user_id):
+        token = await issue_token("digest", tenant_id=ctx.tenant_id,
+                                  owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                                  payload={"enabled": not enabled},
+                                  ttl=timedelta(hours=1))
+        rows.append([keyboards.cb("dg", token,
+                                  "🔕 Выключить утреннюю сводку" if enabled
+                                  else "🔔 Включить утреннюю сводку")])
+    return Reply(text, markup=keyboards.inline(rows))
+
+
+async def _digest_toggle(ctx: ChatContext, tenant_id: int, tg_user_id: int,
+                         enabled: bool) -> Reply:
+    """Право проверяется второй раз, уже на нажатии: между показом кнопки и
+    нажатием роль могли снять, а кнопка в чате живёт своей жизнью."""
+    if not await access.is_tenant_admin(tenant_id, tg_user_id):
+        return Reply(texts.MSG_NEED_TENANT_ADMIN)
+    touched = await reminders.set_digest(tenant_id, ctx.chat_ref, enabled)
+    if not touched:
+        return Reply(texts.MSG_NO_PROJECT)
+    await audit.record(tenant_id, "chat.digest.set", actor_tg_id=tg_user_id,
+                       target=f"chat:{ctx.chat_ref}",
+                       detail={"enabled": enabled, "bindings": touched})
+    return Reply(texts.MSG_DIGEST_ON if enabled else texts.MSG_DIGEST_OFF)
 
 
 async def _timesheet_months(ctx: ChatContext, tg_user_id: int) -> Reply:
@@ -1447,6 +1530,8 @@ async def _group_command(bot: dict[str, Any], ctx: ChatContext, cmd: tuple[str, 
             # Именно для этого и существует опросник.
             return await _survey_start(ctx, tg_user_id)
         return await _create_from(ctx, source, tg_user_id, msg.get("message_id"))
+    if name == "digest":
+        return await _digest_command(ctx, tg_user_id)
     if name == "comment":
         return await _comment_command(ctx, msg, arg, tg_user_id)
     if name == "discussion":
@@ -1730,6 +1815,9 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
     if tenant_id is None:
         return Reply(texts.MSG_NOT_CLAIMED)
 
+    if ns == "dg":
+        return await _digest_toggle(ctx, tenant_id, tg_user_id,
+                                    bool(payload.get("enabled")))
     if ns == "s":
         return await _survey_begin(ctx, tg_user_id, int(payload["template_id"]))
     if ns == "k":

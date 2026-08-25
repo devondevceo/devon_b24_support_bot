@@ -10,12 +10,14 @@
 Три вещи, которые стоит понимать до чтения кода:
 
 * **Личка ответственного — не чат клиента.** У бота нет ChatContext для личных
-  диалогов (dispatch.py их не регистрирует), поэтому сообщение шлётся напрямую
-  `tg.send_message`, а не через `outbox`: тот жёстко привязан к `tg_chats`,
+  диалогов (dispatch.py их не регистрирует), поэтому сообщение идёт через
+  `domain/dm.py` напрямую, а не через `outbox`: тот жёстко привязан к `tg_chats`,
   которых для личных чатов не существует. Если человек ни разу не писал боту
   лично, Telegram отвечает 400/403 — это не ошибка нашего кода, а такая же
-  правда, как «письмо на несуществующий адрес»: запрос остаётся `pending` и
-  найдётся через /pending, когда человек всё же откроет бота.
+  правда, как «письмо на несуществующий адрес». Раньше на этом всё и кончалось:
+  запрос молча оставался `pending` до тех пор, пока кто-нибудь не наберёт
+  /pending. Теперь недоставка видна в `notified_at IS NULL`, и `domain/reminders.py`
+  через полчаса рассказывает о ней в чате проекта — словами, а не тишиной.
 * **Гонку двойного клика закрывает не advisory-lock, как в b24/tokens.py, а сам
   атомарный `UPDATE ... WHERE status='pending' RETURNING`.** В tokens.py лок
   нужен потому, что два конкурентных вызова могли бы одновременно дёрнуть OAuth
@@ -38,12 +40,10 @@ from b24bot.b24 import errors
 from b24bot.b24.tokens import NeedsReauth
 from b24bot.bot import keyboards
 from b24bot.core.text import esc_html
-from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access, audit
+from b24bot.domain import access, audit, dm
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import ProjectRef, issue_token
-from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
 
@@ -189,33 +189,49 @@ async def on_task_created(tenant_id: int, project: ProjectRef, task: dict[str, A
         if approval_id is None:
             return
 
-        await _notify(tenant_id, int(approval_id), project, task_id, title,
-                     int(settings.responsible_user_id))
+        await deliver(tenant_id, int(approval_id))
     except Exception:
         log.exception("не удалось запросить подтверждение задачи: теннант %s, "
                       "проект %s, задача %s", tenant_id, project.id, task.get("id"))
 
 
-async def _notify(tenant_id: int, approval_id: int, project: ProjectRef, task_id: int,
-                  title: str, responsible_user_id: int) -> None:
+HEADING_NEW = "🙋 <b>Требуется подтверждение</b>"
+HEADING_REMINDER = "⏰ <b>Напоминание: задача ждёт вашего решения</b>"
+
+
+async def deliver(tenant_id: int, approval_id: int, *,
+                  heading: str = HEADING_NEW) -> bool:
+    """Отправить запрос в личку ответственному. `False` — не доставлено.
+
+    Данные читаются по `approval_id`, а не приходят аргументами, потому что у
+    отправки два входа: создание задачи и напоминание сутки спустя
+    (`domain/reminders.py`). Второму взять их неоткуда, кроме как из этой же строки.
+
+    Кнопки выдаются новые на каждую отправку. Старые при этом не отзываются:
+    оба токена ведут в один `resolve()`, а он идемпотентен по статусу строки —
+    второй клик получит «уже решено», а не второй перенос задачи.
+    """
     async with pool().acquire() as conn:
-        person = await conn.fetchrow(
-            "SELECT u.tg_user_id, m.b24_user_id FROM users u "
-            "LEFT JOIN tenant_members m ON m.tenant_id = $2 AND m.user_id = u.id "
-            "WHERE u.id = $1", responsible_user_id, tenant_id)
-        bot_row = await conn.fetchrow(
-            "SELECT id, bot_id, token FROM tg_bots WHERE tenant_id = $1", tenant_id)
-        domain = await conn.fetchval("SELECT b24_domain FROM tenants WHERE id = $1",
-                                     tenant_id)
-    if person is None or person["tg_user_id"] is None or bot_row is None:
+        row = await conn.fetchrow(
+            """
+            SELECT a.b24_task_id, a.task_title, a.responsible_user_id,
+                   p.name AS project_name, cl.name AS client_name,
+                   u.tg_user_id, m.b24_user_id, t.b24_domain
+              FROM task_approvals a
+              JOIN projects p ON p.id = a.project_id
+              JOIN clients cl ON cl.id = p.client_id
+              JOIN tenants t ON t.id = a.tenant_id
+              JOIN users u ON u.id = a.responsible_user_id
+              LEFT JOIN tenant_members m ON m.tenant_id = a.tenant_id
+                                        AND m.user_id = a.responsible_user_id
+             WHERE a.id = $1 AND a.tenant_id = $2
+            """, approval_id, tenant_id)
+    if row is None or row["tg_user_id"] is None:
         log.warning("запрос на подтверждение %s не отправлен: нет привязки Telegram "
-                   "у ответственного или бот не подключён", approval_id)
-        return
+                    "у ответственного", approval_id)
+        return False
 
-    token = box.decrypt(bot_row["token"],
-                        box.aad("tg_bots", "token", tenant_id, bot_row["bot_id"]))
-    tg_user_id = int(person["tg_user_id"])
-
+    tg_user_id = int(row["tg_user_id"])
     confirm = await issue_token("task_approval", tenant_id=tenant_id,
                                 owner_tg_id=tg_user_id,
                                 payload={"approval_id": approval_id, "decision": "confirm"},
@@ -226,22 +242,26 @@ async def _notify(tenant_id: int, approval_id: int, project: ProjectRef, task_id
                                ttl=timedelta(days=30))
     # Номер — ссылка на задачу: решение принимают, посмотрев её целиком.
     from b24bot.bot.views import task_ref
-    ref = task_ref(task_id, domain=str(domain or ""),
-                   b24_user_id=person["b24_user_id"])
-    text = (f"🙋 <b>Требуется подтверждение</b>\n\n"
-           f"<b>{ref} · {esc_html(title)}</b>\n"
-           f"Клиент: {esc_html(project.client_name)} · Проект: {esc_html(project.name)}")
+    ref = task_ref(int(row["b24_task_id"]), domain=str(row["b24_domain"] or ""),
+                   b24_user_id=row["b24_user_id"])
+    text = (f"{heading}\n\n"
+            f"<b>{ref} · {esc_html(str(row['task_title']))}</b>\n"
+            f"Клиент: {esc_html(str(row['client_name']))} · "
+            f"Проект: {esc_html(str(row['project_name']))}")
     markup = keyboards.inline([[
         keyboards.cb("av", confirm, "✅ Подтвердить"),
         keyboards.cb("av", reject, "❌ Отклонить"),
     ]])
-    try:
-        await tg.send_message(token, tg_user_id, text, reply_markup=markup)
-    except tg.TelegramError as exc:
-        # 400/403 — человек ни разу не писал боту лично. Запрос остаётся pending
-        # и будет виден через /pending, когда он всё же откроет диалог.
-        log.info("запрос на подтверждение %s не доставлен в личку %s: %s",
-                approval_id, tg_user_id, exc)
+
+    delivered = await dm.send(tenant_id, tg_user_id, text, markup=markup)
+    if delivered:
+        # Первая доставка, а не последняя: по ней считается возраст запроса,
+        # который человек действительно видел.
+        async with pool().acquire() as conn:
+            await conn.execute(
+                "UPDATE task_approvals SET notified_at = now() "
+                "WHERE id = $1 AND notified_at IS NULL", approval_id)
+    return delivered
 
 
 async def pending_for(tenant_id: int, responsible_user_id: int, *,

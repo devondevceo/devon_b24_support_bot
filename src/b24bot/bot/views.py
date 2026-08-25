@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from b24bot.b24.client import B24Client
+from b24bot.b24.limiter import Lane
 from b24bot.b24.mapping import (
     STATUS_DONE,
     STATUS_EMOJI,
@@ -85,6 +86,51 @@ async def fetch_open(client: B24Client, group_ids: list[int]) -> list[dict[str, 
     })
     tasks = res.get("tasks", []) if isinstance(res, dict) else []
     return [t for t in tasks if isinstance(t, dict)]
+
+
+PAGE = 50
+# Потолок обхода: 20 страниц — тысяча незакрытых задач на чат. Дальше почти
+# наверняка не «много работы», а привязка ко всему порталу разом, и молча
+# обрывать обход там нельзя (см. флаг полноты в ответе).
+MAX_PAGES = 20
+
+
+async def fetch_open_all(client: B24Client, group_ids: list[int], *,
+                         lane: Lane = Lane.BACKGROUND
+                         ) -> tuple[list[dict[str, Any]], bool]:
+    """Все незакрытые задачи проектов, а не первая страница. Второе значение —
+    полнота: `False` значит «уперлись в потолок обхода, сводка занижена».
+
+    Обход постраничный, а не keyset: именно эта форма уже отработана на живом
+    портале (`domain/timesheet.py`), а `start` у соседнего метода молча
+    игнорируется — поэтому здесь стоит защита от повторной первой страницы,
+    иначе цикл крутился бы вечно на одном и том же ответе.
+    """
+    if not group_ids:
+        return [], True
+
+    out: list[dict[str, Any]] = []
+    previous_first: Any = None
+    complete = False
+    for page in range(MAX_PAGES):
+        res = await client.call("tasks.task.list", {
+            "filter": {"GROUP_ID": group_ids, "!=REAL_STATUS": STATUS_DONE},
+            "select": TASK_SELECT_LIST,
+            "order": {"ID": "asc"},
+            "start": page * PAGE,
+        }, lane=lane)
+        chunk = [t for t in (res.get("tasks", []) if isinstance(res, dict) else [])
+                 if isinstance(t, dict)]
+        if not chunk or (previous_first is not None
+                         and chunk[0].get("id") == previous_first):
+            complete = True
+            break
+        previous_first = chunk[0].get("id")
+        out.extend(chunk)
+        if len(chunk) < PAGE:
+            complete = True
+            break
+    return out, complete
 
 
 async def stages_of(tenant_id: int, project_id: int) -> list[tuple[int, str]]:

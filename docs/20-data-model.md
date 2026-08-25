@@ -855,6 +855,7 @@ docker run --rm --network b24sdbot-internal -v /opt/b24sdbot:/w -w /tmp \
 | `task_cache` отбойники (`is_ours=false`) | 7 дней | по `expires_at` |
 | `task_cache` закрытые задачи | 90 дней после `closed_date` | джоб |
 | `task_approvals` решённые (`confirmed`/`rejected`) | 90 дней после `resolved_at` | джоб (см. §16, не реализован) |
+| `reminder_marks` | 60 дней | джоб (`reminders.cleanup_marks`) |
 | `callback_tokens` | по `expires_at` + 1 день | джоб раз в час |
 | `survey_sessions`, `tg_fsm_states` | 30 дней | джоб |
 | `tg_message_links` | 180 дней | джоб |
@@ -979,6 +980,50 @@ CREATE INDEX ix_task_approvals__responsible_pending
 
 Доставка запроса — НЕ через `outbox`: та таблица жёстко требует `chat_ref REFERENCES
 tg_chats(id)`, а личные чаты в `tg_chats` принципиально не регистрируются (см.
-docs/10-architecture.md о `dispatch.py`). Сообщение с кнопками уходит напрямую
-`tg.send_message`, в обход очереди; если человек ни разу не писал боту в личку,
-Telegram отвечает 400/403, заявка остаётся `pending` и находится через `/pending`.
+docs/10-architecture.md о `dispatch.py`). Сообщение с кнопками уходит напрямую через
+`domain/dm.py`, в обход очереди; если человек ни разу не писал боту в личку, Telegram
+отвечает 400/403.
+
+**Недоставка перестала быть тишиной** (миграция `0015`): успешная доставка проставляет
+`task_approvals.notified_at`, и `NULL` в этой колонке — не «ещё не смотрели», а «до
+человека не дошло». Через 30 минут такой запрос уходит в чаты проекта словами и с теми
+же кнопками (§15.4 в docs/30-bot-spec.md). Раньше он просто лежал `pending` до тех пор,
+пока кто-нибудь не догадается набрать `/pending`.
+
+
+## 17. Отметки об отправленных напоминаниях
+
+```sql
+CREATE TABLE reminder_marks (
+  tenant_id   BIGINT      NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  scope       TEXT        NOT NULL CHECK (scope IN ('approval','task','chat')),
+  scope_id    BIGINT      NOT NULL,   -- id заявки, номер задачи в Б24 либо chat_ref
+  kind        TEXT        NOT NULL,   -- remind | escalate | deadline_soon | digest[:thread]
+  fingerprint TEXT        NOT NULL DEFAULT '',
+  sent_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, scope, scope_id, kind)
+);
+CREATE INDEX ix_reminder_marks__sent ON reminder_marks (sent_at);
+```
+
+Зачем таблица: условие напоминания истинно всё окно целиком, и без отметки каждый
+проход воркера слал бы его заново. `outbox.dedup_key` эту роль не выполняет — его
+уникальный индекс накрывает только `pending`/`sending`, а после отправки та же строка
+вставится снова.
+
+`fingerprint` отличает «то же самое» от «изменилось»: у напоминания о сроке это сам
+срок задачи (перенесли — напомним снова), у сводки — местная дата чата (одна в сутки),
+у подтверждения он пуст. Проверка выражена в самом `UPSERT`, а не в коде:
+
+```sql
+INSERT INTO reminder_marks (...) VALUES (...)
+ON CONFLICT (tenant_id, scope, scope_id, kind) DO UPDATE
+   SET fingerprint = EXCLUDED.fingerprint, sent_at = now()
+ WHERE reminder_marks.fingerprint <> EXCLUDED.fingerprint
+RETURNING sent_at;      -- строка вернулась = повод новый = сообщение отправляем
+```
+
+`scope_id` намеренно без внешнего ключа: под ним лежат сущности из разных таблиц, а
+для номера задачи в Битриксе своей строки у нас может не быть вовсе. Ретенция 60 дней
+безопасна: удалённая отметка воскресила бы напоминание только при том же поводе, а
+срок к тому времени давно в прошлом, отпечаток же сводки — прошедшая дата.
