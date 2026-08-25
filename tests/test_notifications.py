@@ -421,6 +421,17 @@ async def test_settings_of_two_tenants_do_not_leak(db: object) -> None:
 
 
 # ------------------------------------------------- живая база: очередь и сводка
+async def _drain(conn: object) -> None:
+    """Очистить очередь перед проверками воркера.
+
+    `send_outbox` и `flush_digests` работают по ВСЕЙ очереди, без теннанта: у
+    воркера нет и не может быть «своего» теннанта. База в этом модуле одна на
+    все тесты, поэтому строка, оставленная соседним тестом, попадёт в ту же
+    отправку — и провалит проверку, ничего не сказав о продукте.
+    """
+    await conn.execute("DELETE FROM outbox")  # type: ignore[attr-defined]
+
+
 @live
 async def test_disabled_event_never_reaches_the_queue(db: object) -> None:
     w = await _world(db)
@@ -482,6 +493,7 @@ async def test_flush_sends_one_message_for_many_and_keeps_buttons_for_one(
     from b24bot.worker import main as worker
 
     w = await _world(db)
+    await _drain(db)
     sent: list[tuple[str, object]] = []
 
     async def fake_send(token: str, chat_id: int, text: str, **kw: object) -> None:
@@ -524,6 +536,7 @@ async def test_plain_queue_ignores_rows_that_wait_for_their_window(
     from b24bot.worker import main as worker
 
     w = await _world(db)
+    await _drain(db)
     await db.execute(  # type: ignore[attr-defined]
         "INSERT INTO outbox (tenant_id, bot_ref, chat_ref, kind, text, digest, "
         "next_attempt_at) VALUES ($1,$2,$3,'task.status_changed','текст',true,"
