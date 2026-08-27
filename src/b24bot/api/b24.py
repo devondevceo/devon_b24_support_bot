@@ -16,17 +16,18 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from b24bot.api import app_ui
 from b24bot.api import ui_kit as ui
+from b24bot.b24 import oauth
 from b24bot.core.config import get_settings, is_trusted_portal_domain
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
 from b24bot.domain import events as event_queue
+from b24bot.domain import linking
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/b24", tags=["bitrix24"])
@@ -74,14 +75,13 @@ def shape_for_log(payload: dict[str, str]) -> dict[str, str]:
 # ------------------------------------------------------------- вызовы в портал
 async def b24_call(domain: str, method: str, access_token: str,
                    params: dict[str, Any] | None = None) -> dict[str, Any]:
-    """REST-вызов. client_endpoint собираем САМИ из проверенного домена (И-4)."""
-    if not is_trusted_portal_domain(domain):
-        raise ValueError(f"домен портала не прошёл проверку: {domain!r}")
-    url = f"https://{domain}/rest/{method}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, data={**(params or {}), "auth": access_token})
-        payload: dict[str, Any] = r.json()
-        return payload
+    """REST-вызов. client_endpoint собираем САМИ из проверенного домена (И-4).
+
+    Тело переехало в `b24/oauth.py`: тем же вызовом опознаётся человек, вошедший
+    в портал из Telegram, а две копии проверки домена — это одна копия, которую
+    однажды забудут поправить.
+    """
+    return await oauth.rest_call(domain, method, access_token, params)
 
 
 # ------------------------------------------------------------------ сохранение
@@ -167,12 +167,99 @@ def _notice(kind: str, title: str, text: str, portal_domain: str | None, *,
     return app_ui.page(body, portal_domain)
 
 
+# ------------------------------------------------------- /b24/oauth/callback
+@router.get("/oauth/callback")
+async def oauth_callback(request: Request) -> Response:
+    """Возврат человека из портала после входа: направление «Telegram → портал».
+
+    Отдельный путь существует на случай, если локальное приложение всё-таки
+    принимает свой `redirect_uri` (`B24_OAUTH_REDIRECT=true`). Пока это не
+    проверено живым входом, портал вернёт `code` на зарегистрированный путь
+    обработчика — поэтому его принимают ещё и `/b24/placement`, и `/b24/install`.
+    Лишний открытый путь тут ничего не стоит: без нашего `state` он бесполезен.
+    """
+    return await _finish_link(dict(request.query_params))
+
+
+def _is_oauth_return(payload: dict[str, str]) -> bool:
+    """Портал вернул человека с кодом, а не открыл приложение.
+
+    Признак — наш `state` вместе с `code` или `error`. Голый `code` без `state`
+    сюда не относится: чужой он или наш, связать его не с чем.
+    """
+    return bool(payload.get("state")) and bool(payload.get("code") or payload.get("error"))
+
+
+async def _finish_link(payload: dict[str, str]) -> Response:
+    """Обмен кода и запись привязки. Один обработчик на все пути возврата."""
+    if payload.get("error"):
+        # Человек нажал «Отмена» на экране согласия — это не поломка.
+        log.info("привязка не завершена, портал ответил %s", payload["error"][:64])
+        return _link_notice("cancelled")
+
+    result = await linking.complete(
+        payload.get("state", ""), payload.get("code", ""),
+        domain_hint=payload.get("domain"), member_hint=payload.get("member_id"))
+
+    if isinstance(result, linking.Refusal):
+        return _link_notice(result.code)
+
+    await linking.notify_linked(result)
+    return await _link_done_page(result)
+
+
+LINK_REFUSALS: dict[str, tuple[str, str]] = {
+    "state": ("Ссылка не подошла",
+              "Она одноразовая и живёт 15 минут. Отправьте боту /link ещё раз — "
+              "и пройдите по свежей ссылке."),
+    "portal": ("Портал не подтвердил вход",
+               "Битрикс24 не выдал доступ по этой ссылке. Попробуйте ещё раз; "
+               "если повторится — покажите это администратору портала."),
+    "mismatch": ("Это другой Битрикс24",
+                 "Вы вошли не в тот портал, к которому подключён этот бот. "
+                 "Войдите под учётной записью нужного портала."),
+    "cancelled": ("Доступ не выдан",
+                  "Вы отказались выдать доступ на экране Битрикс24. Ничего не "
+                  "изменилось — отправьте боту /link, когда будете готовы."),
+}
+
+
+def _link_notice(code: str) -> HTMLResponse:
+    title, text = LINK_REFUSALS.get(code, LINK_REFUSALS["state"])
+    return app_ui.page(
+        ui.panel("", ui.empty(title, text, icon_name="alert")), None,
+        title="Привязка Telegram", embedded=False)
+
+
+async def _link_done_page(result: linking.Linked) -> HTMLResponse:
+    """Экран «готово». Отсюда человек возвращается в Telegram, а не в портал."""
+    async with pool().acquire() as conn:
+        username = await conn.fetchval(
+            "SELECT username FROM tg_bots WHERE tenant_id = $1", result.tenant_id)
+
+    back = (ui.link_button(f"https://t.me/{username}", "Вернуться в Telegram",
+                           icon_name="send") if username else "")
+    body = (
+        ui.field("Портал", f"<code>{esc_html(result.portal_domain)}</code>")
+        + ui.field("Пользователь Битрикс24",
+                   f"{esc_html(result.display_name)} "
+                   f"<code>{esc_html(result.b24_user_id)}</code>")
+        + ui.hint("Задачи вы создаёте и меняете от своего имени: права режет сам "
+                  "Битрикс24, мы их не расширяем.")
+        + (f'<div class="btn-row">{back}</div>' if back else ""))
+    return app_ui.page(
+        ui.panel("Аккаунты связаны", body, icon_name="check-circle"), None,
+        title="Привязка Telegram", embedded=False)
+
+
 # ------------------------------------------------------------------ /b24/install
 @router.post("/install")
 @router.get("/install")
 async def install(request: Request) -> Response:
     form = _flatten(dict(await request.form())) if request.method == "POST" else {}
     payload = {**dict(request.query_params), **form}
+    if request.method == "GET" and _is_oauth_return(payload):
+        return await _finish_link(payload)
     n = normalize(payload)
     await log_payload("install", n["member_id"], payload)
 
@@ -216,6 +303,23 @@ async def install(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------- /b24/placement
+@router.get("/placement")
+async def placement_return(request: Request) -> Response:
+    """GET на путь обработчика — это возврат из OAuth, а не открытие приложения.
+
+    Приложение портал открывает POST-ом. Сюда же он приводит браузер человека
+    после экрана согласия: `redirect_uri` у локального приложения по умолчанию и
+    есть зарегистрированный путь обработчика. Всё остальное на этом пути —
+    заход по прямой ссылке, и говорить в ответ надо ровно это.
+    """
+    payload = dict(request.query_params)
+    if _is_oauth_return(payload):
+        return await _finish_link(payload)
+    return _notice("warn", "Откройте приложение в Битрикс24",
+                   "Эта страница — часть приложения «Поддержка в Telegram». "
+                   "По прямой ссылке она ничего не показывает.", None)
+
+
 @router.post("/placement")
 async def placement(request: Request) -> Response:
     form = _flatten(dict(await request.form()))
@@ -296,18 +400,13 @@ async def _tenant_row(tenant_id: int) -> Any:
 
 
 async def _is_portal_admin(domain: str, access_token: str) -> bool:
-    """Права администратора портала спрашиваем у самого Битрикса.
+    """Права администратора портала спрашиваем у самого Битрикса (`b24/oauth.py`).
 
     Своих ролей у нас пока нет, а решать, кому можно вводить токен бота, надо уже
-    сейчас. Метод user.admin отвечает про ТЕКУЩЕГО пользователя токена, подделать
-    ответ нельзя — запрос идёт с нашего сервера на портал.
+    сейчас. Дверей в приложение теперь две — открытие в портале и вход из
+    Telegram, — и обе обязаны получать этот ответ одним и тем же способом.
     """
-    try:
-        res = await b24_call(domain, "user.admin", access_token)
-    except Exception as exc:
-        log.warning("user.admin недоступен: %s", str(exc)[:120])
-        return False
-    return bool(res.get("result"))
+    return await oauth.is_portal_admin(domain, access_token)
 
 
 # ------------------------------------------------------------------- /b24/events

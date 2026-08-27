@@ -68,12 +68,20 @@ def safe_tab(value: str) -> str:
     return value if value in TABS else "overview"
 
 
-def page(body: str, portal_domain: str | None, *, title: str = "Поддержка в Telegram"
-         ) -> HTMLResponse:
+def page(body: str, portal_domain: str | None, *, title: str = "Поддержка в Telegram",
+         embedded: bool = True) -> HTMLResponse:
+    """Экран приложения. `embedded=False` — та же вёрстка, но не внутри портала.
+
+    Страница возврата из OAuth открывается верхнеуровнево в браузере, и грузить
+    туда `BX24`-скрипт незачем: ни `fitWindow`, ни `installFinish` там некому
+    вызывать, а внешний запрос из страницы, которая ничего не встраивает, — это
+    лишний повод объясняться в модели угроз.
+    """
+    bx = '<script src="//api.bitrix24.com/api/v1/"></script>' if embedded else ""
     html = (f'<!doctype html><html lang="ru"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
             f"<title>{esc_html(title)}</title>"
-            f'<script src="//api.bitrix24.com/api/v1/"></script>'
+            f"{bx}"
             f"<style>{ui.CSS}</style></head>"
             f'<body><div class="shell">{body}</div>'
             f"<script>{ui.SCRIPT}</script></body></html>")

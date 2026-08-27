@@ -28,6 +28,8 @@ from b24bot.domain import (
     access,
     approvals,
     audit,
+    dm,
+    linking,
     miniapp,
     reminders,
     sync,
@@ -1281,6 +1283,10 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
         return Reply(_help_text(private=True), markup=_private_kb())
     name, arg = cmd
 
+    if name == "start" and arg == linking.START_ARG:
+        # Пришёл по кнопке из группы: там личную ссылку показывать нельзя.
+        await _ensure_menu_button(bot, tg_user_id)
+        return await _link_offer(bot, tg_user_id, user)
     if name == "start" and arg.startswith("b"):
         reply = await _link_account(arg[1:], tg_user_id, user)
         await _ensure_menu_button(bot, tg_user_id)
@@ -1296,7 +1302,7 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
     if name == "whoami":
         return await _whoami(tg_user_id)
     if name == "link":
-        return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
+        return await _link_offer(bot, tg_user_id, user)
     # Те же действия, что на постоянной клавиатуре: человек, привыкший к слешам,
     # не должен искать кнопку, а пришедший из меню Telegram — знать про кнопки.
     slash_actions = {"status": "mine", "list": "mine",
@@ -1464,7 +1470,12 @@ async def _approval_vote(tenant_id: int, tg_user_id: int, payload: dict[str, Any
 
 
 async def _link_account(token: str, tg_user_id: int, user: dict[str, Any]) -> Reply:
-    """Завершение привязки: человек открыл приложение в Б24 и перешёл по deep link."""
+    """Завершение привязки: человек открыл приложение в Б24 и перешёл по deep link.
+
+    Дверь «портал → Telegram». Запись при этом идёт тем же `link_accounts`, что и
+    у двери «Telegram → портал»: одинаковый результат обязан оставлять в базе
+    одинаковое состояние, иначе расхождение видно только по жалобе.
+    """
     row = await consume_token(token, None)
     if row is None or row["kind"] != "link":
         return Reply(texts.MSG_LINK_BAD_TOKEN)
@@ -1472,26 +1483,56 @@ async def _link_account(token: str, tg_user_id: int, user: dict[str, Any]) -> Re
     payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
     tenant_id, b24_user_id = int(row["tenant_id"]), int(payload["b24_user_id"])
 
-    async with pool().acquire() as conn, conn.transaction():
-        user_row = await conn.fetchrow(
-            "INSERT INTO users (tg_user_id, tg_username, display_name) VALUES ($1,$2,$3) "
-            "ON CONFLICT (tg_user_id) DO UPDATE SET tg_username = EXCLUDED.tg_username, "
-            "display_name = EXCLUDED.display_name RETURNING id",
-            tg_user_id, user.get("username"), _author(user))
-        await conn.execute(
-            "INSERT INTO tenant_members (tenant_id, user_id, role, b24_user_id, "
-            "link_status, linked_at) VALUES ($1,$2,'member',$3,'authorized',now()) "
-            "ON CONFLICT (tenant_id, user_id) DO UPDATE SET b24_user_id = EXCLUDED.b24_user_id, "
-            "link_status = 'authorized', linked_at = now()",
-            tenant_id, user_row["id"], b24_user_id)
-        # Токен отдаётся только тому, кто его авторизовал (docs/40-security.md §2).
-        await conn.execute(
-            "UPDATE b24_user_tokens SET authorized_tg_user_id = $3 "
-            "WHERE tenant_id = $1 AND b24_user_id = $2", tenant_id, b24_user_id, tg_user_id)
+    replaced = await linking.link_accounts(
+        tenant_id, b24_user_id, tg_user_id,
+        tg_username=user.get("username"), display_name=_author(user))
+    await audit.record(tenant_id, "user.map", actor_kind="user", actor_id=b24_user_id,
+                       actor_tg_id=tg_user_id, target=f"b24_user:{b24_user_id}",
+                       detail={"источник": "приложение в Битрикс24",
+                               **({"отобрана у tg": replaced} if replaced else {})})
+    if replaced:
+        await dm.send(tenant_id, replaced,
+                      texts.MSG_LINK_TAKEN_OVER.format(b24_user_id=b24_user_id))
 
     log.info("привязка завершена: теннант %s, Б24 %s, TG %s",
              tenant_id, b24_user_id, tg_user_id)
     return Reply(texts.MSG_LINK_DONE)
+
+
+async def _link_offer(bot: dict[str, Any], tg_user_id: int,
+                      user: dict[str, Any]) -> Reply:
+    """`/link` в личке: личная ссылка на экран согласия портала.
+
+    Теннант берётся у бота, а не у чата: бот у теннанта ровно один
+    (`tg_bots.tenant_id UNIQUE`), и в личке другого источника нет вовсе.
+    """
+    raw_tenant = bot.get("tenant_id")
+    tenant_id = int(raw_tenant) if raw_tenant is not None else 0
+    started = await linking.begin(
+        tenant_id, tg_user_id, tg_username=user.get("username"),
+        display_name=_author(user)) if tenant_id else None
+    if started is None:
+        return Reply(texts.MSG_LINK_UNAVAILABLE, markup=_private_kb())
+
+    linked = await access.linked_b24_user(tenant_id, tg_user_id)
+    text = (texts.MSG_LINK_RELINK.format(b24_user_id=linked) if linked
+            else texts.MSG_LINK_OFFER.format(portal=esc_html(started.portal_domain)))
+    # Инлайн-кнопка вместо постоянной клавиатуры: их нельзя послать одним
+    # сообщением, а ссылка тут и есть всё сообщение.
+    return Reply(text, buttons=[[keyboards.url_button("🔐 Войти в Битрикс24",
+                                                      started.url)]])
+
+
+def _link_to_private(bot: dict[str, Any]) -> Reply:
+    """`/link` в ГРУППЕ: зовём в личку, ссылку в общий чат не кладём.
+
+    Ссылка на экран согласия — это разрешение записать, что вошедший и есть
+    владелец ЭТОГО телеграм-аккаунта. Показанная всему чату, она превращается в
+    приглашение отдать свой доступ к Битриксу первому, кто нажмёт.
+    """
+    url = f"https://t.me/{bot['username']}?start={linking.START_ARG}"
+    return Reply(texts.MSG_LINK_IN_PRIVATE,
+                 buttons=[[keyboards.url_button("🔗 Привязать в личке", url)]])
 
 
 async def _whoami(tg_user_id: int) -> Reply:
@@ -1522,7 +1563,7 @@ async def _group_command(bot: dict[str, Any], ctx: ChatContext, cmd: tuple[str, 
     if name == "whoami":
         return await _whoami(tg_user_id)
     if name == "link":
-        return Reply(texts.MSG_NOT_LINKED)
+        return _link_to_private(bot)
 
     if name in ("bind", "bindings", "unbind"):
         return await _bind_commands(ctx, name, tg_user_id)
