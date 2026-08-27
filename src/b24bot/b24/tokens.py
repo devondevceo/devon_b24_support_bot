@@ -25,16 +25,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
-import httpx
 
-from b24bot.core.config import OAUTH_HOSTS, get_settings
+from b24bot.b24 import oauth
+from b24bot.core.config import get_settings
 from b24bot.crypto import box
 
 log = logging.getLogger(__name__)
 
 REFRESH_MARGIN = timedelta(minutes=5)
 LOCK_TIMEOUT_MS = 15_000
-HTTP_TIMEOUT = 30.0
 
 
 class NeedsReauth(Exception):
@@ -189,27 +188,19 @@ class TokenStore:
             return new_access
 
     async def _exchange(self, refresh_token: str) -> dict[str, Any] | None:
-        """Обмен refresh_token. Хосты только из allowlist (И-4)."""
+        """Обмен refresh_token. Хосты только из allowlist (И-4).
+
+        Сам перебор хостов живёт в `b24/oauth.py`: там же обмен `code` при
+        привязке из Telegram, и правило «первый осмысленный ответ и есть
+        результат» обязано быть у обоих одно.
+        """
         s = get_settings()
-        params = {
+        return await oauth.post_token({
             "grant_type": "refresh_token",
             "client_id": s.b24_client_id,
             "client_secret": s.b24_client_secret,
             "refresh_token": refresh_token,
-        }
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http:
-            for host in OAUTH_HOSTS:
-                try:
-                    resp = await http.post(f"https://{host}/oauth/token/", data=params)
-                    data = resp.json()
-                except (httpx.HTTPError, ValueError) as exc:
-                    log.warning("oauth-хост %s недоступен: %s", host, str(exc)[:120])
-                    continue
-                if isinstance(data, dict) and data.get("access_token"):
-                    return data
-                if isinstance(data, dict) and data.get("error"):
-                    return data  # осмысленный отказ — фоллбэк не поможет
-        return None
+        })
 
     # ------------------------------------------------------------------ запись
     async def store(self, tenant_id: int, b24_user_id: int, access_token: str,
