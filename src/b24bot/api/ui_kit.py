@@ -159,39 +159,66 @@ svg{flex:none;display:block}
    «Назначить админом», и на 375px они втроём не помещаются — без переноса
    кнопка уезжала за правый край и тянула горизонтальный скролл всей страницы. */
 .item-a{display:flex;gap:var(--s2);align-items:center;flex:none;flex-wrap:wrap}
-/* Чат — раздел списка: шапка на подложке, под ней проекты и свёрнутая форма.
-   Раньше вложенность объяснялась линией слева, а форма была раскрыта всегда —
-   вместе это читалось как каша из строк без границ. */
-.chat-block{border-bottom:1px solid var(--border)}
-.chat-block:last-child{border-bottom:0}
-.chat-h{display:flex;gap:var(--s2) var(--s3);align-items:center;
-        justify-content:space-between;flex-wrap:wrap;
-        padding:10px var(--s5);background:var(--surface-2)}
-.chat-meta{display:flex;flex-direction:column;gap:1px;min-width:0}
-.chat-name{font-weight:600;overflow-wrap:anywhere}
-.chat-id{color:var(--text-3);font-size:11.5px;
-         font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}
-.chat-body{padding:var(--s2) var(--s5) var(--s4)}
-.proj{display:flex;gap:var(--s3);align-items:center;justify-content:space-between;
-      padding:9px 0;flex-wrap:wrap}
-.proj + .proj{border-top:1px solid var(--border)}
-.proj-m{display:flex;gap:10px;align-items:flex-start;min-width:0;flex:1 1 240px}
-.proj-ico{color:var(--text-3);flex:none;margin-top:2px}
-.proj-t{font-weight:500;overflow-wrap:anywhere}
-.proj-s{color:var(--text-3);font-size:12.5px;margin-top:1px}
-.proj-none{color:var(--text-3);font-size:13px;padding:9px 0}
+/* Раздел списка: сущность (чат, проект) с шапкой, строками и настройкой.
+   Один паттерн на три вкладки — «Чаты», «Подтверждение», «Уведомления»; до
+   компонента каждая собирала эти классы руками и отставала от правок соседей.
+   Иерархию шапки держат три признака разом: плитка-значок, кегль имени и
+   подложка --surface-3. Прежняя пара «--surface-2 + тот же кегль» не читалась
+   вовсе: два процента разницы яркости — и шапка чата выглядела строкой того же
+   списка (видно на скриншоте с прода 29.08). */
+.grp{border-bottom:1px solid var(--border)}
+.grp:last-child{border-bottom:0}
+.grp-h{display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap;
+       padding:var(--s3) var(--s5);background:var(--surface-3)}
+.grp-av{width:36px;height:36px;border-radius:var(--r2);flex:none;
+        background:var(--surface);border:1px solid var(--border);
+        color:var(--text-2);display:flex;align-items:center;justify-content:center}
+.grp-hm{min-width:0;flex:1 1 200px}
+.grp-t{margin:0;font-size:15px;line-height:1.35;font-weight:600;color:var(--text);
+       text-transform:none;letter-spacing:normal;overflow-wrap:anywhere}
+.grp-s{color:var(--text-3);font-size:12.5px;margin-top:1px;min-width:0;
+       display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
+.grp-s>span{overflow-wrap:anywhere}
+.grp-id{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+        font-size:11.5px}
+/* Строка внутри раздела. Подсветка наведения связывает название с кнопкой у
+   правого края: на широком экране между ними до 700px пустоты, и без общего
+   фона «Отвязать» висело в воздухе, ни к чему не относясь. */
+.grp-row{display:flex;gap:var(--s2) var(--s3);align-items:center;
+         justify-content:space-between;flex-wrap:wrap;
+         padding:8px var(--s5);min-height:48px;
+         transition:background-color .12s ease}
+.grp-row:hover{background:var(--surface-2)}
+.grp-row + .grp-row,.grp-u + .grp-u,.grp-row + .note{border-top:1px solid var(--border)}
+.grp-m{display:flex;gap:10px;align-items:center;min-width:0;flex:1 1 240px}
+.grp-ico{color:var(--text-3);flex:none}
+.grp-rt{font-weight:500;overflow-wrap:anywhere}
+.grp-rs{color:var(--text-3);font-size:12.5px;margin-top:1px;overflow-wrap:anywhere}
+/* Свободное содержимое раздела (формы, раскрывашки) — с полями строк. */
+.grp-p{padding:var(--s3) var(--s5) var(--s4)}
+.grp-p:first-child{padding-top:var(--s4)}
 
-/* Форма привязки за <details>: раскрытая на каждом чате, она заслоняла чаты. */
-details.bind{margin-top:var(--s2)}
+/* Строка состояния раздела: тише banner и без aria-live — это постоянное
+   свойство («бот удалён из чата»), а не ответ на действие. */
+.note{display:flex;gap:9px;align-items:flex-start;
+      padding:var(--s3) var(--s5);font-size:13px;line-height:1.5}
+.note svg{margin-top:2px}
+.note.neutral{color:var(--text-2)}
+.note.warn{color:var(--warn)}
+.note.err{color:var(--err)}
+.note.info{color:var(--info)}
+
+/* Раскрывашка-действие («Привязать проект», «Настроить…», «Заменить бота»).
+   Выглядит как обычная вторичная кнопка: пунктирная рамка на скриншоте с прода
+   читалась как сломанное поле ввода, а не как кнопка. */
 details.bind>summary{list-style:none;cursor:pointer;user-select:none;
   display:inline-flex;align-items:center;gap:7px;min-height:38px;padding:0 14px;
-  border:1px dashed var(--border-strong);border-radius:var(--r2);
-  color:var(--text-2);font-size:13.5px;font-weight:500;
-  transition:background-color .15s ease,color .15s ease,border-color .15s ease}
+  border:1px solid var(--border-strong);border-radius:var(--r2);
+  background:var(--surface);color:var(--text);font-size:13.5px;font-weight:500;
+  transition:background-color .15s ease,border-color .15s ease}
 details.bind>summary::-webkit-details-marker{display:none}
-details.bind>summary:hover{background:var(--surface-2);color:var(--text)}
-details.bind[open]>summary{border-style:solid;background:var(--surface-2);
-  color:var(--text);margin-bottom:var(--s4)}
+details.bind>summary:hover{background:var(--surface-2);border-color:var(--text-3)}
+details.bind[open]>summary{background:var(--surface-2);margin-bottom:var(--s4)}
 
 /* ------------------------------------------------------------------- кнопки */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;
@@ -346,7 +373,7 @@ stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
 @media (max-width:640px){
   body{padding:var(--s3) var(--s3) var(--s6);font-size:15px}
   .panel-b,.panel-h,.item,.step{padding-left:var(--s4);padding-right:var(--s4)}
-  .chat-h,.chat-body{padding-left:var(--s4);padding-right:var(--s4)}
+  .grp-h,.grp-row,.grp-p,.note{padding-left:var(--s4);padding-right:var(--s4)}
   .field{flex-direction:column;align-items:flex-start;gap:2px}
   .field-v{text-align:left}
   .item-a{width:100%;justify-content:flex-start}
@@ -395,8 +422,10 @@ _PATHS: dict[str, str] = {
                " M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16 M8 16H3v5",
     "link": "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"
             " M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71",
-    "unlink": "M18.84 12.25l1.72-1.71a5 5 0 0 0-7.07-7.07l-1.72 1.71 M5.17 11.75l-1.71 1.71a5"
-              " 5 0 0 0 7.07 7.07l1.71-1.71 M8 2v3 M2 8h3 M16 22v-3 M22 16h-3",
+    # Полукольца цепи и перечёркивание. Прежний вариант с четырьмя «искрами»
+    # вокруг разрыва при 15px сливался в нечитаемую кляксу (видно на скриншоте
+    # с прода): штрихи в 2–3px друг от друга экран такого размера не разрешает.
+    "unlink": "M9 17H7A5 5 0 0 1 7 7 M15 7h2a5 5 0 0 1 4 8 M8 12h4 M2 2l20 20",
     "plus": "M12 5v14 M5 12h14",
     "external": "M15 3h6v6 M10 14 21 3 M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
     "settings": "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06"
@@ -579,6 +608,52 @@ def row(title_html: str, *, sub_html: str = "", actions_html: str = "") -> str:
     как «список, 1 элемент» перед каждым чатом, и это чистый шум.
     """
     return f'<div class="item">{_row_inner(title_html, sub_html, actions_html)}</div>'
+
+
+def group(title: str, *, sub_html: str = "", actions_html: str = "",
+          body_html: str = "", icon_name: str = "chat") -> str:
+    """Раздел списка: сущность с шапкой (значок, имя, статус) и содержимым.
+
+    Общий паттерн вкладок «Чаты», «Подтверждение» и «Уведомления». До него
+    каждая собирала одни и те же классы руками, и правка вёрстки в одной
+    молча не доезжала до остальных.
+
+    Шапка отвечает на «что это и в каком оно состоянии», строки (`group_row`)
+    — «из чего оно состоит», `.grp-p` — «что с этим можно сделать». Плитка со
+    значком — не украшение: она делает разделы находимыми при беглом
+    просмотре списка, где все имена — текст одного кегля.
+    """
+    sub = f'<div class="grp-s">{sub_html}</div>' if sub_html else ""
+    body = f'<div class="grp-b">{body_html}</div>' if body_html else ""
+    return (f'<section class="grp"><div class="grp-h">'
+            f'<div class="grp-av">{icon(icon_name, 18)}</div>'
+            f'<div class="grp-hm"><h3 class="grp-t">{esc_html(title)}</h3>{sub}</div>'
+            f"{actions_html}</div>{body}</section>")
+
+
+def group_row(title_html: str, *, sub_html: str = "", actions_html: str = "",
+              icon_name: str = "folder") -> str:
+    """Строка раздела: значок типа сущности, название, действия у правого края."""
+    sub = f'<div class="grp-rs">{sub_html}</div>' if sub_html else ""
+    act = f'<div class="item-a">{actions_html}</div>' if actions_html else ""
+    return (f'<div class="grp-row"><div class="grp-m">'
+            f'<span class="grp-ico">{icon(icon_name, 15)}</span>'
+            f'<div><div class="grp-rt">{title_html}</div>{sub}</div></div>{act}</div>')
+
+
+_NOTE_ICONS = {"neutral": "info", "info": "info", "warn": "alert", "err": "x-circle"}
+
+
+def note(text: str, kind: str = "neutral", *, icon_name: str = "") -> str:
+    """Строка состояния раздела: объясняет, почему раздел такой, и что сделать.
+
+    Не banner: тот объявляет РЕЗУЛЬТАТ действия через aria-live, а здесь —
+    постоянное свойство («бот удалён из чата»), и произносить его скринридеру
+    при каждой отрисовке незачем.
+    """
+    kind = kind if kind in _NOTE_ICONS else "neutral"
+    ico = icon(icon_name or _NOTE_ICONS[kind], 15)
+    return f'<div class="note {kind}">{ico}<span>{esc_html(text)}</span></div>'
 
 
 def step(number: int, title: str, text: str, *, state: str = "todo",

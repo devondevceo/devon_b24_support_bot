@@ -99,17 +99,16 @@ def _project_row(session: str, active: str, project_id: int, name: str, client: 
                  stages: list[sync.Stage], can_manage: bool) -> str:
     enabled = bool(s and s.enabled)
     status = ui.badge("включено", "ok") if enabled else ui.badge("выключено", "neutral")
-    head = (f'<div class="chat-h"><div class="chat-meta">'
-           f'<span class="chat-name">{esc_html(name)}</span>'
-           f'<span class="chat-id">клиент {esc_html(client)}</span></div>{status}</div>')
+    sub = f"<span>клиент {esc_html(client)}</span>"
 
     if not can_manage:
-        return f'<div class="chat-block">{head}</div>'
+        return ui.group(name, sub_html=sub, actions_html=status, icon_name="folder")
 
     if not stages:
-        return (f'<div class="chat-block">{head}<div class="chat-body">'
-               + ui.hint("Стадии канбана этого проекта сейчас недоступны.")
-               + "</div></div>")
+        return ui.group(
+            name, sub_html=sub, actions_html=status, icon_name="folder",
+            body_html=ui.note("Стадии канбана этого проекта сейчас недоступны.",
+                              "warn"))
 
     resp_id = s.responsible_user_id if s else None
     member_opts = ['<option value="0">— выбрать человека —</option>']
@@ -164,7 +163,8 @@ def _project_row(session: str, active: str, project_id: int, name: str, client: 
         f"получит в личке с ботом кнопки «Подтвердить»/«Отклонить». Решение "
         f"передвинет задачу на выбранную стадию.</p>"
         f"</form>")
-    return f'<div class="chat-block">{head}<div class="chat-body">{body}</div></div>'
+    return ui.group(name, sub_html=sub, actions_html=status, icon_name="folder",
+                    body_html=f'<div class="grp-p">{body}</div>')
 
 
 # ------------------------------------------------------------------ сохранение

@@ -159,17 +159,18 @@ def _project_block(session: str, active: str, project: asyncpg.Record,
     own = p_ev is not None or p_min is not None
     badge = (ui.badge("своя настройка", "info") if own
              else ui.badge("как у теннанта", "neutral"))
-    head = (f'<div class="chat-h"><div class="chat-meta">'
-            f'<span class="chat-name">{esc_html(project["name"])}</span>'
-            f'<span class="chat-id">клиент {esc_html(project["client"])} · '
-            f'{esc_html(_summary(rules, "project"))}</span></div>{badge}</div>')
+    sub = (f"<span>клиент {esc_html(project['client'])}</span>"
+           f'<span aria-hidden="true">·</span>'
+           f'<span>{esc_html(_summary(rules, "project"))}</span>')
 
     if not can_manage:
-        return f'<div class="chat-block">{head}</div>'
+        return ui.group(str(project["name"]), sub_html=sub, actions_html=badge,
+                        icon_name="folder")
 
-    body = _details(f"Настроить проект «{project['name']}»",
-                    _scope_form(session, active, "project", pid, p_ev, p_min, rules,
-                                can_manage, inherited=tenant_rules))
+    body = "<div class=\"grp-p\">" + _details(
+        f"Настроить проект «{project['name']}»",
+        _scope_form(session, active, "project", pid, p_ev, p_min, rules,
+                    can_manage, inherited=tenant_rules)) + "</div>"
 
     for b in bindings:
         bid = int(b["id"])
@@ -181,19 +182,22 @@ def _project_block(session: str, active: str, project: asyncpg.Record,
         state = (ui.badge("своя настройка", "info")
                  if b_ev is not None or b_min is not None
                  else ui.badge("как у проекта", "neutral"))
+        # Строка чата и его раскрывашка — один блок .grp-u: разделители идут
+        # между чатами, а не между строкой и её же настройкой.
         body += (
-            f'<div class="proj"><div class="proj-m">'
-            f'<span class="proj-ico">{ui.icon("chat", 15)}</span>'
-            f'<div><div class="proj-t">{esc_html(chat_name)}{esc_html(topic)}</div>'
-            f'<div class="proj-s">{esc_html(_summary(chat_rules, "binding"))}</div></div>'
-            f'</div><div class="item-a">{state}</div></div>'
+            '<div class="grp-u">'
+            + ui.group_row(esc_html(chat_name) + esc_html(topic),
+                           sub_html=esc_html(_summary(chat_rules, "binding")),
+                           actions_html=state, icon_name="chat")
+            + '<div class="grp-p">'
             + _details(f"Настроить чат «{chat_name}»",
                        _scope_form(session, active, "binding", bid, b_ev, b_min,
-                                   chat_rules, can_manage, inherited=rules)))
+                                   chat_rules, can_manage, inherited=rules))
+            + "</div></div>")
     if not bindings:
-        body += ('<div class="proj-none">Чатов у проекта нет — настраивать пока '
-                 "нечего</div>")
-    return f'<div class="chat-block">{head}<div class="chat-body">{body}</div></div>'
+        body += ui.note("Чатов у проекта нет — настраивать пока нечего.")
+    return ui.group(str(project["name"]), sub_html=sub, actions_html=badge,
+                    icon_name="folder", body_html=body)
 
 
 def _details(summary: str, body: str) -> str:
