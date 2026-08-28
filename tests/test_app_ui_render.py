@@ -77,6 +77,8 @@ def assert_no_injection(html: str) -> None:
     lambda: ui.panel(EVIL, "тело"),
     lambda: ui.link_button("https://t.me/bot", EVIL),
     lambda: ui.goto_button("chats", EVIL),
+    lambda: ui.group(EVIL),
+    lambda: ui.note(EVIL, "warn"),
 ])
 def test_components_escape_hostile_text(render: object) -> None:
     assert_no_injection(render())  # type: ignore[operator]
@@ -92,6 +94,16 @@ def test_html_suffix_marks_the_boundary_of_responsibility() -> None:
     assert "<b>жирный</b>" in ui.item("<b>жирный</b>")
     assert_no_injection(ui.item(esc_html(EVIL), sub_html=esc_html(EVIL)))
     assert_no_injection(ui.row(esc_html(EVIL), sub_html=esc_html(EVIL)))
+    assert_no_injection(ui.group_row(esc_html(EVIL), sub_html=esc_html(EVIL)))
+    assert_no_injection(ui.group(EVIL, sub_html=esc_html(EVIL)))
+
+
+def test_note_is_a_property_not_an_announcement() -> None:
+    """У note нет aria-live: это постоянное свойство раздела, а не результат
+    действия. banner остаётся единственным говорящим компонентом."""
+    html = ui.note("Бот удалён из этого чата.", "err")
+    assert "aria-live" not in html
+    assert "role=" not in html
 
 
 def test_action_form_escapes_label_and_fields() -> None:
@@ -185,12 +197,75 @@ def test_bind_form_locks_client_when_chat_already_has_one() -> None:
     assert "Ромашка" not in html                     # чужие клиенты не предлагаются
 
 
-def test_project_row_title_and_client_are_separate_blocks() -> None:
-    """Спаны здесь однажды склеились в «Devon SD BOTклиент Devon SD BOT»."""
-    html = app_ui._project_row(EVIL, EVIL)
-    assert '<div class="proj-t">' in html
-    assert '<div class="proj-s">' in html
+def _binding(**over: object) -> dict[str, object]:
+    base: dict[str, object] = {"id": 5, "chat_ref": 1, "project_id": 2,
+                               "project": "Проект", "b24_group_id": 12,
+                               "client_id": 3, "client": "Линия Жизни"}
+    base.update(over)
+    return base
+
+
+_PORTAL = [{"id": 12, "name": "Проект", "role": "A", "extranet": False},
+           {"id": 15, "name": "Другой", "role": "A", "extranet": False}]
+
+
+def test_chat_section_escapes_hostile_names() -> None:
+    """Название чата ставит его создатель, проекта и клиента — портал."""
+    html = app_ui._chat_section(
+        _chat(), [_binding(project=EVIL, client=EVIL)], _PORTAL, set(), [],
+        "sess", "chats", True)
     assert_no_injection(html)
+
+
+def test_chat_section_names_client_once_in_the_header() -> None:
+    """Один чат — один клиент, поэтому клиент назван в шапке чата, а не под
+    каждым проектом: повтор «Devon SD BOT · клиент Devon SD BOT» на каждой
+    строке читался как сбой вёрстки."""
+    chat = _chat()
+    chat["title"] = "Чат"
+    html = app_ui._chat_section(
+        chat, [_binding(project="Проект А"), _binding(id=6, project="Проект Б")],
+        _PORTAL, set(), [], "sess", "chats", False)
+    assert html.count("клиент") == 1
+    # Имя, клиент и id — разные элементы: склейка без пробела невозможна.
+    assert '<h3 class="grp-t">Чат</h3>' in html
+    assert "<span>клиент Линия Жизни</span>" in html
+    assert '<span class="grp-id tnum">' in html
+
+
+def test_chat_section_left_chat_explains_the_fix_not_the_projects() -> None:
+    """Прежний текст «проектов пока нет» рассказывал про проекты, когда
+    проблема была в боте. И формы привязки у такого чата нет."""
+    chat = _chat()
+    chat["status"] = "left"
+    html = app_ui._chat_section(chat, [], _PORTAL, set(), [], "sess", "chats", True)
+    assert "Верните бота в группу" in html
+    assert "<details" not in html
+    html_bound = app_ui._chat_section(chat, [_binding()], _PORTAL, set(), [],
+                                      "sess", "chats", True)
+    assert "привязки и настройки сохранились" in html_bound
+
+
+def test_chat_section_unbound_chat_states_the_consequence() -> None:
+    html = app_ui._chat_section(_chat(), [], _PORTAL, set(), [], "sess", "chats", True)
+    assert "некуда создавать" in html
+    assert '<details class="bind" open>' in html  # привязка — следующий шаг
+
+
+@pytest.mark.parametrize(("status", "bound", "kind", "label"), [
+    ("active", True, "ok", "работает"),
+    ("claimed", True, "ok", "подключён"),
+    ("active", False, "warn", "без проекта"),
+    ("unclaimed", False, "warn", "без проекта"),
+    ("left", True, "err", "бот удалён из чата"),
+    ("left", False, "err", "бот удалён из чата"),
+])
+def test_chat_state_is_honest_about_usability(status: str, bound: bool,
+                                              kind: str, label: str) -> None:
+    """Зелёное «работает» у чата, из которого нельзя создать задачу, — это
+    два противоположных ответа на экране разом."""
+    got_label, got_kind = app_ui._chat_state(status, bound)
+    assert (got_label, got_kind) == (label, kind)
 
 
 # --------------------------------------------------------------------- вкладки

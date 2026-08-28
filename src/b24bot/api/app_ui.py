@@ -583,69 +583,103 @@ async def _chats_block(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
     for b in bindings:
         by_chat.setdefault(b["chat_ref"], []).append(b)
 
-    state = {
-        "unclaimed": ("не привязан", "warn"),
-        "claimed": ("подключён", "ok"),
-        "active": ("работает", "ok"),
-        "left": ("бот удалён из чата", "err"),
-    }
-
-    out = []
-    for ch in chats:
-        label, kind = state.get(ch["status"], (str(ch["status"]), "neutral"))
-        chat_name = ch["title"] or f"чат {ch['chat_id']}"
-        forum = " · форум" if ch["is_forum"] else ""
-        head = (f'<div class="chat-h"><div class="chat-meta">'
-                f'<span class="chat-name">{esc_html(chat_name)}</span>'
-                f'<span class="chat-id tnum">{esc_html(ch["chat_id"])}'
-                f"{esc_html(forum)}</span></div>{ui.badge(label, kind)}</div>")
-
-        linked = by_chat.get(ch["id"], [])
-        rows = []
-        for b in linked:
-            btn = ""
-            if is_admin:
-                btn = ui.action_form(
-                    "/b24/app/chat",
-                    {"session": session, "action": "unbind", "binding_id": b["id"],
-                     "tab": active},
-                    "Отвязать", variant="danger", icon_name="unlink",
-                    confirm=f"Отвязать проект «{b['project']}» от чата "
-                            f"«{chat_name}»?\n\nЗадачи из этого чата больше не будут "
-                            f"попадать в проект.")
-            rows.append(_project_row(str(b["project"]), str(b["client"]), btn))
-        if not linked:
-            rows.append('<div class="proj-none">Проектов пока нет — задачи из '
-                        "этого чата создать нельзя</div>")
-
-        form = ""
-        if is_admin and ch["status"] != "left":
-            form = _bind_form(ch, linked, portal, known_ids, clients, session, active)
-
-        out.append(f'<div class="chat-block">{head}'
-                   f'<div class="chat-body">{"".join(rows)}{form}</div></div>')
+    sections = "".join(
+        _chat_section(ch, by_chat.get(ch["id"], []), portal, known_ids, clients,
+                      session, active, is_admin)
+        for ch in chats)
 
     err = ui.banner(esc_html(portal_error), "warn") if portal_error else ""
-    tail = ("" if is_admin else
-            ui.hint("Управлять привязками может администратор портала."))
+    # Кнопки «добавить чат» нет намеренно (принадлежность подтверждается
+    # присутствием бота), но человек, ищущий её, обязан узнать это здесь,
+    # а не сдаться после осмотра всех углов экрана.
+    tail = ui.hint("Новый чат появляется здесь сам, как только Telegram-бота "
+                   "добавят в группу.")
+    if not is_admin:
+        tail += ui.hint("Управлять привязками может администратор портала.")
     note = (f'<span class="panel-note tnum">чатов: {len(chats)} · '
             f"привязок: {len(bindings)}</span>")
-    return err + ui.panel("Чаты и проекты", "".join(out), icon_name="chat",
+    return err + ui.panel("Чаты и проекты", sections, icon_name="chat",
                           flush=True, actions_html=note, footer_html=tail)
 
 
-def _project_row(project: str, client: str, actions_html: str = "") -> str:
-    """Строка проекта под чатом.
+def _chat_state(status: str, has_bindings: bool) -> tuple[str, str]:
+    """Статус чата глазами пользователя, а не таблицы tg_chats.
 
-    Название и клиент — блочными элементами, а не спанами: спаны здесь однажды
-    склеились в «Devon SD BOTклиент Devon SD BOT» без единого пробела, потому
-    что стили писались под блоки, а разметка была инлайновой.
+    «Работает» у чата без единой привязки — уверенная неправда: бот в чате
+    есть, а задачи создавать некуда. Прежняя вкладка показывала зелёный статус
+    и серую строку «проектов пока нет» рядом — два противоположных ответа на
+    один вопрос. Статус присутствия бота и статус пригодности к работе здесь
+    сведены в один честный: без проекта чат не работает, каким бы живым ни
+    был бот.
     """
-    act = f'<div class="item-a">{actions_html}</div>' if actions_html else ""
-    return (f'<div class="proj"><div class="proj-m">'
-            f'<span class="proj-ico">{ui.icon("folder", 15)}</span>'
-            f'<div><div class="proj-t">{esc_html(project)}</div>'
-            f'<div class="proj-s">клиент {esc_html(client)}</div></div></div>{act}</div>')
+    if status == "left":
+        return "бот удалён из чата", "err"
+    if not has_bindings:
+        return "без проекта", "warn"
+    if status == "claimed":
+        return "подключён", "ok"
+    if status == "active":
+        return "работает", "ok"
+    return status, "neutral"
+
+
+def _chat_section(ch: asyncpg.Record, linked: list[asyncpg.Record],
+                  portal: list[dict[str, Any]], known_ids: set[int],
+                  clients: list[asyncpg.Record], session: str, active: str,
+                  is_admin: bool) -> str:
+    """Раздел одного чата: шапка с клиентом, строки проектов, форма привязки.
+
+    Клиент назван один раз в шапке, а не на каждой строке проекта: один чат
+    обслуживает ровно одного клиента (доменная модель), и повтор
+    «Devon SD BOT · клиент Devon SD BOT» под каждым проектом читался как сбой
+    вёрстки, а не как информация.
+
+    У чата, из которого бота удалили, вместо формы привязки — что случилось и
+    что сделать: прежний текст «проектов пока нет» рассказывал про проекты,
+    когда проблема была в боте.
+    """
+    label, kind = _chat_state(str(ch["status"]), bool(linked))
+    chat_name = str(ch["title"] or f"чат {ch['chat_id']}")
+
+    sub_bits: list[str] = []
+    if linked:
+        sub_bits.append(f"<span>клиент {esc_html(linked[0]['client'])}</span>")
+    sub_bits.append(f'<span class="grp-id tnum">{esc_html(ch["chat_id"])}</span>')
+    if ch["is_forum"]:
+        sub_bits.append("<span>форум</span>")
+    sub = '<span aria-hidden="true">·</span>'.join(sub_bits)
+
+    rows: list[str] = []
+    for b in linked:
+        btn = ""
+        if is_admin:
+            btn = ui.action_form(
+                "/b24/app/chat",
+                {"session": session, "action": "unbind", "binding_id": b["id"],
+                 "tab": active},
+                "Отвязать", variant="danger", icon_name="unlink",
+                confirm=f"Отвязать проект «{b['project']}» от чата "
+                        f"«{chat_name}»?\n\nЗадачи из этого чата больше не будут "
+                        f"попадать в проект.")
+        rows.append(ui.group_row(esc_html(str(b["project"])), actions_html=btn,
+                                 icon_name="folder"))
+
+    body = "".join(rows)
+    if str(ch["status"]) == "left":
+        body += ui.note(
+            "Верните бота в группу в Telegram"
+            + (" — привязки и настройки сохранились." if linked
+               else ", затем привяжите проект."))
+    elif not linked:
+        body += ui.note("Чат не привязан к проекту — задачи из него пока "
+                        "некуда создавать.")
+
+    if is_admin and str(ch["status"]) != "left":
+        form = _bind_form(ch, linked, portal, known_ids, clients, session, active)
+        body += f'<div class="grp-p">{form}</div>'
+
+    return ui.group(chat_name, sub_html=sub, actions_html=ui.badge(label, kind),
+                    body_html=body, icon_name="chat")
 
 
 def _bind_form(chat: asyncpg.Record, linked: list[asyncpg.Record],
