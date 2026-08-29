@@ -15,7 +15,7 @@ import argparse
 import pathlib
 import tempfile
 
-from b24bot.api import app_approval, app_ui
+from b24bot.api import app_approval, app_tag, app_ui
 from b24bot.api import ui_kit as ui
 from b24bot.domain import approvals, sync
 
@@ -90,6 +90,15 @@ def build() -> str:
             None, [], stages, False),
         icon_name="check-circle", flush=True)
 
+    # Тег поддержки во всех трёх состояниях: настроен и проход был; настроен,
+    # но прохода не было (предупреждение); выключен (кнопка прохода неактивна).
+    tag_panels = "".join(
+        app_tag.panel(tag, synced, created, True, SESSION, "bot")
+        for tag, synced, created in (("tg-support", True, 128),
+                                     ("tg-support", False, 128),
+                                     ("", False, 0)))
+    tag_ro = app_tag.panel("tg-support", True, 128, False, SESSION, "bot")
+
     tabs = app_ui._tabs_html("chats", [
         ("overview", "Обзор", "info", 0),
         ("chats", "Чаты", "chat", 4),
@@ -108,7 +117,8 @@ def build() -> str:
             + app_ui._panel_html(
                 "chats", "chats",
                 chats_admin + '<div class="divider"></div>' + chats_ro
-                + '<div class="divider"></div>' + approval_panel))
+                + '<div class="divider"></div>' + approval_panel
+                + '<div class="divider"></div>' + tag_panels + tag_ro))
 
     html = app_ui.page(body, None).body.decode("utf-8")
     # BX24-скрипт с file:// не грузится и превью не нужен.

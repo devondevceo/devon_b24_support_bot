@@ -61,6 +61,8 @@ COMMANDS: tuple[Command, ...] = (
             (GROUPS, ADMINS), "Задачи", args="<номер> [текст]"),
     Command("discussion", "показать обсуждение задачи", (GROUPS, ADMINS), "Задачи",
             args="<номер>"),
+    Command("time", "списать время в задачу", (GROUPS, ADMINS), "Задачи",
+            args="<номер> <время> [комментарий]"),
     Command("cancel", "прервать начатый опрос", (GROUPS, ADMINS), "Задачи"),
     Command("digest", "сводка сейчас и настройка утренней рассылки",
             (GROUPS, ADMINS), "Задачи"),

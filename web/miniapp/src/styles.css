@@ -1333,6 +1333,76 @@ code {
 @keyframes fade { from { opacity: 0; } }
 @keyframes rise { from { transform: translateY(100%); } }
 
+/* ================================================================ списания */
+/* Значение «Трудозатраты» в карточке — вход в лист списаний. Кнопкой, а не
+   ссылкой: действия у неё нет адреса. Цель тянется на всю строку — 44px по
+   высоте набирается за счёт padding, а не за счёт кегля. */
+.fact-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.fact-link > svg { color: var(--text-2); }
+
+.timelog-total {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  color: var(--text-2);
+  margin: 0 0 var(--sp-5);
+}
+
+.timelog-total strong { color: var(--text); font-size: var(--fs-lg); }
+
+.timelog-list {
+  list-style: none;
+  margin: 0 0 var(--sp-6);
+  padding: 0;
+}
+
+.timelog-list > li {
+  padding: var(--sp-4) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.timelog-list > li:last-child { border-bottom: 0; }
+
+/* Длительность первой и моноширинно: колонка чисел читается сверху вниз,
+   а имя переносится, если длинное. */
+.timelog-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.timelog-row .who { flex: 1 1 auto; min-width: 0; }
+
+.timelog-comment {
+  color: var(--text-2);
+  font-size: var(--fs-md);
+  margin-top: var(--sp-2);
+  overflow-wrap: break-word;
+}
+
+.preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-6);
+}
+
+.preset-row .btn { flex: 0 0 auto; }
+
 /* ====================================================== снижение движения */
 /*
  * Всё движение — только transform и opacity, поэтому выключается разом.

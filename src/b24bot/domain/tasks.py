@@ -234,6 +234,9 @@ def preset_deadline(kind: str, offset: timedelta, *, now: datetime | None = None
 
 
 # --------------------------------------------------------------- справочники
+BATCH_USERS = 50  # столько команд принимает один batch портала
+
+
 async def group_members(client: B24Client, group_id: int, *, limit: int = 100
                         ) -> list[dict[str, Any]]:
     """Участники проекта с именами. Порядок: сначала владельцы и модераторы.
@@ -273,6 +276,29 @@ async def group_members(client: B24Client, group_id: int, *, limit: int = 100
             "role": roles.get(uid, ""),
         })
     out.sort(key=lambda m: (m["role"] not in ("A", "E"), m["name"].lower()))
+    return out
+
+
+async def user_names(client: B24Client, ids: list[int]) -> dict[int, str]:
+    """Имена пользователей портала одним batch-ом.
+
+    Отдельно от `group_members`, потому что спрашивают о разном: там — «кто в
+    проекте», здесь — «как зовут вот этих». В списаниях времени встречаются и
+    те, кого в проекте уже нет: человек ушёл, а его часы остались.
+    """
+    unique = sorted({int(i) for i in ids if i})
+    if not unique:
+        return {}
+    fetched = await client.call_many(
+        [(f"u{uid}", "user.get", {"ID": uid}) for uid in unique[:BATCH_USERS]])
+    out: dict[int, str] = {}
+    for uid in unique[:BATCH_USERS]:
+        rows = fetched.get(f"u{uid}") or []
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        name = ""
+        if isinstance(row, dict):
+            name = " ".join(str(row.get(k) or "") for k in ("NAME", "LAST_NAME")).strip()
+        out[uid] = name or f"пользователь {uid}"
     return out
 
 

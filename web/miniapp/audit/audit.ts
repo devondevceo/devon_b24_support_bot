@@ -285,6 +285,17 @@ function audit(): { findings: Finding[]; checked: Record<string, number> } {
     }
   }
 
+  // Экран, который не удалось довести нажатием до нужного состояния, померен
+  // не тот. Это находка стенда, а не мелочь: «чисто» тогда относится к другому.
+  for (const frame of document.querySelectorAll<HTMLElement>('[data-undriven]')) {
+    findings.push({
+      kind: 'undriven',
+      screen: frame.dataset.screen ?? '?',
+      detail: 'кнопка не найдена, экран не доведён до нужного состояния',
+      value: frame.dataset.undriven ?? '',
+    })
+  }
+
   return { findings, checked: counts }
 }
 

@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from b24bot.api.app_approval import router as approval_router
 from b24bot.api.app_notify import router as notify_router
 from b24bot.api.app_survey import router as survey_router
+from b24bot.api.app_tag import router as tag_router
 from b24bot.api.app_ui import router as app_router
 from b24bot.api.b24 import router as b24_router
 from b24bot.api.miniapp import ApiError, error_response, portal_failure
@@ -62,6 +63,7 @@ app.include_router(app_router)
 app.include_router(survey_router)
 app.include_router(approval_router)
 app.include_router(notify_router)
+app.include_router(tag_router)
 app.include_router(tg_router)
 app.include_router(miniapp_router)
 

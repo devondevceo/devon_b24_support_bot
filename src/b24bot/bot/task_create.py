@@ -18,7 +18,7 @@ from b24bot.b24 import errors
 from b24bot.b24.client import B24Client
 from b24bot.core.text import esc_bbcode
 from b24bot.db.pool import pool
-from b24bot.domain import approvals
+from b24bot.domain import approvals, support_tag
 from b24bot.domain.context import ProjectRef
 
 log = logging.getLogger(__name__)
@@ -95,6 +95,14 @@ async def find_existing(client: B24Client, idem_key: str) -> dict[str, Any] | No
     return tasks[0] if tasks else None
 
 
+def _tags(draft: Draft, support: str) -> list[str]:
+    """Ключ идемпотентности, теги из ответов опросника и тег поддержки."""
+    out = [draft.idem_key, *(draft.fields.get("TAGS") or [])]
+    if support and support not in out:
+        out.append(support)
+    return out
+
+
 async def create(client: B24Client, tenant_id: int, project: ProjectRef, draft: Draft,
                  responsible_id: int) -> tuple[dict[str, Any], bool]:
     """Создать задачу. Возвращает (задача, была_ли_создана_сейчас).
@@ -116,6 +124,12 @@ async def create(client: B24Client, tenant_id: int, project: ProjectRef, draft: 
 
     # Поля опросника кладём первыми: наши обязательные их перекрывают, а не
     # наоборот. Иначе вопрос, привязанный к GROUP_ID, унёс бы задачу в чужой проект.
+    # Тег поддержки ставится ЗДЕСЬ, а не в каждой точке входа: `create()` —
+    # единственная дверь в `tasks.task.add`, и через неё идут и чат, и опросник,
+    # и полная форма мини-аппа. Разложи это по вызывающим — и первая же новая
+    # дверь завела бы задачу без тега, то есть мимо отчёта, никак себя не выдав.
+    tag = await support_tag.get(tenant_id)
+
     fields: dict[str, Any] = dict(draft.fields)
     fields.update({
         "TITLE": draft.title,
@@ -123,8 +137,10 @@ async def create(client: B24Client, tenant_id: int, project: ProjectRef, draft: 
         "DESCRIPTION_IN_BBCODE": "Y",
         "RESPONSIBLE_ID": draft.responsible_id or responsible_id,
         "GROUP_ID": project.b24_group_id,
-        # Тег идемпотентности обязан уцелеть рядом с тегами из ответов (И-10).
-        "TAGS": [draft.idem_key, *(draft.fields.get("TAGS") or [])],
+        # Тег идемпотентности обязан уцелеть рядом с тегами из ответов (И-10)
+        # и рядом с тегом поддержки. Дубли портал схлопывает сам, но и мы не шлём:
+        # тег поддержки мог приехать из ответа опросника.
+        "TAGS": _tags(draft, tag),
     })
     # Поля полной формы мини-аппа. Портал принимает их прямо при создании —
     # проверено записью (§9.1). Пустые значения не шлём вовсе: пустой DEADLINE

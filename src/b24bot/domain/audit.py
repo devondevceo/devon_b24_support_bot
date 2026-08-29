@@ -25,6 +25,10 @@ HIGH_RISK = frozenset({
     "user.map",
     "task.responsible.change", "task.complete", "task.defer",
     "task.approval.confirm", "task.approval.reject",
+    # Разовый проход правит ТЕГИ СОТЕН чужих задач одним нажатием. Смена самого
+    # тега рядом: она бесшумно меняет, что попадает в отчёт по трудозатратам,
+    # и вопрос «почему цифры другие» без этой записи не разобрать.
+    "tenant.support_tag.set", "tenant.support_tag.backfill",
     "report.export",
 })
 

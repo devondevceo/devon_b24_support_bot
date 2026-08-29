@@ -54,7 +54,7 @@ export const CARD = {
   description:
     'Воспроизводится с 14 августа у всех операторов дневной смены.\n\nШаги: ЭДО → Отчёты → Контрагенты → Выгрузить. Крутится и падает по таймауту.',
   accomplices: [], auditors: [], tags: ['эдо', 'срочно'],
-  allowed: ['complete', 'pause', 'defer', 'edit'],
+  allowed: ['complete', 'pause', 'defer', 'edit', 'elapsedtime.add'],
   changed_date: '2026-08-18T10:00:00+03:00', stage_title: 'Выполняются',
   time_spent: 19800, portal_url: 'https://devondev.bitrix24.ru/company/personal/user/1/tasks/task/view/233/',
 }
@@ -144,7 +144,25 @@ const ROUTES: Record<string, unknown> = {
     ],
     total_seconds: 72000, task_count: 7, entry_count: 79,
     complete: false, seen: 60, total_on_portal: 79,
+    split_by_tag: true, support_tag: 'tg-support',
+    all_seconds: 104400, all_task_count: 9, all_entry_count: 91,
     projects: [{ id: 1, name: 'Линия Жизни Битрикс24', client: 'Линия Жизни' }],
+  },
+  '/api/miniapp/tasks/233/timelog': {
+    total_seconds: 19800,
+    // Неполный список — состояние, у которого своя строка на экране.
+    complete: false,
+    items: [
+      { id: 189, seconds: 10800, user_id: 1, user_name: 'Иванов Иван',
+        at: '2026-08-27T10:00:00+03:00', comment: 'разбор логов выгрузки' },
+      { id: 187, seconds: 5400, user_id: 3, user_name: 'Мария Орлова',
+        at: '2026-08-28T14:20:00+03:00', comment: '' },
+    ],
+    presets: [
+      { seconds: 900, label: '15 м' }, { seconds: 1800, label: '30 м' },
+      { seconds: 3600, label: '1 ч' }, { seconds: 7200, label: '2 ч' },
+      { seconds: 14400, label: '4 ч' }, { seconds: 28800, label: '8 ч' },
+    ],
   },
   '/api/miniapp/surveys': {
     items: [

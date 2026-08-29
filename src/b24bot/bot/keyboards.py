@@ -153,6 +153,11 @@ def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str,
     if "edit" in allowed and "stage" in tokens:
         second.insert(0, cb("e", tokens["stage"], "📂 Стадия"))
     rows.append(second)
+    # Списание времени — своё право портала (`elapsedtime.add` в блоке `action`,
+    # проверено 29.08.2026), а не производная от `edit`: время можно списать и в
+    # закрытую задачу, и тому, кому правка полей не разрешена.
+    if "elapsedtime.add" in allowed and "timelog" in tokens:
+        rows.append([cb("tl", tokens["timelog"], "⏱ Списать время")])
     links: list[Button] = [url_button("🔗 Открыть в Б24", portal_url)]
     if app_url:
         links.append(url_button("🧩 Приложение", app_url))
@@ -182,6 +187,30 @@ def edit_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, A
     if app_url:
         rows.append([url_button("🧩 Изменить в приложении", app_url)])
     rows.append([cb("e", tokens["back"], "◀️ К карточке")])
+    return inline(rows)
+
+
+def timelog_menu(items: list[tuple[str, str]], back: str,
+                 app_url: str | None = None) -> dict[str, Any]:
+    """Быстрые длительности по три в ряд плюс путь к произвольной.
+
+    Свободного ввода в группе нет по той же причине, что и у правки полей: бот не
+    умеет ждать ответа одного человека, не перехватывая чужие реплики. Поэтому
+    произвольная длительность — это команда `/time`, и о ней сказано текстом, а
+    не оставлено на догадку.
+    """
+    rows: Rows = []
+    row: list[Button] = []
+    for token, label in items:
+        row.append(cb("tl", token, label))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if app_url:
+        rows.append([url_button("🧩 Другое время — в приложении", app_url)])
+    rows.append([cb("tl", back, "◀️ К карточке")])
     return inline(rows)
 
 
