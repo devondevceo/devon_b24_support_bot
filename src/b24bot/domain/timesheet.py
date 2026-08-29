@@ -27,6 +27,7 @@ from typing import Any
 from b24bot.b24 import errors, mapping
 from b24bot.b24.client import B24Client
 from b24bot.b24.limiter import Lane
+from b24bot.domain import support_tag
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ class TaskRef:
     title: str
     status: int
     stage_id: int
+    is_support: bool = False
+    """Помечена ли задача тегом поддержки (`tenants.support_tag`)."""
 
 
 @dataclass
@@ -73,12 +76,21 @@ class Report:
     by_status: list[Bucket]
     by_stage: list[Bucket]
     total_seconds: int
+    """Итог по РАЗРЕЗАМ: поддержка, когда тег задан; всё, когда не задан."""
     task_count: int
     entry_count: int
     complete: bool
     """Видели ли мы все записи портала. False — сумма снизу, а не точная."""
     seen: int = 0
     total_on_portal: int = 0
+    split_by_tag: bool = False
+    """Задан ли тег поддержки. False — отчёт как раньше, одной суммой."""
+    all_seconds: int = 0
+    """Время по ВСЕМ задачам проектов, с тегом и без. Равно total_seconds,
+    когда тег не задан."""
+    all_task_count: int = 0
+    all_entry_count: int = 0
+    support_tag: str = ""
 
     @property
     def title(self) -> str:
@@ -111,7 +123,7 @@ def parse_entries(raw: Any) -> list[Entry]:
     return out
 
 
-def parse_tasks(raw: Any) -> list[TaskRef]:
+def parse_tasks(raw: Any, support: str = "") -> list[TaskRef]:
     tasks = raw.get("tasks", []) if isinstance(raw, dict) else raw
     out: list[TaskRef] = []
     for t in tasks or []:
@@ -122,7 +134,8 @@ def parse_tasks(raw: Any) -> list[TaskRef]:
             continue
         out.append(TaskRef(task_id, str(t.get("title") or ""),
                            mapping.as_int(t.get("status")) or 0,
-                           mapping.as_int(t.get("stageId")) or 0))
+                           mapping.as_int(t.get("stageId")) or 0,
+                           support_tag.has(t.get("tags"), support)))
     return out
 
 
@@ -149,8 +162,15 @@ def in_month(entry: Entry, year: int, month: int) -> bool:
 def aggregate(entries: list[Entry], tasks: dict[int, TaskRef],
               stage_titles: dict[int, str], *, year: int, month: int,
               complete: bool = True, seen: int = 0,
-              total_on_portal: int = 0) -> Report:
-    """Свод за месяц. Записи по задачам вне `tasks` не считаются вовсе."""
+              total_on_portal: int = 0, tag: str = "") -> Report:
+    """Свод за месяц. Записи по задачам вне `tasks` не считаются вовсе.
+
+    Когда тег поддержки задан, отчёт считает ДВЕ суммы: по задачам с тегом и по
+    всем задачам проектов. Разрезы по статусам и стадиям строятся только по
+    поддержке — вопрос, ради которого тег и заводился, звучит «сколько ушло на
+    поддержку», а не «сколько ушло на всё». Вторая сумма стоит рядом, чтобы
+    падение первой нельзя было принять за падение объёма работ вообще.
+    """
     from b24bot.bot.views import stage_label
 
     by_status: dict[int, Bucket] = {}
@@ -161,6 +181,9 @@ def aggregate(entries: list[Entry], tasks: dict[int, TaskRef],
     total = 0
     counted: set[int] = set()
     entry_count = 0
+    all_total = 0
+    all_counted: set[int] = set()
+    all_entries = 0
 
     for e in entries:
         if not in_month(e, year, month):
@@ -168,6 +191,11 @@ def aggregate(entries: list[Entry], tasks: dict[int, TaskRef],
         task = tasks.get(e.task_id)
         if task is None:
             continue  # чужой проект: область отчёта названа в шапке
+        all_total += e.seconds
+        all_counted.add(task.id)
+        all_entries += 1
+        if tag and not task.is_support:
+            continue  # в разрезы идёт только поддержка
         status = by_status.setdefault(
             task.status,
             Bucket(mapping.STATUS_TITLES.get(task.status, f"статус {task.status}")))
@@ -185,7 +213,10 @@ def aggregate(entries: list[Entry], tasks: dict[int, TaskRef],
         by_status=[b for _, b in sorted(by_status.items())],
         by_stage=_ordered_stages(by_stage, stage_titles),
         total_seconds=total, task_count=len(counted), entry_count=entry_count,
-        complete=complete, seen=seen, total_on_portal=total_on_portal)
+        complete=complete, seen=seen, total_on_portal=total_on_portal,
+        split_by_tag=bool(tag), all_seconds=all_total,
+        all_task_count=len(all_counted), all_entry_count=all_entries,
+        support_tag=tag)
 
 
 def _ordered_stages(buckets: dict[str, Bucket], stage_titles: dict[int, str]
@@ -240,9 +271,12 @@ class Snapshot:
     seen: int
     total_on_portal: int
     at: datetime
+    tag: str = ""
+    """Тег поддержки на момент снимка. Он же часть ключа кэша: сменили тег —
+    прежний снимок отвечает на другой вопрос и годиться перестал."""
 
 
-_cache: dict[tuple[int, tuple[int, ...]], Snapshot] = {}
+_cache: dict[tuple[int, tuple[int, ...], str], Snapshot] = {}
 
 
 async def snapshot(client: B24Client, tenant_id: int, group_ids: list[int], *,
@@ -252,21 +286,23 @@ async def snapshot(client: B24Client, tenant_id: int, group_ids: list[int], *,
     Кэш нужен не ради экономии вообще, а ради месяцев: человек листает их
     кнопками подряд, и каждый месяц — это срез одного и того же снимка.
     """
-    key = (tenant_id, tuple(sorted(group_ids)))
+    tag = await support_tag.get(tenant_id)
+    key = (tenant_id, tuple(sorted(group_ids)), tag)
     hit = _cache.get(key)
     if hit is not None and not force and _now() - hit.at < CACHE_TTL:
         return hit
 
-    tasks = await _fetch_tasks(client, group_ids)
+    tasks = await _fetch_tasks(client, group_ids, tag)
     entries, seen, total = await _fetch_entries(client)
     snap = Snapshot(tasks=tasks, entries=entries,
                     complete=(total == 0 or seen >= total),
-                    seen=seen, total_on_portal=total, at=_now())
+                    seen=seen, total_on_portal=total, at=_now(), tag=tag)
     _cache[key] = snap
     return snap
 
 
-async def _fetch_tasks(client: B24Client, group_ids: list[int]) -> dict[int, TaskRef]:
+async def _fetch_tasks(client: B24Client, group_ids: list[int],
+                       tag: str = "") -> dict[int, TaskRef]:
     """ВСЕ задачи проектов, включая закрытые: время списывают и на них.
 
     Постраничность здесь честная (метод современный), но защита от повтора всё
@@ -280,11 +316,11 @@ async def _fetch_tasks(client: B24Client, group_ids: list[int]) -> dict[int, Tas
     for page in range(MAX_TASK_PAGES):
         res = await client.call("tasks.task.list", {
             "filter": {"GROUP_ID": group_ids},
-            "select": ["ID", "TITLE", "STATUS", "STAGE_ID", "GROUP_ID"],
+            "select": ["ID", "TITLE", "STATUS", "STAGE_ID", "GROUP_ID", "TAGS"],
             "order": {"ID": "asc"},
             "start": page * PAGE,
         }, lane=Lane.INTERACTIVE)
-        chunk = parse_tasks(res)
+        chunk = parse_tasks(res, tag)
         if not chunk or (previous_first is not None and chunk[0].id == previous_first):
             break
         previous_first = chunk[0].id

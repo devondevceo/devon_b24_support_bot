@@ -77,6 +77,11 @@ const SCREENS: { name: string; node: React.ReactNode; click?: string }[] = [
     click: 'Изменить',
   },
   {
+    name: 'Списание времени',
+    node: <TaskCardScreen context={CONTEXT} taskId={233} onBack={noop} />,
+    click: '5 ч 30 мин',
+  },
+  {
     name: 'Меню разделов',
     node: (
       <TaskList
@@ -130,6 +135,7 @@ for (const screen of SCREENS) {
   frame.appendChild(host)
   gallery.appendChild(frame)
 
+  if (screen.click) frame.dataset.undriven = screen.click
   createRoot(host).render(screen.node)
 }
 
@@ -147,8 +153,15 @@ function drive(): void {
       (b.textContent ?? '').includes(screen.click!) ||
       (b.getAttribute('aria-label') ?? '').includes(screen.click!),
     )
-    if (button) button.click()
-    else console.warn('не нашлась кнопка', screen.click, 'на экране', screen.name)
+    if (button) {
+      button.click()
+      frame?.removeAttribute('data-undriven')
+    } else {
+      // Отметка снимается только удавшимся нажатием. Без неё промах был бы
+      // виден лишь предупреждением в консоли страницы, которую раннер не
+      // читает: стенд отчитался бы «чисто», померив экран, так и не открытый.
+      frame?.setAttribute('data-undriven', screen.click)
+    }
   }
 }
 

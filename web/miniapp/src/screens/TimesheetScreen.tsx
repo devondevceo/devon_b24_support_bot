@@ -94,7 +94,10 @@ export function TimesheetScreen({ context, onBack }: Props) {
           {loading ? <Refreshing label="Пересчитываем месяц" /> : null}
 
           <div className="task-hero">
-            <div className="id">{data.title}</div>
+            <div className="id">
+              {data.title}
+              {data.split_by_tag ? <> · тег {data.support_tag}</> : null}
+            </div>
             <h2 className="num">{duration(data.total_seconds)}</h2>
             <div className="pill-row">
               <Pill icon="folder" tone="plain">
@@ -105,6 +108,28 @@ export function TimesheetScreen({ context, onBack }: Props) {
               </Pill>
             </div>
           </div>
+
+          {/*
+           * Вторая сумма. Тег стоит только на задачах, заведённых через бота, —
+           * значит первая сумма меньше второй ровно на ту работу, которую вели
+           * мимо нас. Без этой строки её падение читается как потеря данных.
+           */}
+          {data.split_by_tag ? (
+            <dl className="card">
+              <div className="fact">
+                <dt>Поддержка</dt>
+                <dd className="num">{duration(data.total_seconds)}</dd>
+              </div>
+              <div className="fact">
+                <dt>Всего по проектам</dt>
+                <dd className="num">{duration(data.all_seconds)}</dd>
+              </div>
+              <div className="fact">
+                <dt>Мимо поддержки</dt>
+                <dd className="num">{duration(data.all_seconds - data.total_seconds)}</dd>
+              </div>
+            </dl>
+          ) : null}
 
           {/*
            * Честность про полноту выборки. Постраничность
@@ -126,8 +151,16 @@ export function TimesheetScreen({ context, onBack }: Props) {
           {data.total_seconds === 0 ? (
             <Empty
               icon="timer"
-              title="За этот месяц времени не списывали"
-              hint="Выберите другой месяц или отметьте время в Битрикс24."
+              title={
+                data.split_by_tag && data.all_entry_count > 0
+                  ? 'За этот месяц по задачам поддержки времени не списывали'
+                  : 'За этот месяц времени не списывали'
+              }
+              hint={
+                data.split_by_tag && data.all_entry_count > 0
+                  ? `По остальным задачам проектов — ${duration(data.all_seconds)}. Задачи помечаются тегом ${data.support_tag}, только если заведены через бота.`
+                  : 'Выберите другой месяц или отметьте время в Битрикс24.'
+              }
             />
           ) : (
             <>

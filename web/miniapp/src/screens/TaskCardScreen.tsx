@@ -15,6 +15,7 @@ import { OVERDUE, priorityView, statusView } from '../status'
 import { tg } from '../telegram'
 import { Icon, type IconName } from '../ui/Icon'
 import { AppBar, IconButton, Pill, Sheet } from '../ui/parts'
+import { TimelogSheet } from './TimelogSheet'
 import { PRIORITY_TITLES, type Comment, type Context, type Member, type TaskCard } from '../types'
 
 type Props = { context: Context; taskId: number; onBack: () => void }
@@ -40,6 +41,7 @@ export function TaskCardScreen({ context, taskId, onBack }: Props) {
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<{ kind: 'ok' | 'warn' | 'err'; text: string } | null>(null)
   const [editing, setEditing] = useState(false)
+  const [timelog, setTimelog] = useState(false)
 
   const load = useCallback(() => {
     setError(null)
@@ -152,9 +154,16 @@ export function TaskCardScreen({ context, taskId, onBack }: Props) {
             )}
           </dd>
         </div>
+        {/* Трудозатраты — не просто факт, а вход в списание: строка кликабельна
+            целиком, потому что цель в 44px тут дороже лишней кнопки рядом. */}
         <div className="fact">
           <dt>Трудозатраты</dt>
-          <dd className="num">{duration(task.time_spent)}</dd>
+          <dd>
+            <button type="button" className="fact-link" onClick={() => setTimelog(true)}>
+              <span className="num">{duration(task.time_spent)}</span>
+              <Icon name="chevronRight" size={16} />
+            </button>
+          </dd>
         </div>
       </dl>
 
@@ -247,6 +256,16 @@ export function TaskCardScreen({ context, taskId, onBack }: Props) {
           }
         }}
       />
+
+      {timelog ? (
+        <TimelogSheet
+          context={context}
+          taskId={task.id}
+          canAdd={task.allowed.includes('elapsedtime.add')}
+          onClose={() => setTimelog(false)}
+          onLogged={(seconds) => setTask({ ...task, time_spent: seconds })}
+        />
+      ) : null}
 
       {editing ? (
         <EditSheet

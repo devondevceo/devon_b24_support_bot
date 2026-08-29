@@ -193,3 +193,23 @@ async def test_foreign_task_is_not_written(written: list[dict[str, Any]],
     reply = await handlers._task_action(_ctx(), TG_USER, TASK_ID, "complete")
     assert reply.text == texts.MSG_TASK_NOT_FOUND
     assert written == []
+
+
+# --------------------------------------------------------------- трудозатраты
+def test_time_logging_has_one_name_for_both_doors() -> None:
+    """Списание времени называется одинаково из бота и из мини-аппа.
+
+    У остальных действий имена сверяются списками: наборы там разные. Здесь
+    действие одно, и общая константа `timelog.AUDIT_ACTION` делает расхождение
+    невозможным по построению — тест сторожит, что литерал не вернулся обратно
+    в код по частям.
+    """
+    import inspect
+
+    from b24bot.domain import timelog
+
+    assert timelog.AUDIT_ACTION == "task.time.log"
+    for module in (handlers, api_miniapp):
+        source = inspect.getsource(module)
+        assert '"task.time.log"' not in source, module.__name__
+        assert "AUDIT_ACTION" in source, module.__name__

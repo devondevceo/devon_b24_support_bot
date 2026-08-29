@@ -332,16 +332,35 @@ def render_card(task: dict[str, Any], project: ProjectRef, *,
 
 
 def render_timesheet(report: Any, projects: list[ProjectRef]) -> str:
-    """Отчёт по трудозатратам: два разреза одной суммы.
+    """Отчёт по трудозатратам: два разреза одной суммы и, при заданном теге,
+    вторая сумма рядом.
 
     Разрезы обязаны сходиться между собой и с итогом — у задачи один статус и
     одна стадия. Если когда-нибудь разойдутся, это будет означать потерю времени
     по дороге, поэтому итог печатается один и считается один раз.
+
+    Сумм при этом две, и они НЕ обязаны совпадать: «Поддержка» — по задачам с
+    тегом, «Всего по проектам» — по всем задачам тех же проектов. Первая меньше
+    второй ровно на ту работу, которую завели не через бота.
     """
     head = " · ".join(esc_html(p.name) for p in projects) or "проекты чата"
-    lines = [f"⏱ <b>Трудозатраты · {esc_html(report.title)}</b>", head, ""]
+    lines = [f"⏱ <b>Трудозатраты · {esc_html(report.title)}</b>", head]
+    if report.split_by_tag:
+        lines.append("Разрезы — по задачам с тегом "
+                     f"<code>{esc_html(report.support_tag)}</code>")
+    lines.append("")
 
     if not report.entry_count:
+        if report.split_by_tag and report.all_entry_count:
+            # «Работы не было» и «работу вели мимо бота» — разные новости, и
+            # пустой отчёт без второй строки читается как первая, а верна вторая.
+            lines.append(
+                f"Списаний по задачам с тегом <code>{esc_html(report.support_tag)}</code>"
+                f" за этот месяц нет.")
+            lines.append(f"По остальным задачам проектов — "
+                         f"{fmt_duration(report.all_seconds)} · "
+                         f"{_tasks_word(report.all_task_count)}.")
+            return "\n".join(lines)
         lines.append("За этот месяц списаний времени нет.")
         return "\n".join(lines)
 
@@ -354,15 +373,63 @@ def render_timesheet(report: Any, projects: list[ProjectRef]) -> str:
         lines.append(f"  {esc_html(bucket.title)} — {fmt_duration(bucket.seconds)}"
                      f" · {_tasks_word(len(bucket.tasks))}")
 
-    lines += ["", f"<b>Итого: {fmt_duration(report.total_seconds)}</b> · "
+    # Тег стоит только на задачах, заведённых через бота; всё, что завели прямо
+    # в Битриксе, в первую сумму не попадает никогда. Без строки «всего» её
+    # падение читается как потеря данных, а означает лишь работу мимо бота.
+    label = "Поддержка" if report.split_by_tag else "Итого"
+    lines += ["", f"<b>{label}: {fmt_duration(report.total_seconds)}</b> · "
                   f"{_tasks_word(report.task_count)} · "
                   f"{plural(report.entry_count, 'списание', 'списания', 'списаний')}"]
+    if report.split_by_tag:
+        other = report.all_seconds - report.total_seconds
+        lines.append(f"Всего по проектам: {fmt_duration(report.all_seconds)} · "
+                     f"{_tasks_word(report.all_task_count)}")
+        if other > 0:
+            lines.append(f"Из них мимо поддержки: {fmt_duration(other)}")
     if not report.complete:
         # Молчаливое усечение выглядит как баг продукта. Портал отдаёт не больше
         # 50 записей за раз и не умеет листать (docs/00-portal-facts.md §5.2).
         lines.append(f"\n⚠️ Портал отдал {report.seen} записей учёта времени из "
                      f"{report.total_on_portal}. Сумма — это минимум, а не точное "
                      f"значение.")
+    return "\n".join(lines)
+
+
+def render_timelog(task_id: int, entries: Any, names: dict[int, str],
+                   *, task_title: str = "") -> str:
+    """Экран списаний одной задачи: сумма, кто сколько списал, чем занимался.
+
+    Чужие списания показываются наравне со своими — вопрос «сколько мы потратили
+    на эту задачу» коллективный, а разделение «своё/чужое» здесь только мешало бы
+    сверять итог с тем, что видно в Битриксе.
+
+    Комментарий списания приходит с портала без разметки (поле не BBCode,
+    docs/00-portal-facts.md §5.3), но в Telegram уезжает через `esc_html`: там
+    он снова становится опасен (И-6).
+    """
+    from b24bot.bot.texts import MSG_TIMELOG_EMPTY, MSG_TIMELOG_PARTIAL
+
+    head = f"⏱ <b>Трудозатраты · задача #{task_id}</b>"
+    if task_title:
+        head += f"\n{esc_html(task_title)}"
+    lines = [head, f"Всего: <b>{fmt_duration(entries.total_seconds)}</b>", ""]
+
+    if not entries.entries:
+        lines.append(MSG_TIMELOG_EMPTY if entries.complete
+                     else "Списания по этой задаче есть, но их не видно в выборке "
+                          "портала.")
+    for e in entries.entries:
+        who = esc_html(names.get(e.user_id, f"пользователь {e.user_id}"))
+        when = fmt_date(e.at) if e.at else "—"
+        row = f"• {fmt_duration(e.seconds)} — {who} · {esc_html(when)}"
+        if e.comment:
+            row += f"\n  <i>{esc_html(e.comment)}</i>"
+        lines.append(row)
+
+    if not entries.complete:
+        shown = sum(e.seconds for e in entries.entries)
+        lines.append(MSG_TIMELOG_PARTIAL.format(shown=fmt_duration(shown),
+                                                total=fmt_duration(entries.total_seconds)))
     return "\n".join(lines)
 
 

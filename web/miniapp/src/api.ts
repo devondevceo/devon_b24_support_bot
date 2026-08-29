@@ -22,6 +22,7 @@ import type {
   Task,
   TaskCard,
   TaskFilter,
+  Timelog,
   Timesheet as TimesheetReport,
 } from './types'
 
@@ -153,6 +154,23 @@ export const api = {
       `/projects/${projectId}/stages`,
       { query: { chat_ref: chatRef } },
     ),
+
+  timelog: (chatRef: number, id: number) =>
+    request<Timelog>(`/tasks/${id}/timelog`, { query: { chat_ref: chatRef } }),
+
+  /**
+   * Списание времени.
+   *
+   * Длительность уходит строкой, а не числом: разбирает её тот же
+   * `timelog.parse_duration`, что и команда `/time` в чате. Считай мы минуты
+   * здесь — «1ч30м» в двух дверях однажды разошлись бы, и никто бы не заметил.
+   */
+  addTimelog: (chatRef: number, id: number, duration: string, comment: string, startedAt?: string) =>
+    request<Timelog>(`/tasks/${id}/timelog`, {
+      method: 'POST',
+      query: { chat_ref: chatRef },
+      body: { duration, comment, started_at: startedAt },
+    }),
 
   /* ------------------------------------------------ паритет с ботом */
 

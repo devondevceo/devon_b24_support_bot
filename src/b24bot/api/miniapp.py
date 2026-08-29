@@ -26,7 +26,15 @@ from b24bot.bot import comments as comments_service
 from b24bot.bot import survey, task_create, views
 from b24bot.core.text import bbcode_to_text, safe_filename
 from b24bot.db.pool import pool
-from b24bot.domain import access, approvals, audit, miniapp, sync, timesheet
+from b24bot.domain import (
+    access,
+    approvals,
+    audit,
+    miniapp,
+    sync,
+    timelog,
+    timesheet,
+)
 from b24bot.domain import tasks as task_service
 from b24bot.domain.context import (
     TASK_NOT_FOUND,
@@ -501,6 +509,79 @@ def _author(actor: miniapp.Actor) -> str:
     return f"{name} (@{actor.init.username})" if actor.init.username else name
 
 
+# ---------------------------------------------------------------- трудозатраты
+@router.get("/tasks/{task_id}/timelog")
+async def task_timelog(task_id: int, bundle: CtxDep) -> JSONResponse:
+    """Списания по задаче: кто, сколько, когда и с каким комментарием.
+
+    Полнота списка доказывается сходимостью с `TIME_SPENT_IN_LOGS` задачи, а не
+    размером выборки: у метода портала нет ни фильтров, ни страниц.
+    """
+    actor, ctx = bundle
+    async with await _client(actor) as client:
+        task, _ = await _authorized_task(actor, ctx, client, task_id)
+        total = mapping.as_int(task.get("timeSpentInLogs")) or 0
+        entries = await timelog.for_task(client, task_id, total)
+        names = await task_service.user_names(
+            client, [e.user_id for e in entries.entries])
+    return JSONResponse(_timelog_body(entries, names))
+
+
+@router.post("/tasks/{task_id}/timelog")
+async def add_timelog(task_id: int, bundle: CtxDep, body: JsonBody) -> JSONResponse:
+    """Списать время. Длительность принимаем и числом, и человеческой строкой.
+
+    Строка нужна, потому что форма мини-аппа и команда `/time` в чате обязаны
+    понимать «1ч30м» одинаково: разбор один и тот же (`timelog.parse_duration`),
+    иначе одно и то же написание давало бы в двух дверях разные минуты.
+    """
+    actor, ctx = bundle
+    raw = body.get("seconds")
+    try:
+        if isinstance(raw, int | float) and not isinstance(raw, bool):
+            seconds = timelog.checked(int(raw))
+        else:
+            seconds = timelog.parse_duration(str(body.get("duration") or ""))
+    except timelog.BadDuration as exc:
+        raise ApiError(400, "validation", str(exc)) from exc
+
+    comment = str(body.get("comment") or "").strip()[:timelog.COMMENT_MAX]
+    started_at = task_service.parse_deadline(body.get("started_at")) \
+        if body.get("started_at") else None
+
+    async with await _client(actor) as client:
+        _, project = await _authorized_task(actor, ctx, client, task_id)
+        await timelog.add(client, task_id, seconds, comment=comment,
+                          started_at=started_at)
+        # Имя — из общей константы: у бота и здесь оно обязано быть одним.
+        await _audit(actor, timelog.AUDIT_ACTION, task_id, project,
+                     {"seconds": seconds})
+        fresh = await task_service.read(client, task_id)
+        total = mapping.as_int(fresh.get("timeSpentInLogs")) or 0
+        entries = await timelog.for_task(client, task_id, total)
+        names = await task_service.user_names(
+            client, [e.user_id for e in entries.entries])
+    return JSONResponse(_timelog_body(entries, names))
+
+
+def _timelog_body(entries: timelog.TaskEntries,
+                  names: dict[int, str]) -> dict[str, Any]:
+    return {
+        "total_seconds": entries.total_seconds,
+        # False означает «часть списаний за окном выборки портала», а не «их нет».
+        # Разница видна только здесь, и молчать о ней нельзя.
+        "complete": entries.complete,
+        "items": [{"id": e.id, "seconds": e.seconds,
+                   "user_id": e.user_id,
+                   "user_name": names.get(e.user_id, f"пользователь {e.user_id}"),
+                   "at": e.at.isoformat() if e.at else None,
+                   "comment": e.comment}
+                  for e in entries.entries],
+        "presets": [{"seconds": s, "label": timelog.preset_label(s)}
+                    for s in timelog.PRESETS],
+    }
+
+
 # -------------------------------------------------------------------- создание
 @router.post("/tasks")
 async def create_task(bundle: CtxDep, body: JsonBody) -> JSONResponse:
@@ -784,7 +865,8 @@ async def timesheet_report(bundle: CtxDep,
 
     report = timesheet.aggregate(
         snap.entries, snap.tasks, stage_titles, year=year, month=month_number,
-        complete=snap.complete, seen=snap.seen, total_on_portal=snap.total_on_portal)
+        complete=snap.complete, seen=snap.seen, total_on_portal=snap.total_on_portal,
+        tag=snap.tag)
 
     def bucket(b: timesheet.Bucket) -> dict[str, Any]:
         return {"title": b.title, "seconds": b.seconds, "tasks": len(b.tasks)}
@@ -803,6 +885,14 @@ async def timesheet_report(bundle: CtxDep,
         "complete": report.complete,
         "seen": report.seen,
         "total_on_portal": report.total_on_portal,
+        # Тег поддержки задан — рядом с итогом по поддержке стоит итог по всем
+        # задачам проектов. Без второй суммы падение первой читается как падение
+        # объёма работ вообще, а означает лишь то, что работу завели мимо бота.
+        "split_by_tag": report.split_by_tag,
+        "support_tag": report.support_tag,
+        "all_seconds": report.all_seconds,
+        "all_task_count": report.all_task_count,
+        "all_entry_count": report.all_entry_count,
         "projects": [{"id": p.id, "name": p.name, "client": p.client_name}
                      for p in ctx.projects],
     })

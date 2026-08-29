@@ -118,7 +118,31 @@ export type Timesheet = {
   complete: boolean
   seen: number
   total_on_portal: number
+  /** Задан ли тег поддержки. false — отчёт одной суммой, как до тега. */
+  split_by_tag: boolean
+  support_tag: string
+  /** Время по ВСЕМ задачам проектов, с тегом и без. */
+  all_seconds: number
+  all_task_count: number
+  all_entry_count: number
   projects: { id: number; name: string; client: string }[]
+}
+
+export type TimelogEntry = {
+  id: number
+  seconds: number
+  user_id: number
+  user_name: string
+  at: string | null
+  comment: string
+}
+
+export type Timelog = {
+  total_seconds: number
+  /** Видны ли ВСЕ списания задачи. false — часть за окном выборки портала. */
+  complete: boolean
+  items: TimelogEntry[]
+  presets: { seconds: number; label: string }[]
 }
 
 export type SurveyTemplate = { id: number; title: string }

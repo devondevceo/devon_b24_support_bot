@@ -17,7 +17,7 @@ from b24bot.api import miniapp as api_miniapp
 from b24bot.api.main import app
 from b24bot.b24 import errors
 from b24bot.bot import task_create, views
-from b24bot.domain import access, sync
+from b24bot.domain import access, support_tag, sync
 from b24bot.domain import events as b24_events
 from b24bot.domain import miniapp as domain_miniapp
 from b24bot.domain.context import TASK_NOT_FOUND, ChatContext, ProjectRef
@@ -113,7 +113,9 @@ def portal(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
     monkeypatch.setattr(api_miniapp, "_client", lambda actor: _ready(client))
     # `sync` — потому что карточка разрешает название стадии, а незнакомая стадия
     # тянет за собой точечное обновление справочника (views.resolve_stage_title).
-    for module in (api_miniapp, views, task_create, sync):
+    # `support_tag` — потому что создание задачи читает тег теннанта: пустая база
+    # отвечает пусто, и в задачу уезжает значение по умолчанию `tg-support`.
+    for module in (api_miniapp, views, task_create, sync, support_tag):
         monkeypatch.setattr(module, "pool", lambda: FakePool())
     return client
 

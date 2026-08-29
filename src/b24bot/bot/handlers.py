@@ -33,6 +33,7 @@ from b24bot.domain import (
     miniapp,
     reminders,
     sync,
+    timelog,
     timesheet,
 )
 from b24bot.domain import events as b24_events
@@ -266,6 +267,96 @@ async def _authorize_live(ctx: ChatContext, task_id: int, b24_user_id: int,
     return await authorize_task_for_chat(
         ctx.tenant_id, ctx.chat_ref, task_id,
         group_id_hint=mapping.as_int(task.get("groupId")))
+
+
+@dataclass(frozen=True)
+class TimeInput:
+    task_id: int | None
+    seconds: int | None
+    comment: str
+    quoted_author: str
+    error: str = ""
+
+
+def time_input(arg: str, msg: dict[str, Any]) -> TimeInput:
+    """Разбор `/time <номер> <длительность> [комментарий]`.
+
+    Чистая функция: то же решение, что у `comment_input`, и по той же причине —
+    разбор аргументов проверяется тестом без портала, без базы и без Telegram.
+
+    Комментарий берётся из реплая, если его не написали в самой команде. Жест тот
+    же, что у `/comment`, и он избавляет от переписывания чужой реплики руками.
+    Пустой реплай цитатой не считается: в форуме Telegram сам подставляет ответ
+    на служебное сообщение о создании топика.
+    """
+    # `arg` — это уже ТОЛЬКО аргументы: имя команды отрезает `_command`.
+    parts = arg.split()
+    task_id = _task_number(arg)
+    if task_id is None or len(parts) < 2:
+        return TimeInput(task_id, None, "", "", error="usage")
+
+    try:
+        seconds = timelog.parse_duration(parts[1])
+    except timelog.BadDuration as exc:
+        return TimeInput(task_id, None, "", "", error=str(exc))
+
+    comment = arg.split(None, 2)[2].strip() if len(parts) > 2 else ""
+    quoted_author = ""
+    if not comment:
+        reply_to = msg.get("reply_to_message") or {}
+        quoted = _text_of(reply_to).strip() if reply_to else ""
+        if quoted:
+            comment = quoted
+            quoted_author = _author(reply_to.get("from") or {})
+    return TimeInput(task_id, seconds, comment, quoted_author)
+
+
+async def _time_command(ctx: ChatContext, msg: dict[str, Any], arg: str,
+                        tg_user_id: int) -> Reply:
+    """`/time <номер> <время> [комментарий]` — списание времени в задачу."""
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    data = time_input(arg, msg)
+    if data.error == "usage" or data.task_id is None:
+        return Reply(texts.MSG_TIMELOG_USAGE)
+    if data.seconds is None:
+        return Reply(texts.MSG_TIMELOG_BAD_DURATION.format(
+            reason=esc_html(data.error)) + "\n\n" + texts.MSG_TIMELOG_USAGE)
+
+    project = await _authorize_live(ctx, data.task_id, b24_user_id, tg_user_id)
+    if project is None:
+        return Reply(texts.MSG_TASK_NOT_FOUND)
+
+    # Автор цитаты называется в самом комментарии: без этого списание выглядит
+    # так, будто нажавший пересказал чужие слова от своего имени.
+    comment = data.comment
+    if data.quoted_author:
+        comment = f"{comment} (из Telegram, автор: {data.quoted_author})"
+
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            await timelog.add(client, data.task_id, data.seconds, comment=comment)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied as exc:
+        return Reply(texts.MSG_NO_RIGHTS_B24.format(reason=esc_html(exc.description)))
+    except errors.B24Error as exc:
+        log.warning("списание времени в задачу %s не удалось: %s", data.task_id, exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    await _audit_timelog(ctx.tenant_id, b24_user_id, tg_user_id, data.task_id,
+                         project.id, data.seconds, source="bot")
+
+    domain = await _tenant_domain(ctx.tenant_id)
+    ref = views.task_ref(data.task_id, domain=domain, b24_user_id=b24_user_id)
+    return Reply(f"⏱ В задачу {ref} списано "
+                 f"{timelog.format_duration(data.seconds)}.")
 
 
 async def _comment_command(ctx: ChatContext, msg: dict[str, Any], arg: str,
@@ -797,7 +888,8 @@ async def _timesheet_text(tenant_id: int, tg_user_id: int, b24_user_id: int,
 
     report = timesheet.aggregate(
         snap.entries, snap.tasks, stage_titles, year=year, month=month,
-        complete=snap.complete, seen=snap.seen, total_on_portal=snap.total_on_portal)
+        complete=snap.complete, seen=snap.seen, total_on_portal=snap.total_on_portal,
+        tag=snap.tag)
     return views.render_timesheet(report, projects)
 
 
@@ -909,6 +1001,7 @@ async def _render_card(ctx: ChatContext, tg_user_id: int, b24_user_id: int,
             single_use=(act != "refresh"), ttl=timedelta(hours=12))
     tokens["edit"] = await _edit_token(ctx, tg_user_id, task_id, "menu")
     tokens["stage"] = await _edit_token(ctx, tg_user_id, task_id, "stage_menu")
+    tokens["timelog"] = await _timelog_token(ctx, tg_user_id, task_id, "menu")
     tokens["back"] = await issue_token(
         "menu", tenant_id=ctx.tenant_id, chat_ref=ctx.chat_ref,
         payload={"action": "all"}, single_use=False, ttl=timedelta(days=7))
@@ -993,6 +1086,105 @@ async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
                        detail={"act": act, "source": "bot"})
 
     return await _open_card(ctx, tg_user_id, task_id)
+
+
+# -------------------------------------------------------------- трудозатраты
+async def _timelog_token(ctx: ChatContext, tg_user_id: int, task_id: int, act: str,
+                         seconds: int | None = None) -> str:
+    """Токен кнопки списания.
+
+    Экран можно открывать сколько угодно, а само списание одноразовое: два клика
+    по «1 ч» подряд создали бы две записи по часу, и отличить это от честного
+    «ещё час» уже не смог бы никто — ни мы, ни человек.
+    """
+    payload: dict[str, Any] = {"task_id": task_id, "act": act}
+    if seconds is not None:
+        payload["seconds"] = seconds
+    return await issue_token("timelog", tenant_id=ctx.tenant_id,
+                             owner_tg_id=tg_user_id, chat_ref=ctx.chat_ref,
+                             payload=payload, single_use=(act == "add"),
+                             ttl=timedelta(hours=12))
+
+
+async def _timelog(ctx: ChatContext, tg_user_id: int, payload: dict[str, Any]) -> Reply:
+    """Экран списаний задачи и быстрое списание кнопкой."""
+    task_id = int(payload["task_id"])
+    act = str(payload.get("act") or "menu")
+    if act == "back":
+        return await _open_card(ctx, tg_user_id, task_id)
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+
+    seconds = mapping.as_int(payload.get("seconds")) if act == "add" else None
+    if act == "add" and seconds is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
+
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            task = await task_service.read(client, task_id)
+            # И-3: право открыть задачу даёт не токен кнопки, а принадлежность
+            # задачи проекту ЭТОГО чата. Проверяется на каждом нажатии заново.
+            project = await authorize_task_for_chat(
+                ctx.tenant_id, ctx.chat_ref, task_id,
+                group_id_hint=mapping.as_int(task.get("groupId")))
+            if project is None:
+                return Reply(texts.MSG_TASK_NOT_FOUND)
+
+            if seconds is not None:
+                await timelog.add(client, task_id, seconds)
+                await _audit_timelog(ctx.tenant_id, b24_user_id, tg_user_id,
+                                     task_id, project.id, seconds, source="bot")
+                task = await task_service.read(client, task_id)
+                note = texts.MSG_TIMELOG_DONE.format(
+                    task_id=task_id, duration=timelog.format_duration(seconds))
+                return await _render_card(ctx, tg_user_id, b24_user_id, task,
+                                          project, note)
+
+            return await _timelog_screen(ctx, tg_user_id, client, task, project)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied as exc:
+        return Reply(texts.MSG_NO_RIGHTS_B24.format(reason=esc_html(exc.description)))
+    except errors.B24Error as exc:
+        log.warning("списание времени в задачу %s не удалось: %s", task_id, exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+
+async def _timelog_screen(ctx: ChatContext, tg_user_id: int, client: Any,
+                          task: dict[str, Any], project: ProjectRef) -> Reply:
+    """Кто сколько списал плюс кнопки быстрых длительностей."""
+    task_id = mapping.as_int(task.get("id")) or 0
+    total = mapping.as_int(task.get("timeSpentInLogs")) or 0
+    entries = await timelog.for_task(client, task_id, total)
+    names = await task_service.user_names(client, [e.user_id for e in entries.entries])
+
+    items = [(await _timelog_token(ctx, tg_user_id, task_id, "add", value),
+              timelog.preset_label(value))
+             for value in timelog.PRESETS]
+    back = await _timelog_token(ctx, tg_user_id, task_id, "back")
+    app_url = await miniapp.link_for_chat(ctx.tenant_id or 0, ctx.chat_ref,
+                                          thread_id=ctx.thread_id, task_id=task_id)
+
+    text = (views.render_timelog(task_id, entries, names,
+                                 task_title=str(task.get("title") or ""))
+            + "\n\n" + texts.MSG_TIMELOG_MENU.format(task_id=task_id)
+            + "\n" + texts.MSG_TIMELOG_HINT.format(task_id=task_id))
+    return Reply(text, markup=keyboards.timelog_menu(items, back, app_url), edit=True)
+
+
+async def _audit_timelog(tenant_id: int, b24_user_id: int, tg_user_id: int | None,
+                         task_id: int, project_id: int, seconds: int,
+                         *, source: str) -> None:
+    """Имя берётся из `timelog.AUDIT_ACTION`: одно действие — одно имя."""
+    await audit.record(tenant_id, timelog.AUDIT_ACTION, actor_id=b24_user_id,
+                       actor_tg_id=tg_user_id, target=f"task:{task_id}",
+                       project_id=project_id,
+                       detail={"seconds": seconds, "source": source})
 
 
 # ------------------------------------------------------------- редактирование
@@ -1589,6 +1781,8 @@ async def _group_command(bot: dict[str, Any], ctx: ChatContext, cmd: tuple[str, 
         return await _digest_command(ctx, tg_user_id)
     if name == "comment":
         return await _comment_command(ctx, msg, arg, tg_user_id)
+    if name == "time":
+        return await _time_command(ctx, msg, arg, tg_user_id)
     if name == "discussion":
         return await _discussion(ctx, arg, tg_user_id)
     if name == "cancel":
@@ -1929,6 +2123,8 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
                                                str(payload.get("act") or "refresh")))
     if ns == "e":
         return _keep_source(payload, await _edit(ctx, tg_user_id, payload))
+    if ns == "tl":
+        return await _timelog(ctx, tg_user_id, payload)
     if ns == "b":
         return await _apply_bind(ctx, tenant_id, payload, tg_user_id)
     if ns == "tp":

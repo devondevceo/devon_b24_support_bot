@@ -87,6 +87,8 @@ CREATE TABLE tenants (
   tz                  TEXT        NOT NULL DEFAULT 'Europe/Moscow',
   audit_mode          TEXT        NOT NULL DEFAULT 'full' CHECK (audit_mode IN ('full','minimal')),
   audit_mode_effective_at TIMESTAMPTZ,               -- переключение вступает в силу через 24 ч
+  support_tag         TEXT        NOT NULL DEFAULT 'tg-support',  -- миграция 0017
+  support_tag_synced_at TIMESTAMPTZ,               -- разовый проход по старым задачам
   settings            JSONB       NOT NULL DEFAULT '{}',
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -95,7 +97,23 @@ COMMENT ON COLUMN tenants.audit_mode_effective_at IS
   'Отложенное применение minimal: точечное сокрытие действий становится бесполезным';
 COMMENT ON COLUMN tenants.b24_app_token IS
   'НЕ доказательство подлинности события: значение видит любой сотрудник портала через F12';
+COMMENT ON COLUMN tenants.support_tag IS
+  'Тег, который дописывается КАЖДОЙ задаче, созданной через бота или мини-апп,
+   рядом с ключом идемпотентности. По нему отбираются задачи поддержки и режется
+   отчёт о трудозатратах. Пустая строка = не помечать и не делить отчёт';
+COMMENT ON COLUMN tenants.support_tag_synced_at IS
+  'Когда разовый проход дописал тег задачам, созданным до появления настройки';
 ```
+
+**Почему колонка, а не ключ в `settings`.** JSONB там лежит с миграции `0001` и за
+полтора месяца не получил ни одного читателя и ни одного писателя: конвенции о ключах
+не существует, и первый же ключ завёл бы её молча. Колонка типизирована, видна в
+`\d tenants`, а её `DEFAULT` и есть обещанное «по умолчанию `tg-support`» — одинаково
+для уже заведённого теннанта и для любого будущего.
+
+**Наследования у тега нет** (И-9 не применяется): теннант — верхний уровень цепочки,
+наследовать выше не у кого. Поэтому пустая строка означает «выключено», а не
+«не настроено», и различать эти два состояния незачем.
 
 > `oauth_host` намеренно **не** хранится: хост берётся из жёсткого списка
 > `{oauth.bitrix24.tech, oauth.bitrix.info}`, `client_endpoint` собирается как

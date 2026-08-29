@@ -296,7 +296,7 @@ async def _manager_screen(tenant: asyncpg.Record, b24_user_id: int, is_admin: bo
             "создавать и комментировать задачи из чатов вы пока не можете — "
             "привязка находится во вкладке «Команда».", "warn")
 
-    from b24bot.api import app_approval, app_notify
+    from b24bot.api import app_approval, app_notify, app_tag
 
     can_roles = await can_manage_admins(int(tenant["id"]), b24_user_id, is_admin)
     survey = await _survey_block(int(tenant["id"]), can_roles, session, active)
@@ -321,7 +321,11 @@ async def _manager_screen(tenant: asyncpg.Record, b24_user_id: int, is_admin: bo
     # Мини-апп — это витрина того же бота, поэтому живёт на его вкладке,
     # а не отдельной: настраивать там нечего, кнопка меню ставится сама.
     bot_panel = (_bot_panel(bot, is_admin, session, active)
-                 + _miniapp_block(bot, is_admin, session, active))
+                 + _miniapp_block(bot, is_admin, session, active)
+                 # Тег живёт на вкладке бота, а не своей: это свойство задач,
+                 # которые заводит бот, а не отдельная сущность настройки.
+                 + await app_tag.render_block(int(tenant["id"]), can_roles,
+                                              session, active))
     team = await _team_panel(tenant, b24_user_id, is_admin, session, bot, linked, active)
 
     body = (_panel_html("overview", active, (flash if active == "overview" else "") + overview)
