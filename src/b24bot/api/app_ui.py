@@ -26,7 +26,7 @@ from b24bot.api import ui_kit as ui
 from b24bot.core.config import get_settings, is_trusted_portal_domain
 from b24bot.core.text import esc_attr, esc_html
 from b24bot.crypto import box
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, set_tenant, system_scope
 from b24bot.domain import access, audit, context, lifecycle, miniapp
 from b24bot.tg import api as tg
 
@@ -53,10 +53,21 @@ async def issue_session(conn: asyncpg.Connection, tenant_id: int, b24_user_id: i
 
 
 async def load_session(token: str) -> asyncpg.Record | None:
-    async with pool().acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT tenant_id, b24_user_id, is_portal_admin FROM app_sessions "
-            "WHERE token_hash = $1 AND expires_at > now()", _hash(token))
+    """Опознать сессию и объявить теннанта на остаток HTTP-запроса.
+
+    Это общий шлюз ВСЕХ обработчиков приложения Б24 (десять вызовов в пяти
+    роутерах) — поэтому RLS-контекст ставится здесь один раз, а не в каждом.
+    Сам поиск по хэшу токена — резолв недоверенного ввода, до него теннант
+    неизвестен: системный скоуп ровно на один запрос.
+    """
+    with system_scope():
+        async with pool().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT tenant_id, b24_user_id, is_portal_admin FROM app_sessions "
+                "WHERE token_hash = $1 AND expires_at > now()", _hash(token))
+    if row is not None:
+        set_tenant(int(row["tenant_id"]))
+    return row
 
 
 # ---------------------------------------------------------------------- вёрстка

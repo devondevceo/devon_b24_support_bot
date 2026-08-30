@@ -31,8 +31,33 @@ os.environ.setdefault("MASTER_KEY_ID", "1")
 os.environ.setdefault("DOMAIN", "b24sdbot.devondev.ru")
 os.environ.setdefault("B24_CLIENT_ID", "test.client")
 os.environ.setdefault("B24_CLIENT_SECRET", "test.secret")
+# Второй рубеж изоляции в тестах включён ВСЕГДА: политики RLS (миграция 0020)
+# без enforce инертны, и прогон с выключенным флагом проверял бы их существование,
+# а не работу. На проде флаг включается отдельным шагом (docs/80-deploy.md §9).
+os.environ.setdefault("RLS_ENFORCE", "true")
 
 ADMIN_URL = os.environ.get("TEST_DATABASE_URL")
+
+# Пароль роли приложения на ОДНОРАЗОВОМ тестовом кластере. Синтетика: роль
+# создаётся миграцией 0020 без входа, вход с этим паролем включает фикстура
+# ниже — и только там, где кластер живёт не дольше прогона.
+APP_ROLE_PASSWORD = "b24bot-app-test-only"
+
+
+def app_role_url(admin_url: str) -> str:
+    """Тот же адрес базы, но входит роль приложения, а не админ кластера.
+
+    Разница принципиальна для RLS: bootstrap-пользователь контейнера postgres —
+    суперпользователь, а суперпользователя row security не касается вообще.
+    Тесты обязаны ходить той же ролью, какой будет ходить прод после
+    переключения (docs/80-deploy.md §9), иначе политики «проверены» вхолостую.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(admin_url)
+    hostport = parts.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parts.scheme, f"b24bot_app:{APP_ROLE_PASSWORD}@{hostport}",
+                       parts.path, parts.query, parts.fragment))
 
 
 @pytest.fixture(scope="module")
@@ -79,6 +104,16 @@ def db_url() -> Iterator[str]:
     alembic("upgrade", "head")
     alembic("downgrade", "base")
     alembic("upgrade", "head")
+
+    async def enable_app_role() -> None:
+        # Миграция 0020 создаёт роль NOLOGIN; вход включаем здесь, на
+        # одноразовом кластере. На проде это делает оператор (80-deploy §9).
+        conn = await asyncpg.connect(url)
+        await conn.execute(
+            f"ALTER ROLE b24bot_app LOGIN PASSWORD '{APP_ROLE_PASSWORD}'")
+        await conn.close()
+
+    asyncio.run(enable_app_role())
     try:
         yield url
     finally:
@@ -87,12 +122,27 @@ def db_url() -> Iterator[str]:
 
 @pytest.fixture
 async def db(db_url: str) -> AsyncIterator[object]:
-    """Пул приложения на тестовую базу — код ходит ровно теми же запросами."""
+    """Пул приложения на тестовую базу — код ходит ровно теми же запросами.
+
+    Два решения про RLS (миграция 0020):
+
+    * Соединение самой фикстуры переводится в обслуживание (`app.rls='off'`):
+      прямые INSERT-ы тестовых миров — это канал сборки стенда, а не путь
+      приложения, и политики ему не адресованы. Любой НОВЫЙ захват через фасад
+      переобъявляет обе переменные, поэтому «off» не переживает возврат
+      соединения в пул.
+    * Фоновый контекст теста — системный, как у воркера: доменные функции,
+      вызванные тестом напрямую, без HTTP и без диспетчера, не имеют точки
+      входа, которая объявила бы теннанта. Тесты самой изоляции (test_rls)
+      объявляют скоупы явно и перекрывают этот фон.
+    """
     from b24bot.db import pool as pool_mod
 
-    await pool_mod.init_pool(db_url)
+    await pool_mod.init_pool(app_role_url(db_url))
     try:
         async with pool_mod.pool().acquire() as conn:
-            yield conn
+            await conn.execute("SELECT set_config('app.rls', 'off', false)")
+            with pool_mod.system_scope():
+                yield conn
     finally:
         await pool_mod.close_pool()

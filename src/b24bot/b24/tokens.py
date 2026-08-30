@@ -29,6 +29,7 @@ import asyncpg
 from b24bot.b24 import oauth
 from b24bot.core.config import get_settings
 from b24bot.crypto import box
+from b24bot.db.pool import PoolFacade
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ def _now() -> datetime:
 
 
 class TokenStore:
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: PoolFacade) -> None:
         self._pool = pool
 
     # ------------------------------------------------------------------ чтение

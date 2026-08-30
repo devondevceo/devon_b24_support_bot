@@ -34,7 +34,7 @@ from b24bot.b24.limiter import Lane
 from b24bot.b24.tokens import NeedsReauth
 from b24bot.core.config import get_settings
 from b24bot.crypto import box
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, system_scope, tenant_scope
 from b24bot.domain import access, audit
 
 log = logging.getLogger(__name__)
@@ -337,21 +337,22 @@ async def purge_due() -> int:
     В аудит запись не пишется: журнал этого теннанта стирается тем же проходом,
     а чужому теннанту про это знать нечего. След остаётся в логах приложения.
     """
-    async with pool().acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, slug, b24_domain FROM tenants "
-            "WHERE status = 'uninstalled' AND uninstalled_at < now() - $1::interval",
-            PURGE_AFTER)
-    purged = 0
-    for row in rows:
-        tid = int(row["id"])
-        async with pool().acquire() as conn, conn.transaction():
-            await conn.execute("DELETE FROM audit_log WHERE tenant_id = $1", tid)
-            await conn.execute("DELETE FROM tenants WHERE id = $1", tid)
-        purged += 1
-        log.warning("данные теннанта %s (%s, %s) удалены: %d дн. после "
-                    "деинсталляции истекли", tid, row["slug"], row["b24_domain"],
-                    PURGE_AFTER.days)
+    with system_scope():  # чистка — системный слой: контекст теннанта здесь и умирает
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, slug, b24_domain FROM tenants "
+                "WHERE status = 'uninstalled' AND uninstalled_at < now() - $1::interval",
+                PURGE_AFTER)
+        purged = 0
+        for row in rows:
+            tid = int(row["id"])
+            async with pool().acquire() as conn, conn.transaction():
+                await conn.execute("DELETE FROM audit_log WHERE tenant_id = $1", tid)
+                await conn.execute("DELETE FROM tenants WHERE id = $1", tid)
+            purged += 1
+            log.warning("данные теннанта %s (%s, %s) удалены: %d дн. после "
+                        "деинсталляции истекли", tid, row["slug"], row["b24_domain"],
+                        PURGE_AFTER.days)
     return purged
 
 
@@ -369,20 +370,23 @@ async def daily_pass() -> None:
     except Exception:
         log.exception("чистка деинсталлированных теннантов не прошла")
 
-    async with pool().acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id FROM tenants WHERE status = 'active' AND "
-            "(license_checked_at IS NULL OR license_checked_at < now() - $1::interval) "
-            "ORDER BY license_checked_at ASC NULLS FIRST LIMIT $2",
-            LICENSE_TTL, DAILY_BATCH)
+    with system_scope():  # кому пора — вопрос ко всем теннантам разом (RLS)
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id FROM tenants WHERE status = 'active' AND "
+                "(license_checked_at IS NULL OR "
+                " license_checked_at < now() - $1::interval) "
+                "ORDER BY license_checked_at ASC NULLS FIRST LIMIT $2",
+                LICENSE_TTL, DAILY_BATCH)
     for row in rows:
         tid = int(row["id"])
-        try:
-            await refresh_license(tid)
-            await ensure_event_bindings(tid)
-        except NeedsReauth:
-            log.warning("суточный проход: у теннанта %s нет живого сервисного "
-                        "токена — подписка и события не проверены", tid)
-        except Exception as exc:
-            log.warning("суточный проход не прошёл для теннанта %s: %s",
-                        tid, str(exc)[:200])
+        with tenant_scope(tid):
+            try:
+                await refresh_license(tid)
+                await ensure_event_bindings(tid)
+            except NeedsReauth:
+                log.warning("суточный проход: у теннанта %s нет живого сервисного "
+                            "токена — подписка и события не проверены", tid)
+            except Exception as exc:
+                log.warning("суточный проход не прошёл для теннанта %s: %s",
+                            tid, str(exc)[:200])

@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     # Куда собран фронтенд. В образе это /app/web/miniapp, локально — пусто.
     miniapp_dist: str = "/app/web/miniapp"
 
+    # Второй рубеж изоляции: соединения объявляют RLS-enforce (db/pool.py).
+    # По умолчанию выключено: политики в базе (миграция 0020) инертны, пока
+    # соединение само не скажет `app.rls='enforce'`. Порядок включения на
+    # боевом сервере — docs/80-deploy.md §9. В CI включён всегда (conftest).
+    rls_enforce: bool = False
+
     log_level: str = "INFO"
 
     @field_validator("master_key")

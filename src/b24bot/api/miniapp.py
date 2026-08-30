@@ -25,7 +25,7 @@ from b24bot.b24.tokens import NeedsReauth
 from b24bot.bot import comments as comments_service
 from b24bot.bot import survey, task_create, views
 from b24bot.core.text import bbcode_to_text, safe_filename
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, set_tenant
 from b24bot.domain import (
     access,
     approvals,
@@ -95,6 +95,11 @@ async def actor_dep(request: Request) -> miniapp.Actor:
         raise ApiError(401, "unauthenticated",
                        "Не удалось подтвердить, что запрос из Telegram. "
                        "Закройте и откройте приложение заново.") from exc
+    # Теннант опознан — объявляем его на весь остаток запроса (RLS-контекст;
+    # у ASGI каждый запрос живёт в своей задаче, contextvar умрёт вместе с ней).
+    # Строго ДО проверки подписки: под enforce без контекста строка теннанта
+    # не видна, и blocked() молча ответил бы «не заблокирован».
+    set_tenant(actor.tenant_id)
     # Единственная точка входа всех запросов мини-аппа — поэтому гейт подписки
     # Маркета стоит здесь, а не в каждом обработчике.
     if await lifecycle.blocked(actor.tenant_id):

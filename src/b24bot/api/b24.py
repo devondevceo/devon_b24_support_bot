@@ -24,7 +24,7 @@ from b24bot.b24 import oauth
 from b24bot.core.config import is_trusted_portal_domain
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, set_tenant, system_scope, tenant_scope
 from b24bot.domain import events as event_queue
 from b24bot.domain import lifecycle, linking
 
@@ -89,6 +89,14 @@ async def upsert_tenant(n: dict[str, str | None], granted_scope: str | None) -> 
     if not is_trusted_portal_domain(domain):
         raise ValueError(f"недоверенный домен портала: {domain!r}")
 
+    # Установка — единственное место, где строка теннанта только рождается:
+    # объявить её контекстом заранее нечем, поэтому системный скоуп (RLS).
+    with system_scope():
+        return await _upsert_tenant_row(n, granted_scope, domain)
+
+
+async def _upsert_tenant_row(n: dict[str, str | None], granted_scope: str | None,
+                             domain: str) -> int:
     async with pool().acquire() as conn:
         # Переустановка возвращает теннанта в строй: пометка деинсталляции
         # снимается, пока данные не стёрты (lifecycle.PURGE_AFTER). После стирания
@@ -208,6 +216,7 @@ async def _finish_link(payload: dict[str, str]) -> Response:
     if isinstance(result, linking.Refusal):
         return _link_notice(result.code)
 
+    set_tenant(result.tenant_id)  # RLS: остаток запроса — от имени теннанта
     await linking.notify_linked(result)
     return await _link_done_page(result)
 
@@ -273,6 +282,8 @@ async def install(request: Request) -> Response:
                        "интерфейса Битрикс24, а не по прямой ссылке.", None)
 
     tenant_id = await upsert_tenant(n, n["scope"])
+    # Дальше теннант известен — весь остаток установки идёт от его имени (RLS).
+    set_tenant(tenant_id)
     await lifecycle.note_app_status(tenant_id, n["status"])
 
     installer_id = None
@@ -345,10 +356,12 @@ async def placement(request: Request) -> Response:
         return _notice("err", "Доступ не подтверждён",
                        "Откройте приложение из интерфейса Битрикс24.", None)
 
-    async with pool().acquire() as conn:
-        t = await conn.fetchrow(
-            "SELECT id, b24_app_token, b24_domain, status FROM tenants WHERE b24_member_id = $1",
-            n["member_id"])
+    # Резолв теннанта по недоверенному member_id — системный скоуп на один запрос.
+    with system_scope():
+        async with pool().acquire() as conn:
+            t = await conn.fetchrow(
+                "SELECT id, b24_app_token, b24_domain, status FROM tenants "
+                "WHERE b24_member_id = $1", n["member_id"])
     if not t:
         return _notice("warn", "Портал не подключён",
                        "Сначала установите приложение на портале — тогда этот "
@@ -369,6 +382,9 @@ async def placement(request: Request) -> Response:
             return _notice("err", "Доступ не подтверждён",
                            "Откройте приложение из интерфейса Битрикс24.",
                            n["domain"])
+
+    # APPLICATION_TOKEN сошёлся — дальше запрос обслуживает этого теннанта (RLS).
+    set_tenant(int(t["id"]))
 
     # Буква статуса приложения приезжает в каждом открытии — бесплатный свежий
     # сигнал о подписке между суточными проверками app.info.
@@ -446,6 +462,7 @@ async def events(request: Request) -> Response:
     if tenant_id is None:
         log.warning("событие от неизвестного или неподтверждённого портала")
         return JSONResponse({"ok": True})
+    set_tenant(tenant_id)  # опознан — постановка в очередь от его имени (RLS)
 
     task_id = _task_id_of(payload)
     actor = payload.get("auth[user_id]")
@@ -476,35 +493,37 @@ async def _app_event(event_name: str, n: dict[str, str | None]) -> Response:
     if not member_id:
         return JSONResponse({"ok": True})
 
-    async with pool().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, b24_app_token FROM tenants "
-            "WHERE b24_member_id = $1 AND status <> 'deleted'", member_id)
+    with system_scope():  # резолв по недоверенному member_id (RLS)
+        async with pool().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, b24_app_token FROM tenants "
+                "WHERE b24_member_id = $1 AND status <> 'deleted'", member_id)
     if row is None:
         log.warning("событие %s от неизвестного портала", event_name)
         return JSONResponse({"ok": True})
     tenant_id = int(row["id"])
 
-    if event_name == "ONAPPTEST":
-        log.info("ONAPPTEST от теннанта %s", tenant_id)
-    elif event_name == "ONAPPUNINSTALL":
-        token_ok = True
-        if row["b24_app_token"]:
-            expected = box.decrypt(
-                row["b24_app_token"],
-                box.aad("tenants", "b24_app_token", tenant_id, member_id))
-            token_ok = bool(n["app_token"]) and hmac.compare_digest(
-                expected, n["app_token"] or "")
-        if token_ok:
-            await lifecycle.on_uninstall_event(tenant_id)
+    with tenant_scope(tenant_id):
+        if event_name == "ONAPPTEST":
+            log.info("ONAPPTEST от теннанта %s", tenant_id)
+        elif event_name == "ONAPPUNINSTALL":
+            token_ok = True
+            if row["b24_app_token"]:
+                expected = box.decrypt(
+                    row["b24_app_token"],
+                    box.aad("tenants", "b24_app_token", tenant_id, member_id))
+                token_ok = bool(n["app_token"]) and hmac.compare_digest(
+                    expected, n["app_token"] or "")
+            if token_ok:
+                await lifecycle.on_uninstall_event(tenant_id)
+            else:
+                log.warning("ONAPPUNINSTALL с несовпавшим APPLICATION_TOKEN, "
+                            "теннант %s — игнорирую", tenant_id)
+        elif event_name == "ONAPPUPDATE":
+            await lifecycle.on_update_event(tenant_id, n["app_token"], n["scope"])
         else:
-            log.warning("ONAPPUNINSTALL с несовпавшим APPLICATION_TOKEN, "
-                        "теннант %s — игнорирую", tenant_id)
-    elif event_name == "ONAPPUPDATE":
-        await lifecycle.on_update_event(tenant_id, n["app_token"], n["scope"])
-    else:
-        log.info("событие приложения %s без обработчика (теннант %s)",
-                 event_name, tenant_id)
+            log.info("событие приложения %s без обработчика (теннант %s)",
+                     event_name, tenant_id)
     return JSONResponse({"ok": True})
 
 
@@ -527,10 +546,11 @@ async def _tenant_by_member(member_id: str | None, app_token: str | None) -> int
     """
     if not member_id:
         return None
-    async with pool().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, b24_app_token FROM tenants "
-            "WHERE b24_member_id = $1 AND status = 'active'", member_id)
+    with system_scope():  # резолв по недоверенному member_id (RLS)
+        async with pool().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, b24_app_token FROM tenants "
+                "WHERE b24_member_id = $1 AND status = 'active'", member_id)
     if row is None:
         return None
     if row["b24_app_token"]:

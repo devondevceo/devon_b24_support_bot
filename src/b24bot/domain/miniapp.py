@@ -25,7 +25,7 @@ from typing import Any
 
 from b24bot.core.config import get_settings
 from b24bot.crypto import box
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, system_scope, tenant_scope
 from b24bot.domain import access
 from b24bot.domain.context import ChatContext, ProjectRef, load_chat_context_by_ref
 from b24bot.tg import initdata
@@ -147,13 +147,19 @@ async def authenticate(raw_init: str) -> Actor:
     peeked_user = initdata.peek_user_id(raw_init)
     peeked_start = initdata.peek_start_param(raw_init)
 
-    for bot in await _candidates(peeked_user, peeked_start):
+    # Резолв по недоверенному вводу: теннант станет известен только после сверки
+    # подписи, до неё выборка кандидатов кросс-теннантна по построению (RLS).
+    with system_scope():
+        candidates = await _candidates(peeked_user, peeked_start)
+
+    for bot in candidates:
         try:
             data = initdata.verify(raw_init, bot.token)
         except initdata.InitDataInvalid:
             continue
 
-        b24_user_id = await access.linked_b24_user(bot.tenant_id, data.user_id)
+        with tenant_scope(bot.tenant_id):
+            b24_user_id = await access.linked_b24_user(bot.tenant_id, data.user_id)
         if b24_user_id is None:
             raise NotLinked(bot.tenant_id, bot.username)
         return Actor(tenant_id=bot.tenant_id, tg_user_id=data.user_id,

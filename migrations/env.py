@@ -16,7 +16,10 @@ if config.config_file_name is not None:
 
 
 def _url() -> str:
-    url = os.environ.get("DATABASE_URL")
+    # После включения RLS (docs/80-deploy.md §9) DATABASE_URL приложения ходит
+    # ролью b24bot_app без DDL-прав — миграциям нужен владелец. Отдельная
+    # переменная разводит их; пока она не задана, поведение прежнее.
+    url = os.environ.get("MIGRATIONS_DATABASE_URL") or os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL не задан — миграции запускать нечем")
     if url.startswith("postgresql://"):

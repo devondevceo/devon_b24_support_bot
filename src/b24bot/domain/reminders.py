@@ -54,7 +54,7 @@ from b24bot.b24.mapping import as_int
 from b24bot.b24.tokens import NeedsReauth
 from b24bot.bot import keyboards, views
 from b24bot.core.text import esc_html
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, system_scope, tenant_scope
 from b24bot.domain import access, approvals, dm, events
 from b24bot.domain.context import issue_token
 
@@ -192,34 +192,37 @@ async def approvals_pass(limit: int = APPROVALS_PER_PASS) -> int:
     цепочке идти некуда, и держать их в очереди значило бы просматривать одни и
     те же самые старые запросы каждым проходом.
     """
-    async with pool().acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT a.id, a.tenant_id, a.project_id, a.b24_task_id, a.task_title,
-                   a.requested_at, a.notified_at, a.responsible_user_id,
-                   u.tg_user_id AS responsible_tg_id, u.display_name,
-                   m.b24_user_id, t.b24_domain
-              FROM task_approvals a
-              JOIN tenants t ON t.id = a.tenant_id AND t.status = 'active'
-                            AND NOT t.license_blocked
-              JOIN users u ON u.id = a.responsible_user_id
-              LEFT JOIN tenant_members m ON m.tenant_id = a.tenant_id
-                                        AND m.user_id = a.responsible_user_id
-             WHERE a.status = 'pending'
-               AND NOT EXISTS (SELECT 1 FROM reminder_marks r
-                                WHERE r.tenant_id = a.tenant_id AND r.scope = 'approval'
-                                  AND r.scope_id = a.id AND r.kind = 'escalate')
-             ORDER BY a.requested_at
-             LIMIT $1
-            """, limit)
+    with system_scope():  # выборка по всем теннантам разом (RLS)
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT a.id, a.tenant_id, a.project_id, a.b24_task_id, a.task_title,
+                       a.requested_at, a.notified_at, a.responsible_user_id,
+                       u.tg_user_id AS responsible_tg_id, u.display_name,
+                       m.b24_user_id, t.b24_domain
+                  FROM task_approvals a
+                  JOIN tenants t ON t.id = a.tenant_id AND t.status = 'active'
+                                AND NOT t.license_blocked
+                  JOIN users u ON u.id = a.responsible_user_id
+                  LEFT JOIN tenant_members m ON m.tenant_id = a.tenant_id
+                                            AND m.user_id = a.responsible_user_id
+                 WHERE a.status = 'pending'
+                   AND NOT EXISTS (SELECT 1 FROM reminder_marks r
+                                    WHERE r.tenant_id = a.tenant_id
+                                      AND r.scope = 'approval'
+                                      AND r.scope_id = a.id AND r.kind = 'escalate')
+                 ORDER BY a.requested_at
+                 LIMIT $1
+                """, limit)
 
     sent = 0
     for row in rows:
-        try:
-            sent += await _approval_step(row)
-        except Exception:
-            log.exception("напоминание по запросу подтверждения %s не отправлено",
-                          row["id"])
+        with tenant_scope(int(row["tenant_id"])):
+            try:
+                sent += await _approval_step(row)
+            except Exception:
+                log.exception("напоминание по запросу подтверждения %s не отправлено",
+                              row["id"])
     return sent
 
 
@@ -383,17 +386,20 @@ async def _open_tasks(tenant_id: int, group_ids: list[int]
 
 async def deadlines_pass() -> int:
     """Личные напоминания о наступающем сроке — по всем активным теннантам."""
-    async with pool().acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT DISTINCT t.id FROM tenants t "
-            "JOIN chat_bindings b ON b.tenant_id = t.id AND b.status = 'active' "
-            "WHERE t.status = 'active' AND NOT t.license_blocked")
+    with system_scope():  # список теннантов кросс-теннантен по построению (RLS)
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT t.id FROM tenants t "
+                "JOIN chat_bindings b ON b.tenant_id = t.id AND b.status = 'active' "
+                "WHERE t.status = 'active' AND NOT t.license_blocked")
     sent = 0
     for row in rows:
-        try:
-            sent += await _deadlines_for_tenant(int(row["id"]))
-        except Exception:
-            log.exception("напоминания о сроках теннанта %s не отправлены", row["id"])
+        with tenant_scope(int(row["id"])):
+            try:
+                sent += await _deadlines_for_tenant(int(row["id"]))
+            except Exception:
+                log.exception("напоминания о сроках теннанта %s не отправлены",
+                              row["id"])
     return sent
 
 
@@ -600,28 +606,31 @@ async def set_digest(tenant_id: int, chat_ref: int, enabled: bool) -> int:
 
 async def digest_pass() -> int:
     """Утренняя сводка по чатам, у которых наступило местное утро."""
-    async with pool().acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT c.id AS chat_ref, c.tenant_id, c.bot_ref, tn.tz, tp.thread_id,
-                   array_agg(DISTINCT p.id)           AS project_ids,
-                   array_agg(DISTINCT p.b24_group_id) AS group_ids,
-                   array_agg(DISTINCT p.name)         AS project_names
-              FROM chat_bindings b
-              JOIN tg_chats c ON c.id = b.chat_ref AND c.status IN ('claimed','active')
-              JOIN tenants tn ON tn.id = b.tenant_id AND tn.status = 'active'
-                             AND NOT tn.license_blocked
-              JOIN projects p ON p.id = b.project_id AND p.status = 'active'
-              LEFT JOIN tg_topics tp ON tp.id = b.topic_ref
-             WHERE b.status = 'active' AND c.bot_ref IS NOT NULL
-             GROUP BY c.id, c.tenant_id, c.bot_ref, tn.tz, tp.thread_id
-            """)
+    with system_scope():  # обход всех чатов всех теннантов (RLS)
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT c.id AS chat_ref, c.tenant_id, c.bot_ref, tn.tz, tp.thread_id,
+                       array_agg(DISTINCT p.id)           AS project_ids,
+                       array_agg(DISTINCT p.b24_group_id) AS group_ids,
+                       array_agg(DISTINCT p.name)         AS project_names
+                  FROM chat_bindings b
+                  JOIN tg_chats c ON c.id = b.chat_ref
+                                 AND c.status IN ('claimed','active')
+                  JOIN tenants tn ON tn.id = b.tenant_id AND tn.status = 'active'
+                                 AND NOT tn.license_blocked
+                  JOIN projects p ON p.id = b.project_id AND p.status = 'active'
+                  LEFT JOIN tg_topics tp ON tp.id = b.topic_ref
+                 WHERE b.status = 'active' AND c.bot_ref IS NOT NULL
+                 GROUP BY c.id, c.tenant_id, c.bot_ref, tn.tz, tp.thread_id
+                """)
     sent = 0
     for row in rows:
-        try:
-            sent += await _digest_for_chat(row)
-        except Exception:
-            log.exception("сводка для чата %s не собрана", row["chat_ref"])
+        with tenant_scope(int(row["tenant_id"])):
+            try:
+                sent += await _digest_for_chat(row)
+            except Exception:
+                log.exception("сводка для чата %s не собрана", row["chat_ref"])
     return sent
 
 

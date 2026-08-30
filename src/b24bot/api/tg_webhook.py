@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 
 from b24bot.bot import dispatch
 from b24bot.crypto import box
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, set_tenant, system_scope
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["telegram"])
@@ -31,10 +31,13 @@ OK = JSONResponse({"ok": True})
 async def receive(webhook_id: str, request: Request) -> JSONResponse:
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
 
-    async with pool().acquire() as conn:
-        bot = await conn.fetchrow(
-            "SELECT id, tenant_id, bot_id, username, webhook_secret, status "
-            "FROM tg_bots WHERE webhook_id = $1::uuid", webhook_id)
+    # Резолв бота по недоверенному webhook_id — до сверки секрета теннант
+    # неизвестен (RLS): это второй из резолверов docs/20-data-model.md §13.
+    with system_scope():
+        async with pool().acquire() as conn:
+            bot = await conn.fetchrow(
+                "SELECT id, tenant_id, bot_id, username, webhook_secret, status "
+                "FROM tg_bots WHERE webhook_id = $1::uuid", webhook_id)
 
     if bot is None:
         log.warning("вебхук: неизвестный webhook_id")
@@ -58,6 +61,7 @@ async def receive(webhook_id: str, request: Request) -> JSONResponse:
         log.warning("вебхук: тело не разобрано как JSON, bot_id=%s", bot["bot_id"])
         return OK
 
+    set_tenant(int(bot["tenant_id"]))  # секрет сошёлся — запрос этого теннанта (RLS)
     try:
         await dispatch.handle(bot["id"], bot["tenant_id"], update)
     except Exception:

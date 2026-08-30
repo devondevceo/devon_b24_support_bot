@@ -20,7 +20,7 @@ import logging
 from b24bot.bot import commands, dispatch
 from b24bot.core import heartbeat
 from b24bot.crypto import box
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, system_scope, tenant_scope
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -106,17 +106,19 @@ class BotPoller:
             await self._save_offset()
 
     async def _save_offset(self) -> None:
-        async with pool().acquire() as conn:
-            await conn.execute(
-                "UPDATE tg_bots SET update_offset = $2, last_check_at = now(), "
-                "status = 'active', last_error = NULL WHERE id = $1",
-                self.bot_ref, self._offset)
+        with tenant_scope(self.tenant_id):
+            async with pool().acquire() as conn:
+                await conn.execute(
+                    "UPDATE tg_bots SET update_offset = $2, last_check_at = now(), "
+                    "status = 'active', last_error = NULL WHERE id = $1",
+                    self.bot_ref, self._offset)
 
     async def _mark_error(self, text: str) -> None:
-        async with pool().acquire() as conn:
-            await conn.execute(
-                "UPDATE tg_bots SET status = 'error', last_error = $2, "
-                "last_check_at = now() WHERE id = $1", self.bot_ref, text[:500])
+        with tenant_scope(self.tenant_id):
+            async with pool().acquire() as conn:
+                await conn.execute(
+                    "UPDATE tg_bots SET status = 'error', last_error = $2, "
+                    "last_check_at = now() WHERE id = $1", self.bot_ref, text[:500])
 
 
 def _report_death(task: asyncio.Task[None]) -> None:
@@ -135,14 +137,17 @@ class PollerRegistry:
         self._pollers: dict[int, BotPoller] = {}
 
     async def sync(self) -> None:
-        async with pool().acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT b.id, b.tenant_id, b.bot_id, b.username, b.token, b.update_offset
-                  FROM tg_bots b JOIN tenants t ON t.id = b.tenant_id
-                 WHERE b.mode = 'polling' AND b.status IN ('active','pending')
-                   AND t.status = 'active'
-                """)
+        # Реестр ботов кросс-теннантен по построению — системный скоуп (RLS).
+        with system_scope():
+            async with pool().acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT b.id, b.tenant_id, b.bot_id, b.username, b.token,
+                           b.update_offset
+                      FROM tg_bots b JOIN tenants t ON t.id = b.tenant_id
+                     WHERE b.mode = 'polling' AND b.status IN ('active','pending')
+                       AND t.status = 'active'
+                    """)
 
         alive = {r["id"] for r in rows}
         for bot_ref in list(self._tasks):
