@@ -35,7 +35,7 @@ from b24bot.b24.client import B24Client
 from b24bot.b24.limiter import Lane
 from b24bot.b24.mapping import as_int
 from b24bot.b24.tokens import NeedsReauth
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, system_scope, tenant_scope
 from b24bot.domain import access
 
 log = logging.getLogger(__name__)
@@ -207,6 +207,11 @@ async def sync_project_stages(tenant_id: int, project_id: int, b24_group_id: int
 
 async def due_projects(limit: int) -> list[asyncpg.Record]:
     """Проекты, чей справочник стадий пора обновить. Самые заброшенные первыми."""
+    with system_scope():  # обход всех теннантов (RLS)
+        return await _due_projects(limit)
+
+
+async def _due_projects(limit: int) -> list[asyncpg.Record]:
     async with pool().acquire() as conn:
         rows = await conn.fetch(
             """
@@ -249,8 +254,10 @@ async def sync_stages_due(limit: int = PASS_LIMIT) -> int:
             continue
         attempts += 1
         try:
-            done = await sync_project_stages(int(row["tenant_id"]), int(row["id"]),
-                                             int(row["b24_group_id"]))
+            with tenant_scope(int(row["tenant_id"])):
+                done = await sync_project_stages(int(row["tenant_id"]),
+                                                 int(row["id"]),
+                                                 int(row["b24_group_id"]))
         except Exception:
             log.exception("синхронизация стадий проекта %s упала", row["id"])
             _failed_until[key] = _now() + FAIL_COOLDOWN

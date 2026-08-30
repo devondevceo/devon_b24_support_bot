@@ -11,7 +11,7 @@ from typing import Any
 
 from b24bot.bot import handlers
 from b24bot.crypto import box
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, set_tenant, system_scope
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -56,6 +56,15 @@ async def handle(bot_ref: int, tenant_id: int | None, update: dict[str, Any]) ->
         status = str((my_member.get("new_chat_member") or {}).get("status") or "")
         left = status in ("left", "kicked")
 
+    # Регистрация чатов — системный слой (RLS): незаявленный чат ничей
+    # (tenant_id IS NULL), а ON CONFLICT обязан видеть строку и тогда, когда
+    # чат уже заявлен, — от какого бы бота ни пришёл апдейт.
+    with system_scope():
+        await _register_chat(chat_id, bot_ref, chat_type, title, is_forum, left)
+
+
+async def _register_chat(chat_id: int, bot_ref: int, chat_type: str, title: str,
+                         is_forum: bool, left: bool) -> None:
     async with pool().acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -90,10 +99,11 @@ async def handle(bot_ref: int, tenant_id: int | None, update: dict[str, Any]) ->
 
 
 async def _bot_row(bot_ref: int) -> dict[str, Any] | None:
-    async with pool().acquire() as conn:
-        r = await conn.fetchrow(
-            "SELECT id, tenant_id, bot_id, username, token FROM tg_bots WHERE id = $1",
-            bot_ref)
+    with system_scope():  # резолв бота до того, как известен теннант (RLS)
+        async with pool().acquire() as conn:
+            r = await conn.fetchrow(
+                "SELECT id, tenant_id, bot_id, username, token FROM tg_bots "
+                "WHERE id = $1", bot_ref)
     if r is None:
         return None
     row: dict[str, Any] = {
@@ -120,6 +130,10 @@ async def route(bot_ref: int, update: dict[str, Any]) -> None:
     bot = await _bot_row(bot_ref)
     if bot is None:
         return
+
+    # Бот опознан — все сценарии этого апдейта идут от имени его теннанта (RLS).
+    # Голый set, а не блок: у поллера один цикл на бота, теннант не меняется.
+    set_tenant(bot["tenant_id"])
 
     # Подписка Маркета истекла — функциональность стоит (правило Маркета), но
     # молчать нельзя: молчащий бот неотличим от сломанного. Отвечаем ТОЛЬКО на

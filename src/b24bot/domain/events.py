@@ -23,7 +23,7 @@ from typing import Any
 from b24bot.b24 import errors, mapping
 from b24bot.b24.limiter import Lane
 from b24bot.core.text import esc_html
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, system_scope
 from b24bot.domain import access, notifications
 from b24bot.domain.context import issue_token
 
@@ -620,10 +620,13 @@ async def _finish(event_id: int, state: str, error: str | None = None) -> None:
 
 
 async def take_pending(limit: int = 20) -> list[Any]:
-    async with pool().acquire() as conn:
-        rows = await conn.fetch(
-            "UPDATE b24_event_inbox SET state = 'processing' WHERE id IN ("
-            "  SELECT id FROM b24_event_inbox WHERE state = 'pending' "
-            "  ORDER BY received_at LIMIT $1 FOR UPDATE SKIP LOCKED"
-            ") RETURNING id, tenant_id, event, b24_task_id, b24_user_id", limit)
+    # Очередь событий общая на всех — выборка в системном скоупе (RLS);
+    # обработку каждой строки воркер ведёт уже в скоупе её теннанта.
+    with system_scope():
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                "UPDATE b24_event_inbox SET state = 'processing' WHERE id IN ("
+                "  SELECT id FROM b24_event_inbox WHERE state = 'pending' "
+                "  ORDER BY received_at LIMIT $1 FOR UPDATE SKIP LOCKED"
+                ") RETURNING id, tenant_id, event, b24_task_id, b24_user_id", limit)
     return list(rows)

@@ -31,6 +31,10 @@ os.environ.setdefault("MASTER_KEY_ID", "1")
 os.environ.setdefault("DOMAIN", "b24sdbot.devondev.ru")
 os.environ.setdefault("B24_CLIENT_ID", "test.client")
 os.environ.setdefault("B24_CLIENT_SECRET", "test.secret")
+# Второй рубеж изоляции в тестах включён ВСЕГДА: политики RLS (миграция 0020)
+# без enforce инертны, и прогон с выключенным флагом проверял бы их существование,
+# а не работу. На проде флаг включается отдельным шагом (docs/80-deploy.md §9).
+os.environ.setdefault("RLS_ENFORCE", "true")
 
 ADMIN_URL = os.environ.get("TEST_DATABASE_URL")
 
@@ -87,12 +91,27 @@ def db_url() -> Iterator[str]:
 
 @pytest.fixture
 async def db(db_url: str) -> AsyncIterator[object]:
-    """Пул приложения на тестовую базу — код ходит ровно теми же запросами."""
+    """Пул приложения на тестовую базу — код ходит ровно теми же запросами.
+
+    Два решения про RLS (миграция 0020):
+
+    * Соединение самой фикстуры переводится в обслуживание (`app.rls='off'`):
+      прямые INSERT-ы тестовых миров — это канал сборки стенда, а не путь
+      приложения, и политики ему не адресованы. Любой НОВЫЙ захват через фасад
+      переобъявляет обе переменные, поэтому «off» не переживает возврат
+      соединения в пул.
+    * Фоновый контекст теста — системный, как у воркера: доменные функции,
+      вызванные тестом напрямую, без HTTP и без диспетчера, не имеют точки
+      входа, которая объявила бы теннанта. Тесты самой изоляции (test_rls)
+      объявляют скоупы явно и перекрывают этот фон.
+    """
     from b24bot.db import pool as pool_mod
 
     await pool_mod.init_pool(db_url)
     try:
         async with pool_mod.pool().acquire() as conn:
-            yield conn
+            await conn.execute("SELECT set_config('app.rls', 'off', false)")
+            with pool_mod.system_scope():
+                yield conn
     finally:
         await pool_mod.close_pool()

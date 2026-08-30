@@ -17,7 +17,7 @@ from b24bot.core import heartbeat
 from b24bot.core.config import get_settings
 from b24bot.core.logging import setup as log_setup
 from b24bot.crypto import box
-from b24bot.db.pool import close_pool, init_pool, pool
+from b24bot.db.pool import close_pool, init_pool, pool, system_scope, tenant_scope
 from b24bot.domain import events, lifecycle, notifications, reminders, sync
 from b24bot.tg import api as tg
 
@@ -42,15 +42,18 @@ LIFECYCLE_PASS = timedelta(hours=1)
 async def process_events() -> int:
     rows = await events.take_pending()
     for row in rows:
-        try:
-            await events.process_one(row)
-        except Exception:
-            log.exception("событие %s не обработано", row["id"])
-            async with pool().acquire() as conn:
-                await conn.execute(
-                    "UPDATE b24_event_inbox SET state = 'failed', "
-                    "attempts = attempts + 1, processed_at = now() WHERE id = $1",
-                    row["id"])
+        # Обработка события — от имени его теннанта (RLS): выборка общая, но
+        # дальше каждая строка живёт в своём скоупе.
+        with tenant_scope(int(row["tenant_id"])):
+            try:
+                await events.process_one(row)
+            except Exception:
+                log.exception("событие %s не обработано", row["id"])
+                async with pool().acquire() as conn:
+                    await conn.execute(
+                        "UPDATE b24_event_inbox SET state = 'failed', "
+                        "attempts = attempts + 1, processed_at = now() WHERE id = $1",
+                        row["id"])
     return len(rows)
 
 
@@ -60,37 +63,43 @@ async def send_outbox() -> int:
     Накопительные строки сюда не попадают: у них своё время отправки и своя
     сборка в одно сообщение (`flush_digests`).
     """
-    async with pool().acquire() as conn:
-        rows = await conn.fetch(
-            """
-            UPDATE outbox SET state = 'sending' WHERE id IN (
-              SELECT o.id FROM outbox o
-               WHERE o.state = 'pending' AND NOT o.digest AND o.next_attempt_at <= now()
-                 AND (SELECT count(*) FROM outbox s
-                       WHERE s.chat_ref = o.chat_ref AND s.state = 'sent'
-                         AND s.sent_at > now() - interval '1 minute') < $2
-               ORDER BY o.created_at LIMIT $1 FOR UPDATE SKIP LOCKED
-            ) RETURNING id, tenant_id, bot_ref, chat_ref, thread_id, text, markup,
-                        attempts
-            """, SEND_BATCH, CHAT_LIMIT_PER_MIN)
+    # Очередь общая на всех — выборка в системном скоупе (RLS), отправка каждой
+    # строки — в скоупе её теннанта.
+    with system_scope():
+        async with pool().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE outbox SET state = 'sending' WHERE id IN (
+                  SELECT o.id FROM outbox o
+                   WHERE o.state = 'pending' AND NOT o.digest
+                     AND o.next_attempt_at <= now()
+                     AND (SELECT count(*) FROM outbox s
+                           WHERE s.chat_ref = o.chat_ref AND s.state = 'sent'
+                             AND s.sent_at > now() - interval '1 minute') < $2
+                   ORDER BY o.created_at LIMIT $1 FOR UPDATE SKIP LOCKED
+                ) RETURNING id, tenant_id, bot_ref, chat_ref, thread_id, text, markup,
+                            attempts
+                """, SEND_BATCH, CHAT_LIMIT_PER_MIN)
 
     for row in rows:
-        creds = await _creds(row)
-        if creds is None:
-            await _fail(row["id"], "бот или чат исчезли", final=True)
-            continue
-        token, chat_id = creds
-        try:
-            await tg.send_message(token, chat_id, row["text"],
-                                  thread_id=row["thread_id"],
-                                  reply_markup=_markup(row))
-        except tg.TelegramError as exc:
-            # 403 — бота выкинули из чата, повторять бессмысленно.
-            final = exc.code in (400, 403) or row["attempts"] + 1 >= MAX_ATTEMPTS
-            await _fail(row["id"], f"{exc.code}: {exc.description}"[:400], final=final)
-            continue
+        with tenant_scope(int(row["tenant_id"])):
+            creds = await _creds(row)
+            if creds is None:
+                await _fail(row["id"], "бот или чат исчезли", final=True)
+                continue
+            token, chat_id = creds
+            try:
+                await tg.send_message(token, chat_id, row["text"],
+                                      thread_id=row["thread_id"],
+                                      reply_markup=_markup(row))
+            except tg.TelegramError as exc:
+                # 403 — бота выкинули из чата, повторять бессмысленно.
+                final = exc.code in (400, 403) or row["attempts"] + 1 >= MAX_ATTEMPTS
+                await _fail(row["id"], f"{exc.code}: {exc.description}"[:400],
+                            final=final)
+                continue
 
-        await _sent([row["id"]])
+            await _sent([row["id"]])
     return len(rows)
 
 
@@ -108,66 +117,73 @@ async def flush_digests() -> int:
        `/t_<номер>`, как и раньше.
     3. **Не влезло в одно сообщение — уходит следующим**, а не обрезается.
     """
-    async with pool().acquire() as conn:
-        groups = await conn.fetch(
-            """
-            SELECT o.tenant_id, o.bot_ref, o.chat_ref, o.thread_id
-              FROM outbox o
-             WHERE o.state = 'pending' AND o.digest AND o.next_attempt_at <= now()
-               AND (SELECT count(*) FROM outbox s
-                     WHERE s.chat_ref = o.chat_ref AND s.state = 'sent'
-                       AND s.sent_at > now() - interval '1 minute') < $1
-             GROUP BY 1, 2, 3, 4 LIMIT $2
-            """, CHAT_LIMIT_PER_MIN, SEND_BATCH)
+    with system_scope():  # общая очередь — выборка окон кросс-теннантна (RLS)
+        async with pool().acquire() as conn:
+            groups = await conn.fetch(
+                """
+                SELECT o.tenant_id, o.bot_ref, o.chat_ref, o.thread_id
+                  FROM outbox o
+                 WHERE o.state = 'pending' AND o.digest AND o.next_attempt_at <= now()
+                   AND (SELECT count(*) FROM outbox s
+                         WHERE s.chat_ref = o.chat_ref AND s.state = 'sent'
+                           AND s.sent_at > now() - interval '1 minute') < $1
+                 GROUP BY 1, 2, 3, 4 LIMIT $2
+                """, CHAT_LIMIT_PER_MIN, SEND_BATCH)
 
     done = 0
     for g in groups:
-        async with pool().acquire() as conn:
-            rows = await conn.fetch(
-                """
-                UPDATE outbox SET state = 'sending' WHERE id IN (
-                  SELECT id FROM outbox
-                   WHERE tenant_id = $1 AND chat_ref = $2
-                     AND thread_id IS NOT DISTINCT FROM $3
-                     AND state = 'pending' AND digest AND next_attempt_at <= now()
-                   ORDER BY created_at FOR UPDATE SKIP LOCKED
-                ) RETURNING id, text, digest_text, markup, attempts, created_at
-                """, g["tenant_id"], g["chat_ref"], g["thread_id"])
-        if not rows:
-            continue
-        done += len(rows)
-
-        creds = await _creds(g)
-        if creds is None:
-            for row in rows:
-                await _fail(row["id"], "бот или чат исчезли", final=True)
-            continue
-        token, chat_id = creds
-
-        if len(rows) == 1:
-            texts: list[str] = [rows[0]["text"]]
-            markup = _markup(rows[0])
-        else:
-            span = datetime.now(UTC) - min(r["created_at"] for r in rows)
-            texts = notifications.digest_messages(
-                [r["digest_text"] or r["text"].replace("\n", " · ") for r in rows], span)
-            markup = None
-
-        try:
-            for text in texts:
-                await tg.send_message(token, chat_id, text,
-                                      thread_id=g["thread_id"], reply_markup=markup)
-        except tg.TelegramError as exc:
-            final = exc.code in (400, 403) or rows[0]["attempts"] + 1 >= MAX_ATTEMPTS
-            for row in rows:
-                await _fail(row["id"], f"{exc.code}: {exc.description}"[:400],
-                            final=final)
-            continue
-
-        await _sent([r["id"] for r in rows])
-        log.info("сводка из %d уведомлений отправлена в чат %s (%d сообщени(й))",
-                 len(rows), g["chat_ref"], len(texts))
+        with tenant_scope(int(g["tenant_id"])):
+            done += await _flush_group(g)
     return done
+
+
+async def _flush_group(g: Any) -> int:
+    """Одно окно сводки одного чата. Выполняется в скоупе своего теннанта."""
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE outbox SET state = 'sending' WHERE id IN (
+              SELECT id FROM outbox
+               WHERE tenant_id = $1 AND chat_ref = $2
+                 AND thread_id IS NOT DISTINCT FROM $3
+                 AND state = 'pending' AND digest AND next_attempt_at <= now()
+               ORDER BY created_at FOR UPDATE SKIP LOCKED
+            ) RETURNING id, text, digest_text, markup, attempts, created_at
+            """, g["tenant_id"], g["chat_ref"], g["thread_id"])
+    if not rows:
+        return 0
+
+    creds = await _creds(g)
+    if creds is None:
+        for row in rows:
+            await _fail(row["id"], "бот или чат исчезли", final=True)
+        return len(rows)
+    token, chat_id = creds
+
+    if len(rows) == 1:
+        texts: list[str] = [rows[0]["text"]]
+        markup = _markup(rows[0])
+    else:
+        span = datetime.now(UTC) - min(r["created_at"] for r in rows)
+        texts = notifications.digest_messages(
+            [r["digest_text"] or r["text"].replace("\n", " · ") for r in rows], span)
+        markup = None
+
+    try:
+        for text in texts:
+            await tg.send_message(token, chat_id, text,
+                                  thread_id=g["thread_id"], reply_markup=markup)
+    except tg.TelegramError as exc:
+        final = exc.code in (400, 403) or rows[0]["attempts"] + 1 >= MAX_ATTEMPTS
+        for row in rows:
+            await _fail(row["id"], f"{exc.code}: {exc.description}"[:400],
+                        final=final)
+        return len(rows)
+
+    await _sent([r["id"] for r in rows])
+    log.info("сводка из %d уведомлений отправлена в чат %s (%d сообщени(й))",
+             len(rows), g["chat_ref"], len(texts))
+    return len(rows)
 
 
 async def _creds(row: Any) -> tuple[str, int] | None:
@@ -223,6 +239,11 @@ async def _fail(outbox_id: int, error: str, *, final: bool) -> None:
 async def cleanup() -> None:
     """Ретенция. Журналы событий и очередь не должны расти вечно."""
     cutoff = datetime.now(UTC) - RETENTION
+    with system_scope():  # ретенция чистит все теннанты разом (RLS)
+        await _cleanup(cutoff)
+
+
+async def _cleanup(cutoff: datetime) -> None:
     async with pool().acquire() as conn:
         await conn.execute(
             "DELETE FROM b24_event_inbox WHERE state IN ('done','dropped') "

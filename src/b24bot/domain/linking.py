@@ -32,7 +32,7 @@ from b24bot.b24 import oauth
 from b24bot.b24.tokens import TokenStore
 from b24bot.bot import texts
 from b24bot.core.text import esc_html
-from b24bot.db.pool import pool
+from b24bot.db.pool import pool, set_tenant, system_scope
 from b24bot.domain import access, audit, dm
 from b24bot.domain.context import consume_token, issue_token
 
@@ -119,7 +119,9 @@ async def complete(state: str, code: str, *, domain_hint: str | None = None,
     (без него неизвестно, чей это вход вообще), потом теннант, потом обмен, и
     только потом сверка того, что портал прислал, с тем, что мы о нём знаем.
     """
-    row = await consume_token(state, None)
+    # Поиск state — резолв недоверенного ввода, теннант ещё неизвестен (RLS).
+    with system_scope():
+        row = await consume_token(state, None)
     if row is None or row["kind"] != OAUTH_STATE or row["tenant_id"] is None:
         log.info("привязка отклонена: state не подошёл")
         return Refusal("state")
@@ -129,6 +131,7 @@ async def complete(state: str, code: str, *, domain_hint: str | None = None,
     tenant_id, tg_user_id = int(row["tenant_id"]), int(payload.get("tg_user_id") or 0)
     if not tg_user_id:
         return Refusal("state")
+    set_tenant(tenant_id)  # дальше вся привязка — от имени этого теннанта
 
     async with pool().acquire() as conn:
         tenant = await conn.fetchrow(
