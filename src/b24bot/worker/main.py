@@ -18,7 +18,7 @@ from b24bot.core.config import get_settings
 from b24bot.core.logging import setup as log_setup
 from b24bot.crypto import box
 from b24bot.db.pool import close_pool, init_pool, pool
-from b24bot.domain import events, notifications, reminders, sync
+from b24bot.domain import events, lifecycle, notifications, reminders, sync
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -28,9 +28,15 @@ SEND_BATCH = 10
 MAX_ATTEMPTS = 5
 CHAT_LIMIT_PER_MIN = 15   # потолок Telegram — 20 сообщений в минуту на группу
 RETENTION = timedelta(days=14)
+# Требование Маркета: журнал вызовов API за ПОСЛЕДНИЕ 3 суток. Держим ровно их.
+CALL_LOG_RETENTION = timedelta(days=3)
 # Как часто заглядывать, не пора ли обновить стадии. Сам справочник живёт сутки
 # (sync.STAGE_TTL); проход обычно упирается в один запрос к базе и ничего не делает.
 STAGE_PASS = timedelta(minutes=15)
+# Жизненный цикл теннантов: подписка Маркета, подписки на события, чистка
+# деинсталлированных. Сам проход решает, кому пора (lifecycle.LICENSE_TTL);
+# час — это частота, с которой мы об этом спрашиваем базу.
+LIFECYCLE_PASS = timedelta(hours=1)
 
 
 async def process_events() -> int:
@@ -228,6 +234,8 @@ async def cleanup() -> None:
         await conn.execute(
             "DELETE FROM task_cache WHERE is_ours = false AND expires_at < now()")
         await conn.execute("DELETE FROM callback_tokens WHERE expires_at < now()")
+        await conn.execute("DELETE FROM b24_call_log WHERE at < $1",
+                           datetime.now(UTC) - CALL_LOG_RETENTION)
     await reminders.cleanup_marks()
 
 
@@ -239,6 +247,7 @@ async def main() -> None:
 
     tick = 0
     next_stage_pass = datetime.now(UTC)
+    next_lifecycle_pass = datetime.now(UTC)
     try:
         while True:
             tick += 1
@@ -254,6 +263,9 @@ async def main() -> None:
                     # превращать суточную синхронизацию в непрерывную.
                     next_stage_pass = datetime.now(UTC) + STAGE_PASS
                     await sync.sync_stages_due()
+                if datetime.now(UTC) >= next_lifecycle_pass:
+                    next_lifecycle_pass = datetime.now(UTC) + LIFECYCLE_PASS
+                    await lifecycle.daily_pass()
                 if tick % 100 == 0:
                     await cleanup()
                 if not done and not sent:

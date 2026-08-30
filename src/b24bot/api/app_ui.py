@@ -27,7 +27,7 @@ from b24bot.core.config import get_settings, is_trusted_portal_domain
 from b24bot.core.text import esc_attr, esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
-from b24bot.domain import access, audit, context, miniapp
+from b24bot.domain import access, audit, context, lifecycle, miniapp
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -216,6 +216,14 @@ async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
     linked = await _link_state(int(tenant["id"]), b24_user_id)
 
     flash = ui.banner(message, message_kind) if message else ""
+    # Экран приложения при истёкшей подписке НЕ блокируется: именно отсюда
+    # администратор должен увидеть, что случилось. Останавливаются бот и
+    # мини-апп; здесь — баннер.
+    if await lifecycle.blocked(int(tenant["id"])):
+        flash = ui.banner(
+            "Подписка Битрикс24.Маркет истекла — бот и мини-апп приостановлены. "
+            "Продлите подписку в разделе «Маркет» вашего Битрикс24: всё включится "
+            "само, данные и настройки на месте.", "err") + flash
 
     if not is_manager:
         return await _employee_screen(tenant, b24_user_id, bot, linked, flash)

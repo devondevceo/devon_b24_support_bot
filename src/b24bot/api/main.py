@@ -16,6 +16,7 @@ from b24bot.api.app_survey import router as survey_router
 from b24bot.api.app_tag import router as tag_router
 from b24bot.api.app_ui import router as app_router
 from b24bot.api.b24 import router as b24_router
+from b24bot.api.legal import router as legal_router
 from b24bot.api.miniapp import ApiError, error_response, portal_failure
 from b24bot.api.miniapp import router as miniapp_router
 from b24bot.api.tg_webhook import router as tg_router
@@ -66,6 +67,9 @@ app.include_router(notify_router)
 app.include_router(tag_router)
 app.include_router(tg_router)
 app.include_router(miniapp_router)
+# Публичные юридические документы: карточка Битрикс24.Маркет ссылается сюда,
+# ссылки обязаны открываться в браузере без авторизации.
+app.include_router(legal_router)
 
 
 # --------------------------------------------------------------------- ошибки

@@ -89,6 +89,15 @@ CREATE TABLE tenants (
   audit_mode_effective_at TIMESTAMPTZ,               -- переключение вступает в силу через 24 ч
   support_tag         TEXT        NOT NULL DEFAULT 'tg-support',  -- миграция 0017
   support_tag_synced_at TIMESTAMPTZ,               -- разовый проход по старым задачам
+  -- жизненный цикл тиражного приложения (миграция 0018)
+  b24_app_status      TEXT,                        -- L|F|D|T|P|S из placement/app.info
+  license_expired     BOOLEAN     NOT NULL DEFAULT false,  -- PAYMENT_EXPIRED из app.info
+  license_blocked     BOOLEAN GENERATED ALWAYS AS (
+                        COALESCE(b24_app_status,'') IN ('T','P','S') AND license_expired
+                      ) STORED,                    -- ЕДИНСТВЕННОЕ определение правила
+  b24_app_version     BIGINT,                      -- VERSION из app.info; подтверждает ONAPPUPDATE (И-8)
+  license_checked_at  TIMESTAMPTZ,                 -- только при УСПЕШНОМ app.info
+  uninstalled_at      TIMESTAMPTZ,                 -- подтверждённый ONAPPUNINSTALL; +30 дней = чистка
   settings            JSONB       NOT NULL DEFAULT '{}',
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -114,6 +123,18 @@ COMMENT ON COLUMN tenants.support_tag_synced_at IS
 **Наследования у тега нет** (И-9 не применяется): теннант — верхний уровень цепочки,
 наследовать выше не у кого. Поэтому пустая строка означает «выключено», а не
 «не настроено», и различать эти два состояния незачем.
+
+**Подписка Маркета (миграция `0018`).** Правило блокировки живёт в генерированной
+колонке `license_blocked` и больше нигде: SQL-фильтры воркера (`reminders`) читают
+колонку, код — её же через `lifecycle.blocked()`; `lifecycle.is_blocked()` дублирует
+правило для значений, ещё не записанных в базу, и сверяется с колонкой тестом.
+`COALESCE` в выражении обязателен: `NULL IN (...)` дал бы NULL, и строка выпадала
+бы из `WHERE NOT license_blocked` молча. Блокирует только сочетание «платный статус
+(T/P/S) и `PAYMENT_EXPIRED`» — локальное (L), бесплатное (F) и демо модератора (D)
+не блокируются никогда (правило mclick: ложная блокировка платящего дороже ложного
+пропуска). `uninstalled_at` — подтверждённая деинсталляция; данные живут ещё 30 дней
+(`lifecycle.PURGE_AFTER`, срок обещан в `/legal`), затем `lifecycle.purge_due()`
+удаляет теннанта каскадом (плюс явный DELETE из `audit_log` — у партиций нет FK).
 
 > `oauth_host` намеренно **не** хранится: хост берётся из жёсткого списка
 > `{oauth.bitrix24.tech, oauth.bitrix.info}`, `client_endpoint` собирается как
@@ -767,7 +788,23 @@ CREATE TABLE audit_log (            -- партиционируется по м�
 
 CREATE TABLE security_log (LIKE audit_log INCLUDING ALL);   -- НЕотключаемый
 CREATE TABLE pd_access_log (LIKE audit_log INCLUDING ALL);  -- НЕотключаемый, доступ к ПДн
+
+CREATE TABLE b24_call_log (         -- миграция 0018; требование Битрикс24.Маркет
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id   BIGINT      NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  method      TEXT        NOT NULL,
+  ok          BOOLEAN     NOT NULL,
+  error_code  TEXT,
+  duration_ms INT         NOT NULL,
+  at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
+
+> **`b24_call_log`** — журнал вызовов REST за последние 3 суток: Маркет требует его
+> от серверных приложений. Пишет наблюдатель клиента (`domain/access.py::_call_logger`
+> → `b24/client.py`), одна строка на вызов: метод, исход, длительность. Тел запросов
+> нет намеренно — в них чужая переписка (И-1) и токены (И-7). Ретенция — 3 суток,
+> чистит `worker.cleanup()`. Ошибка записи журнала не роняет вызов.
 
 > **Что создано миграцией `0010` (16.08.2026):** `audit_log` в форме выше, с партициями
 > на пять месяцев вперёд **и партицией по умолчанию**. Партиция по умолчанию обязательна:
@@ -935,8 +972,10 @@ docker run --rm --network b24sdbot-internal -v /opt/b24sdbot:/w -w /tmp \
 |---|---|
 | `tenants` | сам теннант, его ключ — `id` |
 | `users` | глобальная запись человека: один Telegram-аккаунт может состоять в нескольких теннантах, привязка лежит в `tenant_members` |
-| `b24_payload_log` | журнал **структуры** входящих payload, пишется до того, как теннант определён (событие install). Таблица спайковая, удаляется отдельной миграцией |
 | `alembic_version` | служебная |
+
+`b24_payload_log` из списка ушёл вместе с таблицей: спайковый журнал удалён
+миграцией `0019` при подготовке к Маркету (оба спайка закрыты ещё 16.08.2026).
 
 ## 14. Ретенция
 
@@ -955,6 +994,8 @@ docker run --rm --network b24sdbot-internal -v /opt/b24sdbot:/w -w /tmp \
 | `survey_sessions`, `tg_fsm_states` | 30 дней | джоб |
 | `tg_message_links` | 180 дней | джоб |
 | `web_sessions` | по `expires_at` | джоб |
+| `b24_call_log` | 3 суток (требование Маркета — «за последние 3 суток») | `worker.cleanup()` |
+| данные деинсталлированного теннанта | 30 дней после `uninstalled_at` | `lifecycle.purge_due()`, суточный проход воркера |
 
 ## 15. Объём и профиль PostgreSQL
 

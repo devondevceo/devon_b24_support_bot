@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 
-from b24bot.b24.client import B24Client
+from b24bot.b24.client import B24Client, CallObserver
 from b24bot.b24.limiter import LimiterRegistry
 from b24bot.b24.tokens import NeedsReauth, TokenStore
 from b24bot.db.pool import pool
@@ -31,6 +31,23 @@ async def _domain(tenant_id: int) -> str:
     return str(domain)
 
 
+def _call_logger(tenant_id: int) -> CallObserver:
+    """Наблюдатель клиента: строка в `b24_call_log` на каждый вызов.
+
+    Требование Маркета — журнал вызовов API за 3 суток. Пишутся метод, исход и
+    длительность; тел нет (И-1, И-7). Ретенцию держит воркер (`cleanup`).
+    Ошибка записи глушится в самом клиенте: журнал не имеет права стоить вызова.
+    """
+    async def observe(method: str, ok: bool, error_code: str | None,
+                      duration_ms: int) -> None:
+        async with pool().acquire() as conn:
+            await conn.execute(
+                "INSERT INTO b24_call_log (tenant_id, method, ok, error_code, "
+                "duration_ms) VALUES ($1,$2,$3,$4,$5)",
+                tenant_id, method, ok, error_code, duration_ms)
+    return observe
+
+
 async def client_for_user(tenant_id: int, b24_user_id: int, *,
                           actor_tg_user_id: int | None = None) -> B24Client:
     """Клиент от имени конкретного человека."""
@@ -41,7 +58,8 @@ async def client_for_user(tenant_id: int, b24_user_id: int, *,
         return await store.get_access_token(tenant_id, b24_user_id,
                                             actor_tg_user_id=actor_tg_user_id)
 
-    return B24Client(domain, provider, _limiters.for_tenant(tenant_id))
+    return B24Client(domain, provider, _limiters.for_tenant(tenant_id),
+                     observer=_call_logger(tenant_id))
 
 
 async def client_for_service(tenant_id: int) -> B24Client:
@@ -60,7 +78,8 @@ async def client_for_service(tenant_id: int) -> B24Client:
     async def provider() -> str:
         return await store.get_access_token(tenant_id, int(b24_user_id))
 
-    return B24Client(domain, provider, _limiters.for_tenant(tenant_id))
+    return B24Client(domain, provider, _limiters.for_tenant(tenant_id),
+                     observer=_call_logger(tenant_id))
 
 
 async def linked_b24_user(tenant_id: int, tg_user_id: int) -> int | None:

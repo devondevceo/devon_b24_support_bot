@@ -65,6 +65,32 @@ def _lock_key(tenant_id: int, b24_user_id: int) -> int:
     return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big", signed=True)
 
 
+async def _note_portal_domain(conn: asyncpg.Connection, tenant_id: int,
+                              payload: dict[str, Any]) -> None:
+    """Портал переименовали — узнать об этом можно только отсюда.
+
+    `member_id` при переименовании не меняется, а `tenants.b24_domain` до сих пор
+    обновлялся только при переустановке: все вызовы ломались до неё. Ответ обмена
+    токенов — доверенный источник домена, совместимый с И-4: он приходит по TLS
+    с oauth-хоста из allowlist, а не из входящего запроса. Сверх того домен
+    проверяется на суффикс Битрикс24, а `member_id` ответа — на принадлежность
+    именно этому теннанту: чужой ответ ничего не перепишет.
+    """
+    from b24bot.core.config import is_trusted_portal_domain
+
+    new_domain = str(payload.get("domain") or "").strip().lower()
+    member_id = str(payload.get("member_id") or "")
+    if not new_domain or not member_id or not is_trusted_portal_domain(new_domain):
+        return
+    changed = await conn.fetchval(
+        "UPDATE tenants SET b24_domain = $2, updated_at = now() "
+        "WHERE id = $1 AND b24_member_id = $3 AND b24_domain <> $2 RETURNING id",
+        tenant_id, new_domain, member_id)
+    if changed is not None:
+        log.warning("портал теннанта %s переехал на домен %s (из ответа "
+                    "oauth-сервера)", tenant_id, new_domain)
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -185,6 +211,7 @@ class TokenStore:
                 raise NeedsReauth(tenant_id, b24_user_id,
                                   "конкурентная запись, пара токенов потеряна")
 
+            await _note_portal_domain(conn, tenant_id, payload)
             return new_access
 
     async def _exchange(self, refresh_token: str) -> dict[str, Any] | None:

@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import hmac
-import json
 import logging
 from collections.abc import Mapping
 from typing import Any
@@ -22,12 +21,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from b24bot.api import app_ui
 from b24bot.api import ui_kit as ui
 from b24bot.b24 import oauth
-from b24bot.core.config import get_settings, is_trusted_portal_domain
+from b24bot.core.config import is_trusted_portal_domain
 from b24bot.core.text import esc_html
 from b24bot.crypto import box
 from b24bot.db.pool import pool
 from b24bot.domain import events as event_queue
-from b24bot.domain import linking
+from b24bot.domain import lifecycle, linking
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/b24", tags=["bitrix24"])
@@ -91,14 +90,23 @@ async def upsert_tenant(n: dict[str, str | None], granted_scope: str | None) -> 
         raise ValueError(f"недоверенный домен портала: {domain!r}")
 
     async with pool().acquire() as conn:
+        # Переустановка возвращает теннанта в строй: пометка деинсталляции
+        # снимается, пока данные не стёрты (lifecycle.PURGE_AFTER). После стирания
+        # строки нет вовсе, и установка честно начинает с нуля.
+        # `COALESCE($5, ...)` в обеих ветках вместо EXCLUDED: колонка NOT NULL, и
+        # вставляемая строка проверяется ДО разрешения конфликта — NULL падал бы
+        # даже на переустановке. А `COALESCE(EXCLUDED...)` после подстановки '{}'
+        # в VALUES молча затирал бы выданный scope пустым при повторе без него.
         row = await conn.fetchrow(
             """
             INSERT INTO tenants (slug, name, b24_member_id, b24_domain, granted_scope,
                                  install_state)
-            VALUES ($1, $2, $3, $4, $5, 'installed')
+            VALUES ($1, $2, $3, $4, COALESCE($5::text[], '{}'), 'installed')
             ON CONFLICT (b24_member_id) DO UPDATE
               SET b24_domain = EXCLUDED.b24_domain,
-                  granted_scope = COALESCE(EXCLUDED.granted_scope, tenants.granted_scope),
+                  granted_scope = COALESCE($5::text[], tenants.granted_scope),
+                  status = 'active',
+                  uninstalled_at = NULL,
                   updated_at = now()
             RETURNING id
             """,
@@ -141,13 +149,9 @@ async def store_user_token(tenant_id: int, member_id: str, b24_user_id: int,
             tenant_id, b24_user_id, role, a_enc, r_enc, box.kid_of(a_enc))
 
 
-async def log_payload(kind: str, member_id: str | None, payload: dict[str, str]) -> None:
-    if not get_settings().spike_log_payloads:
-        return
-    async with pool().acquire() as conn:
-        await conn.execute(
-            "INSERT INTO b24_payload_log (kind, member_id, shape) VALUES ($1, $2, $3)",
-            kind, member_id, json.dumps(shape_for_log(payload), ensure_ascii=False))
+# Спайковый журнал payload (`log_payload` / SPIKE_LOG_PAYLOADS) удалён вместе с
+# таблицей (миграция 0019): формат входа зафиксирован в docs/00-portal-facts.md
+# §10.1, журнал вызовов ведёт `b24_call_log` — без тел и с ретенцией.
 
 
 # ---------------------------------------------------------------------- страницы
@@ -261,7 +265,6 @@ async def install(request: Request) -> Response:
     if request.method == "GET" and _is_oauth_return(payload):
         return await _finish_link(payload)
     n = normalize(payload)
-    await log_payload("install", n["member_id"], payload)
 
     if not n["member_id"] or not n["domain"]:
         log.warning("install без member_id/domain: %s", shape_for_log(payload))
@@ -270,6 +273,7 @@ async def install(request: Request) -> Response:
                        "интерфейса Битрикс24, а не по прямой ссылке.", None)
 
     tenant_id = await upsert_tenant(n, n["scope"])
+    await lifecycle.note_app_status(tenant_id, n["status"])
 
     installer_id = None
     if n["access_token"] and n["refresh_token"]:
@@ -278,6 +282,17 @@ async def install(request: Request) -> Response:
         if installer_id:
             await store_user_token(tenant_id, n["member_id"], int(installer_id),
                                    n["access_token"], n["refresh_token"], "service_admin")
+            # Подписки на события и снимок подписки Маркета — прямо при установке:
+            # до сих пор события привязывались руками при спайке, и установка на
+            # новый портал не давала ни одного уведомления. Отказ не валит мастер
+            # (он обязан быть идемпотентным) — суточный проход досоздаст.
+            try:
+                await lifecycle.ensure_event_bindings(tenant_id)
+                await lifecycle.refresh_license(tenant_id)
+            except Exception as exc:
+                log.warning("установка: подписки/лицензия не доехали (теннант %s): "
+                            "%s — досоздаст суточный проход", tenant_id,
+                            str(exc)[:200])
 
     async with pool().acquire() as conn:
         await conn.execute("UPDATE tenants SET install_state = 'finished' WHERE id = $1",
@@ -325,7 +340,6 @@ async def placement(request: Request) -> Response:
     form = _flatten(dict(await request.form()))
     payload = {**dict(request.query_params), **form}
     n = normalize(payload)
-    await log_payload("placement", n["member_id"], payload)
 
     if not n["member_id"] or not is_trusted_portal_domain(n["domain"] or ""):
         return _notice("err", "Доступ не подтверждён",
@@ -355,6 +369,10 @@ async def placement(request: Request) -> Response:
             return _notice("err", "Доступ не подтверждён",
                            "Откройте приложение из интерфейса Битрикс24.",
                            n["domain"])
+
+    # Буква статуса приложения приезжает в каждом открытии — бесплатный свежий
+    # сигнал о подписке между суточными проверками app.info.
+    await lifecycle.note_app_status(int(t["id"]), n["status"])
 
     b24_user_id: int | None = None
     is_portal_admin = False
@@ -415,7 +433,12 @@ async def events(request: Request) -> Response:
     form = _flatten(dict(await request.form()))
     payload = {**dict(request.query_params), **form}
     n = normalize(payload)
-    await log_payload(f"event:{n['event'] or '?'}", n["member_id"], payload)
+
+    # События жизненного цикла приложения — отдельная ветка: у них нет задачи,
+    # и класть их в очередь задач значило бы уронить их в «событие без задачи».
+    event_name = str(n["event"] or "").upper()
+    if event_name.startswith("ONAPP"):
+        return await _app_event(event_name, n)
 
     # Отвечаем быстро и обрабатываем асинхронно: Битрикс не должен ждать, пока мы
     # сходим в портал за деталями задачи.
@@ -424,7 +447,6 @@ async def events(request: Request) -> Response:
         log.warning("событие от неизвестного или неподтверждённого портала")
         return JSONResponse({"ok": True})
 
-    event_name = str(n["event"] or "").upper()
     task_id = _task_id_of(payload)
     actor = payload.get("auth[user_id]")
     dedup = (f"{event_name}:{task_id}:{payload.get('data[FIELDS_AFTER][MESSAGE_ID]') or ''}"
@@ -434,6 +456,55 @@ async def events(request: Request) -> Response:
         tenant_id, event_name, task_id,
         int(actor) if actor and str(actor).isdigit() else None, dedup)
     log.info("событие %s задача=%s принято=%s", event_name, task_id, accepted)
+    return JSONResponse({"ok": True})
+
+
+async def _app_event(event_name: str, n: dict[str, str | None]) -> Response:
+    """`ONAPPUNINSTALL` / `ONAPPUPDATE` / `ONAPPTEST`.
+
+    И-8 здесь работает в обе стороны. У `ONAPPUNINSTALL` `APPLICATION_TOKEN`
+    ещё прежний — сверяем как у обычных событий, а решение подтверждает
+    `lifecycle` дозапросом своим токеном. У `ONAPPUPDATE` токен в теле УЖЕ
+    новый — сверять его не с чем, поэтому ветка пропускается без сверки, а
+    подлинность доказывает смена версии в `app.info` (иначе перехваченным
+    событием можно было бы подсунуть чужой токен и заглушить настоящие события).
+
+    Ответ всегда `{"ok": true}`: разный ответ на «портал не найден» и «токен не
+    совпал» работал бы оракулом, а повторов от Битрикса мы не просим.
+    """
+    member_id = n["member_id"]
+    if not member_id:
+        return JSONResponse({"ok": True})
+
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, b24_app_token FROM tenants "
+            "WHERE b24_member_id = $1 AND status <> 'deleted'", member_id)
+    if row is None:
+        log.warning("событие %s от неизвестного портала", event_name)
+        return JSONResponse({"ok": True})
+    tenant_id = int(row["id"])
+
+    if event_name == "ONAPPTEST":
+        log.info("ONAPPTEST от теннанта %s", tenant_id)
+    elif event_name == "ONAPPUNINSTALL":
+        token_ok = True
+        if row["b24_app_token"]:
+            expected = box.decrypt(
+                row["b24_app_token"],
+                box.aad("tenants", "b24_app_token", tenant_id, member_id))
+            token_ok = bool(n["app_token"]) and hmac.compare_digest(
+                expected, n["app_token"] or "")
+        if token_ok:
+            await lifecycle.on_uninstall_event(tenant_id)
+        else:
+            log.warning("ONAPPUNINSTALL с несовпавшим APPLICATION_TOKEN, "
+                        "теннант %s — игнорирую", tenant_id)
+    elif event_name == "ONAPPUPDATE":
+        await lifecycle.on_update_event(tenant_id, n["app_token"], n["scope"])
+    else:
+        log.info("событие приложения %s без обработчика (теннант %s)",
+                 event_name, tenant_id)
     return JSONResponse({"ok": True})
 
 

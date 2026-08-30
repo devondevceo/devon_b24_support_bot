@@ -49,7 +49,6 @@ class Settings(BaseSettings):
     # Куда собран фронтенд. В образе это /app/web/miniapp, локально — пусто.
     miniapp_dist: str = "/app/web/miniapp"
 
-    spike_log_payloads: bool = False
     log_level: str = "INFO"
 
     @field_validator("master_key")

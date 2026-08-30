@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
@@ -27,6 +28,9 @@ REQUEST_TIMEOUT = 65.0  # потолок одного запроса на сто
 
 JsonDict = dict[str, Any]
 TokenProvider = Callable[[], Awaitable[str]]
+# Журнал вызова: (метод, успех, код ошибки, длительность в мс). Клиент не знает
+# ни теннанта, ни базы — кто знает, тот и передаёт наблюдателя (domain/access.py).
+CallObserver = Callable[[str, bool, str | None, int], Awaitable[None]]
 
 
 class B24Client:
@@ -37,7 +41,8 @@ class B24Client:
     """
 
     def __init__(self, domain: str, token_provider: TokenProvider,
-                 limiter: PortalLimiter, *, http: httpx.AsyncClient | None = None) -> None:
+                 limiter: PortalLimiter, *, http: httpx.AsyncClient | None = None,
+                 observer: CallObserver | None = None) -> None:
         if not is_trusted_portal_domain(domain):
             raise ValueError(f"недоверенный домен портала: {domain!r}")
         self.domain = domain
@@ -45,6 +50,7 @@ class B24Client:
         self._limiter = limiter
         self._http = http
         self._own_http = http is None
+        self._observer = observer
 
     async def __aenter__(self) -> B24Client:
         if self._http is None:
@@ -81,7 +87,34 @@ class B24Client:
 
     async def call_envelope(self, method: str, params: JsonDict | None = None, *,
                             lane: Lane = Lane.INTERACTIVE) -> Any:
-        """Тот же вызов, но ответ целиком: снаружи `result` лежат `total` и `next`."""
+        """Тот же вызов, но ответ целиком: снаружи `result` лежат `total` и `next`.
+
+        Обёртка вокруг `_call_envelope` существует ради наблюдателя: журнал
+        вызовов (`b24_call_log`) — требование Маркета к серверным приложениям,
+        и писать его обязан ровно один слой, а не каждый вызывающий. Наблюдатель
+        не имеет права уронить вызов: журнал — свидетель, а не участник.
+        """
+        started = time.monotonic()
+        error_code: str | None = None
+        try:
+            return await self._call_envelope(method, params, lane=lane)
+        except errors.B24Error as exc:
+            error_code = exc.code
+            raise
+        except Exception:
+            error_code = "EXCEPTION"
+            raise
+        finally:
+            if self._observer is not None:
+                duration_ms = int((time.monotonic() - started) * 1000)
+                try:
+                    await self._observer(method, error_code is None, error_code,
+                                         duration_ms)
+                except Exception:
+                    log.exception("наблюдатель вызова %s упал", method)
+
+    async def _call_envelope(self, method: str, params: JsonDict | None = None, *,
+                             lane: Lane = Lane.INTERACTIVE) -> Any:
         body = encode_params(params or {})
         last: Exception | None = None
 

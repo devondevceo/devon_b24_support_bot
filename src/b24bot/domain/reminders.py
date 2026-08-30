@@ -201,6 +201,7 @@ async def approvals_pass(limit: int = APPROVALS_PER_PASS) -> int:
                    m.b24_user_id, t.b24_domain
               FROM task_approvals a
               JOIN tenants t ON t.id = a.tenant_id AND t.status = 'active'
+                            AND NOT t.license_blocked
               JOIN users u ON u.id = a.responsible_user_id
               LEFT JOIN tenant_members m ON m.tenant_id = a.tenant_id
                                         AND m.user_id = a.responsible_user_id
@@ -386,7 +387,7 @@ async def deadlines_pass() -> int:
         rows = await conn.fetch(
             "SELECT DISTINCT t.id FROM tenants t "
             "JOIN chat_bindings b ON b.tenant_id = t.id AND b.status = 'active' "
-            "WHERE t.status = 'active'")
+            "WHERE t.status = 'active' AND NOT t.license_blocked")
     sent = 0
     for row in rows:
         try:
@@ -609,6 +610,7 @@ async def digest_pass() -> int:
               FROM chat_bindings b
               JOIN tg_chats c ON c.id = b.chat_ref AND c.status IN ('claimed','active')
               JOIN tenants tn ON tn.id = b.tenant_id AND tn.status = 'active'
+                             AND NOT tn.license_blocked
               JOIN projects p ON p.id = b.project_id AND p.status = 'active'
               LEFT JOIN tg_topics tp ON tp.id = b.topic_ref
              WHERE b.status = 'active' AND c.bot_ref IS NOT NULL

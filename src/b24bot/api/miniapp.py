@@ -30,6 +30,7 @@ from b24bot.domain import (
     access,
     approvals,
     audit,
+    lifecycle,
     miniapp,
     sync,
     timelog,
@@ -85,7 +86,7 @@ def _init_data_of(request: Request) -> str:
 
 async def actor_dep(request: Request) -> miniapp.Actor:
     try:
-        return await miniapp.authenticate(_init_data_of(request))
+        actor = await miniapp.authenticate(_init_data_of(request))
     except miniapp.NotLinked as exc:
         raise ApiError(403, "not_linked",
                        "Telegram не связан с пользователем Битрикс24.",
@@ -94,6 +95,14 @@ async def actor_dep(request: Request) -> miniapp.Actor:
         raise ApiError(401, "unauthenticated",
                        "Не удалось подтвердить, что запрос из Telegram. "
                        "Закройте и откройте приложение заново.") from exc
+    # Единственная точка входа всех запросов мини-аппа — поэтому гейт подписки
+    # Маркета стоит здесь, а не в каждом обработчике.
+    if await lifecycle.blocked(actor.tenant_id):
+        raise ApiError(402, "license_expired",
+                       "Подписка Битрикс24.Маркет на этом портале истекла. "
+                       "Продлить её может администратор портала — данные и "
+                       "настройки на месте.")
+    return actor
 
 
 ActorDep = Annotated[miniapp.Actor, Depends(actor_dep)]
