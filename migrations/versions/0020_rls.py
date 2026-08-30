@@ -93,8 +93,49 @@ def upgrade() -> None:
         WITH CHECK ({_GUARD} OR {_TENANTS_SELF})
     """)
 
+    # Роль приложения — как и требовал план §13. Сначала казалось, что FORCE
+    # достаточно и без неё, но проверка на живом сервере показала `usesuper=true`:
+    # bootstrap-пользователь контейнера postgres — суперпользователь КЛАСТЕРА,
+    # а суперпользователя row security не касается вообще, FORCE или нет.
+    # Роль создаётся NOLOGIN и без пароля (секретам в миграциях не место):
+    # вход включает оператор при переключении DATABASE_URL (docs/80-deploy.md
+    # §9), а в тестах — фикстура conftest на своём одноразовом кластере. До
+    # этого роль просто существует и никому не мешает. Роль кластерная, поэтому
+    # CREATE обёрнут в exception-блок: вторая база того же кластера находит её
+    # уже созданной.
+    op.execute("""
+        DO $do$
+        BEGIN
+            CREATE ROLE b24bot_app NOLOGIN NOSUPERUSER NOBYPASSRLS
+                NOCREATEDB NOCREATEROLE NOREPLICATION;
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END
+        $do$
+    """)
+    op.execute("GRANT USAGE ON SCHEMA public TO b24bot_app")
+    op.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES "
+               "IN SCHEMA public TO b24bot_app")
+    op.execute("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES "
+               "IN SCHEMA public TO b24bot_app")
+    # Будущие таблицы (их создаёт владелец при миграциях) получают права сами —
+    # иначе каждая новая миграция была бы обязана помнить про GRANT.
+    op.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+               "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO b24bot_app")
+    op.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+               "GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO b24bot_app")
+
 
 def downgrade() -> None:
+    # Права роли снимаются, сама роль остаётся: она кластерная, и в соседней базе
+    # того же кластера (тесты, будущие стенды) на неё могут держаться гранты.
+    # Бесправная login-роль без пароля — безвредный артефакт.
+    op.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+               "REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM b24bot_app")
+    op.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+               "REVOKE USAGE, SELECT, UPDATE ON SEQUENCES FROM b24bot_app")
+    op.execute("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM b24bot_app")
+    op.execute("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM b24bot_app")
+    op.execute("REVOKE USAGE ON SCHEMA public FROM b24bot_app")
     # pg_class, а не pg_tables: последняя не показывает партиционированного
     # родителя (relkind 'p'), и audit_log остался бы с политикой навсегда —
     # повторный upgrade падал бы на CREATE POLICY.
