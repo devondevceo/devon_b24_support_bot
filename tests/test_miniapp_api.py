@@ -111,6 +111,15 @@ def portal(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
     monkeypatch.setattr(api_miniapp, "remember_task", noop)
     monkeypatch.setattr(b24_events, "suppress_echo", noop)
     monkeypatch.setattr(api_miniapp, "_client", lambda actor: _ready(client))
+
+    async def not_blocked(tenant_id: int) -> bool:
+        return False
+
+    # `lifecycle.blocked` — потому что каждый запрос мини-аппа теперь проверяет
+    # подписку Битрикс24.Маркет прямо в actor_dep. Это честная зависимость
+    # эндпоинта; FakePool здесь не годится — он отвечает строкой на любой
+    # fetchval, и «домен портала» читался бы как «заблокирован».
+    monkeypatch.setattr(api_miniapp.lifecycle, "blocked", not_blocked)
     # `sync` — потому что карточка разрешает название стадии, а незнакомая стадия
     # тянет за собой точечное обновление справочника (views.resolve_stage_title).
     # `support_tag` — потому что создание задачи читает тег теннанта: пустая база

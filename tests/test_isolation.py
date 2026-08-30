@@ -210,10 +210,8 @@ async def test_every_domain_table_carries_tenant_id(db: object) -> None:
         "users",             # глобальная запись человека: один Telegram-аккаунт
                              # может состоять сразу в нескольких теннантах,
                              # привязка живёт в tenant_members
-        "b24_payload_log",   # журнал СТРУКТУРЫ входящих payload: пишется до того,
-                             # как теннант вообще определён (событие install).
-                             # Таблица спайковая и удаляется отдельной миграцией,
-                             # см. docs/80-deploy.md
+        # b24_payload_log из этого списка ушёл вместе с таблицей: спайковый
+        # журнал удалён миграцией 0019 при подготовке к Маркету.
     }
     rows = await db.fetch(  # type: ignore[attr-defined]
         """

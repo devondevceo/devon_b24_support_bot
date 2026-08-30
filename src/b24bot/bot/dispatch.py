@@ -105,10 +105,41 @@ async def _bot_row(bot_ref: int) -> dict[str, Any] | None:
     return row
 
 
+def _is_command(update: dict[str, Any]) -> bool:
+    """Сообщение начинается с бот-команды (`/task`, `/help`, …)."""
+    msg = update.get("message") or {}
+    for ent in msg.get("entities") or []:
+        if isinstance(ent, dict) and ent.get("type") == "bot_command" \
+                and int(ent.get("offset") or 0) == 0:
+            return True
+    return False
+
+
 async def route(bot_ref: int, update: dict[str, Any]) -> None:
     """Сценарии бота. Вызывается после регистрации чата."""
     bot = await _bot_row(bot_ref)
     if bot is None:
+        return
+
+    # Подписка Маркета истекла — функциональность стоит (правило Маркета), но
+    # молчать нельзя: молчащий бот неотличим от сломанного. Отвечаем ТОЛЬКО на
+    # явные обращения — команду или нажатие кнопки; на остальную переписку бот
+    # и так не реагирует, и превращать каждую реплику чата в напоминание о
+    # подписке значило бы спамить чат клиента.
+    from b24bot.domain import lifecycle
+    if await lifecycle.blocked(bot["tenant_id"]):
+        if "callback_query" in update or _is_command(update):
+            from b24bot.bot import texts
+            cb = update.get("callback_query")
+            if isinstance(cb, dict):
+                with contextlib.suppress(tg.TelegramError):
+                    await tg.call(bot["token"], "answerCallbackQuery",
+                                  {"callback_query_id": cb.get("id")})
+            chat = chat_of(update)
+            if chat is not None:
+                with contextlib.suppress(tg.TelegramError):
+                    await tg.send_message(bot["token"], int(chat["id"]),
+                                          texts.MSG_LICENSE_EXPIRED)
         return
 
     reply = None

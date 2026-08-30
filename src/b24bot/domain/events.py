@@ -546,6 +546,15 @@ async def _deliver(tenant_id: int, project_id: int, task_id: int,
     """
     if not changes:
         return
+    # Подписка Маркета истекла — исходящие уведомления стоят. Сами события при
+    # этом продолжают обрабатываться и кэш задач живёт: он внутренний, и после
+    # продления подписки уведомления обязаны считаться от свежего состояния, а
+    # не от снимка недельной давности.
+    from b24bot.domain import lifecycle
+    if await lifecycle.blocked(tenant_id):
+        log.info("уведомления по задаче %s не отправлены: подписка Маркета "
+                 "истекла (теннант %s)", task_id, tenant_id)
+        return
     targets = await chat_targets(tenant_id, project_id)
     queued = 0
     for t in targets:
