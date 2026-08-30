@@ -93,14 +93,18 @@ async def upsert_tenant(n: dict[str, str | None], granted_scope: str | None) -> 
         # Переустановка возвращает теннанта в строй: пометка деинсталляции
         # снимается, пока данные не стёрты (lifecycle.PURGE_AFTER). После стирания
         # строки нет вовсе, и установка честно начинает с нуля.
+        # `COALESCE($5, ...)` в обеих ветках вместо EXCLUDED: колонка NOT NULL, и
+        # вставляемая строка проверяется ДО разрешения конфликта — NULL падал бы
+        # даже на переустановке. А `COALESCE(EXCLUDED...)` после подстановки '{}'
+        # в VALUES молча затирал бы выданный scope пустым при повторе без него.
         row = await conn.fetchrow(
             """
             INSERT INTO tenants (slug, name, b24_member_id, b24_domain, granted_scope,
                                  install_state)
-            VALUES ($1, $2, $3, $4, $5, 'installed')
+            VALUES ($1, $2, $3, $4, COALESCE($5::text[], '{}'), 'installed')
             ON CONFLICT (b24_member_id) DO UPDATE
               SET b24_domain = EXCLUDED.b24_domain,
-                  granted_scope = COALESCE(EXCLUDED.granted_scope, tenants.granted_scope),
+                  granted_scope = COALESCE($5::text[], tenants.granted_scope),
                   status = 'active',
                   uninstalled_at = NULL,
                   updated_at = now()
