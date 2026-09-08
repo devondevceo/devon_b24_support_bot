@@ -49,6 +49,11 @@ class Event:
     `kind` — «task» для новостей о задачах (у каждой есть набор кнопок под
     уведомлением) и «proactive» для сообщений по расписанию: их шлёт не событие
     портала, а `domain/reminders.py`.
+
+    `instant` — новость уходит сразу, даже когда в чате включена группировка.
+    Это не обход настройки, а её граница: группировка существует против потока
+    мелких изменений по УЖЕ известной задаче, а появление новой задачи — это
+    начало работы, и узнать о нём через восемь часов значит узнать поздно.
     """
 
     code: str
@@ -58,13 +63,15 @@ class Event:
     emitted: bool = True
     kind: str = "task"
     scopes: tuple[str, ...] = SCOPES
+    instant: bool = False
 
 
 EVENTS: tuple[Event, ...] = (
     Event("task.created", "Создана задача",
-          "По умолчанию выключено: первое событие о незнакомой задаче наполняет "
-          "кэш, и при подключении портала иначе хлынет весь накопленный хвост.",
-          default=False),
+          "Приходит сразу, минуя группировку. По умолчанию выключено: первое "
+          "событие о незнакомой задаче наполняет кэш, и при подключении портала "
+          "иначе хлынет весь накопленный хвост.",
+          default=False, instant=True),
     Event("task.status_changed", "Изменён статус",
           "Взял в работу, вернул в ожидание, отправил на контроль, отложил.",
           default=True),
@@ -107,6 +114,7 @@ EVENTS: tuple[Event, ...] = (
 BY_CODE: dict[str, Event] = {e.code: e for e in EVENTS}
 DEFAULTS: dict[str, bool] = {e.code: e.default for e in EVENTS}
 EMITTED: frozenset[str] = frozenset(e.code for e in EVENTS if e.emitted)
+INSTANT: frozenset[str] = frozenset(e.code for e in EVENTS if e.instant)
 TASK_DEFAULTS: dict[str, bool] = {e.code: e.default for e in EVENTS if e.kind == "task"}
 PROACTIVE_DEFAULTS: dict[str, bool] = {e.code: e.default for e in EVENTS
                                        if e.kind == "proactive"}
