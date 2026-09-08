@@ -518,6 +518,11 @@ async def test_new_task_skips_the_open_window_even_with_grouping_on(
     """
     w = await _world(db)
     await notifications.save_minutes(w["tenant"], "binding", w["binding"], 60)
+    # `task.created` выключена по умолчанию — включаем явно, иначе проверяли бы
+    # не «уходит сразу», а «не уходит вовсе».
+    await notifications.save_events(w["tenant"], "binding", w["binding"],
+                                    {"task.created": True,
+                                     "task.status_changed": True})
     await events._deliver(
         w["tenant"], w["project"], 1,
         [events._change("task.status_changed", "🔁", "#1", "Задача", "Иван завершил"),
