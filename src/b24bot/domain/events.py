@@ -578,9 +578,16 @@ async def _deliver(tenant_id: int, project_id: int, task_id: int,
             # отправке дороже, чем несколькими строками в `callback_tokens`.
             markup = await notify_markup(tenant_id, int(t["chat_ref"]), task_id,
                                          ch.code, portal_url)
+            # Новая задача не ждёт окна группировки НИКОГДА (`Event.instant`).
+            # Группировка заведена против потока мелких правок по уже известной
+            # задаче; появление новой — это начало работы, и в чате поддержки
+            # узнать о нём через час означает узнать поздно. Копить её вместе с
+            # остальными значило бы, что от настройки «раз в 8 часов» страдает
+            # ровно то, ради чего чат и существует.
+            grouped = rules.minutes and ch.code not in notifications.INSTANT
             send_at = (await _digest_window(tenant_id, int(t["chat_ref"]),
                                             t["thread_id"], rules.minutes)
-                       if rules.minutes else None)
+                       if grouped else None)
             await enqueue(
                 tenant_id, bot_ref=int(t["bot_ref"]), chat_ref=int(t["chat_ref"]),
                 thread_id=t["thread_id"], kind=ch.code, text=ch.text, markup=markup,

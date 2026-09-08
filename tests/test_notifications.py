@@ -113,6 +113,19 @@ def test_defaults_are_the_registry_defaults() -> None:
     assert DEFAULTS["task.status_changed"] is True
 
 
+def test_new_task_is_never_grouped() -> None:
+    """Новая задача не ждёт окна: это начало работы, а не мелкая правка.
+
+    Группировка заведена против потока изменений по УЖЕ известной задаче.
+    Появление новой задачи в чате поддержки — событие другого рода, и в сводке
+    раз в восемь часов оно приходило бы поздно ровно там, ради чего чат и нужен.
+    """
+    assert "task.created" in notifications.INSTANT
+    # Остальные новости обязаны оставаться группируемыми, иначе настройка
+    # существует, но ни на что не влияет.
+    assert set(notifications.INSTANT) == {"task.created"}
+
+
 def test_intervals_start_with_immediate_delivery() -> None:
     """Ноль в списке обязателен: это «вернуть как было», а не отсутствие ручки."""
     assert notifications.INTERVALS[0][0] == 0
@@ -492,6 +505,34 @@ async def test_grouping_holds_the_row_and_second_news_joins_the_same_window(
     assert all(r["digest"] and r["state"] == "pending" for r in rows)
     assert all(r["digest_text"] for r in rows), "краткая форма собирается заранее"
     assert rows[0]["next_attempt_at"] == rows[1]["next_attempt_at"]
+
+
+@live
+async def test_new_task_skips_the_open_window_even_with_grouping_on(
+        db: object) -> None:
+    """Включённая группировка не задерживает новость о новой задаче.
+
+    Проверяется вместе с соседней строкой в том же чате: одна ждёт окна, вторая
+    уезжает сразу. Проверять только вторую значило бы не заметить, если бы
+    группировка перестала работать вовсе.
+    """
+    w = await _world(db)
+    await notifications.save_minutes(w["tenant"], "binding", w["binding"], 60)
+    await events._deliver(
+        w["tenant"], w["project"], 1,
+        [events._change("task.status_changed", "🔁", "#1", "Задача", "Иван завершил"),
+         events._change("task.created", "🆕", "#2", "Новая задача",
+                        "Создана задача")])
+
+    rows = {r["kind"]: r for r in await db.fetch(  # type: ignore[attr-defined]
+        "SELECT kind, digest, digest_text, next_attempt_at <= now() AS ready "
+        "FROM outbox WHERE tenant_id = $1", w["tenant"])}
+    assert rows["task.created"]["digest"] is False
+    assert rows["task.created"]["ready"] is True
+    assert rows["task.created"]["digest_text"] is None, (
+        "краткая форма нужна только тому, что попадёт в сводку")
+    assert rows["task.status_changed"]["digest"] is True
+    assert rows["task.status_changed"]["ready"] is False
 
 
 @live
