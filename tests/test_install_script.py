@@ -62,6 +62,38 @@ def test_deploy_owned_files_match_what_ci_copies() -> None:
     assert names == copied
 
 
+def test_token_file_is_ignored_by_git() -> None:
+    """Файл с токеном лежит В КАТАЛОГЕ приложения, а он теперь чекаут main.
+
+    Переименовали файл в скрипте, забыли `.gitignore` — и боевой токен реестра
+    ждёт первого же `git add .` на сервере. Инвариант И-7 проверяется в CI
+    gitleaks-ом, но там он ловит уже сделанный коммит, а здесь — возможность.
+    """
+    files = re.search(r"TOKEN_FILES=\(([^)]*)\)", INSTALL)
+    assert files, "в install.sh не нашлись пути файла с токеном"
+    names = {Path(p.strip('"')).name for p in files.group(1).split()}
+
+    ignored = {ln.strip() for ln in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()}
+    for name in names:
+        assert name in ignored, f"{name} не закрыт .gitignore"
+
+
+def test_token_file_permissions_are_checked() -> None:
+    """Токен, читаемый всей машиной, — это токен соседей по общему VPS."""
+    assert re.search(r"600\|400", INSTALL)
+
+
+def test_token_is_read_outside_command_substitution() -> None:
+    """`fail` внутри `$( )` завершает подоболочку, а не скрипт.
+
+    Поймано живым прогоном: файл с правами 644 напечатал отказ и не остановил
+    ничего — работа шла дальше с пустым токеном и падала в конце совсем другой
+    ошибкой. Проверка, которая не останавливает, хуже отсутствующей.
+    """
+    assert "$(read_token)" not in CODE
+    assert "read_token\n" in CODE or "read_token " in CODE
+
+
 def test_server_never_builds_images() -> None:
     """docs/10-architecture.md §10: на сервере не собирается ничего."""
     assert "docker build" not in CODE

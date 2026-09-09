@@ -22,8 +22,12 @@
 # выкатку, которая разойдётся с первой ровно тогда, когда это дороже всего.
 #
 # Токен реестра нужен для `docker pull` приватного пакета GHCR (PAT со scope
-# read:packages): GHCR_TOKEN=… в окружении, --token-file <путь> или ввод
-# с терминала. На диск скрипт токен не кладёт.
+# read:packages). Соседние проекты на этой машине токена не спрашивают, потому
+# что собирают образ на месте; здесь этого не делается сознательно — образ
+# приезжает ровно тот, что прошёл ruff, mypy, тесты и gitleaks в CI.
+# Порядок поиска: GHCR_TOKEN → --token-file → /opt/b24sdbot/.ghcr-token или
+# /root/.ghcr-token (права строго 600) → запрос с терминала. Положенный один
+# раз файл превращает обновление в `./install.sh update` без аргументов.
 
 set -Eeuo pipefail
 
@@ -76,14 +80,22 @@ usage() {
   --code-only        только подтянуть код, выкатку не запускать
   --force            выкатить, даже если этот образ уже запущен
   --wait <сек>       сколько ждать образ от CI (по умолчанию 600, 0 — не ждать)
-  --token-file <п>   файл с токеном GHCR (иначе GHCR_TOKEN или ввод с терминала)
+  --token-file <п>   файл с токеном GHCR
+
+Токен реестра (PAT со scope read:packages) ищется по порядку: GHCR_TOKEN,
+--token-file, .ghcr-token в каталоге приложения или в /root (права 600),
+запрос с терминала.
 
 Переменные окружения: APP_DIR, BRANCH, WAIT_IMAGE, GHCR_TOKEN, TOKEN_FILE.
 
 Примеры:
   ./install.sh status
   ./install.sh update --dry-run
-  GHCR_TOKEN=ghp_… ./install.sh update
+  ./install.sh update                       # токен из .ghcr-token
+  GHCR_TOKEN=ghp_… ./install.sh update      # или разово в команде
+
+Положить токен один раз:
+  install -m 600 /dev/null /root/.ghcr-token && nano /root/.ghcr-token
 TXT
 }
 
@@ -171,19 +183,51 @@ sync_code() {
 }
 
 # --- реестр ------------------------------------------------------------------
+# Файл с токеном, если его положили один раз. Права проверяем: токен, читаемый
+# всей машиной, — это токен соседей по VPS, а машина общая с чужим продом.
+TOKEN_FILES=("$APP_DIR/.ghcr-token" /root/.ghcr-token)
+default_token_file() {
+  local f
+  for f in "${TOKEN_FILES[@]}"; do
+    if [ -r "$f" ] && [ -s "$f" ]; then printf '%s' "$f"; return 0; fi
+  done
+  return 1
+}
+
+# Результат кладём в глобальную TOKEN, а не печатаем: `t=$(read_token)` завело бы
+# функцию в подоболочку, где `fail` завершает только её саму. Отказ по правам
+# файла печатался бы в лог, а скрипт шёл бы дальше — с пустым токеном и совсем
+# другой ошибкой в конце. Проверка, которая не останавливает, хуже отсутствующей.
+TOKEN=""
 read_token() {
-  local t=""
+  local f mode
+  TOKEN=""
   if [ -n "$GHCR_TOKEN" ]; then
-    t=$GHCR_TOKEN
-  elif [ -n "$TOKEN_FILE" ]; then
-    [ -r "$TOKEN_FILE" ] || fail "не читается $TOKEN_FILE"
-    IFS= read -r t <"$TOKEN_FILE" || true
-  elif [ -t 0 ]; then
+    TOKEN=$GHCR_TOKEN
+    return 0
+  fi
+  f=$TOKEN_FILE
+  if [ -z "$f" ]; then f=$(default_token_file) || f=""; fi
+  if [ -n "$f" ]; then
+    [ -r "$f" ] || fail "не читается $f"
+    # Токен, читаемый всей машиной, — это токен соседей по общему VPS.
+    mode=$(stat -c '%a' "$f" 2>/dev/null || echo "")
+    case $mode in
+      600|400) ;;
+      *) fail "у $f права ${mode:-неизвестны}: chmod 600 $f — токен не должен читаться никем, кроме владельца" ;;
+    esac
+    IFS= read -r TOKEN <"$f" || true
+    log "токен реестра из $f"
+    return 0
+  fi
+  # Токен, положенный файлом один раз, превращает обновление в команду без
+  # аргументов — как у соседних проектов, которые собираются на месте и потому
+  # реестра не спрашивают вовсе.
+  if [ -t 0 ]; then
     printf 'Токен GHCR (PAT со scope read:packages), Enter — пропустить: ' >&2
-    IFS= read -rs t || true
+    IFS= read -rs TOKEN || true
     printf '\n' >&2
   fi
-  printf '%s' "$t"
 }
 
 # Ждём образ, собранный CI. Пока его нет, не тронуто ничего: ни база, ни
@@ -254,8 +298,8 @@ cmd_update() {
     return 0
   fi
 
-  local token
-  token=$(read_token)
+  read_token          # кладёт результат в TOKEN; в $( ) её звать нельзя, см. выше
+  local token=$TOKEN
 
   if [ "$DRY_RUN" = 1 ]; then
     WAIT_IMAGE=0            # сухой прогон не ждёт CI: он отвечает на вопрос «что сейчас»
