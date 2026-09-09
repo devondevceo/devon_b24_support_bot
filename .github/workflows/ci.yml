@@ -4,15 +4,13 @@
 # Отдельной среды у проекта нет, разработка идёт сразу на боевом сервере, поэтому
 # эти проверки — единственный рубеж между веткой и продом.
 #
-# **Раннер свой, на боевом VPS** (09.09.2026): минуты GitHub на тарифе кончились, а
-# выкатка без проверок недопустима. Метку задаёт переменная репозитория
-# `RUNNER_LABEL`, по умолчанию `b24sdbot`; вернуться на раннеры GitHub можно, не
-# трогая код — `RUNNER_LABEL=ubuntu-latest`. Установка — docs/80-deploy.md §8.9.
+# Раннеры — GitHub, и на публичном репозитории они бесплатны и не кончаются.
+# Метку задаёт переменная репозитория `RUNNER_LABEL` (по умолчанию `ubuntu-latest`).
 #
-# Чем это оплачено: проверки идут на той же машине, где живёт прод, и конкурируют
-# с ним за процессор. Отсюда два смягчения: раннер запускается с пониженным
-# приоритетом (`Nice`, `CPUWeight` в юните systemd), а один раннер выполняет один
-# job за раз — очередь вместо параллели здесь свойство, а не недостаток.
+# **Свой раннер здесь включать нельзя, пока репозиторий публичный** (09.09.2026):
+# `pull_request` исполняет код из ЧУЖОЙ ветки, а раннер стоял бы на боевом VPS
+# и состоял в группе `docker` — то есть чужой PR получал бы root на проде.
+# Подробности и порядок, если репозиторий снова станет приватным, — docs/80-deploy.md §8.9.
 
 name: CI
 
@@ -33,7 +31,7 @@ concurrency:
 jobs:
   lint:
     name: ruff
-    runs-on: ${{ vars.RUNNER_LABEL || 'b24sdbot' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -46,7 +44,7 @@ jobs:
 
   types:
     name: mypy --strict
-    runs-on: ${{ vars.RUNNER_LABEL || 'b24sdbot' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -59,7 +57,7 @@ jobs:
 
   tests:
     name: pytest
-    runs-on: ${{ vars.RUNNER_LABEL || 'b24sdbot' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     # Настоящая PostgreSQL, а не мок: тесты изоляции теннантов, синхронизации стадий
     # и вся цепочка миграций upgrade → downgrade → upgrade без неё молча пропускаются
     # (см. tests/conftest.py). Пропущенный тест изоляции нарушает docs/40-security.md §5.
@@ -71,9 +69,10 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports:
-          # Только на петлю. Раннер стоит на публичном VPS, а docker публикует порт
-          # в обход iptables хоста: без явного адреса тестовая база с паролем
-          # postgres/postgres была бы видна из интернета всё время прогона.
+          # Только на петлю. На раннере GitHub это ничего не меняет, а на своём —
+          # спасает: docker публикует порты в обход iptables хоста, и без явного
+          # адреса тестовая база с паролем postgres/postgres была бы видна
+          # из интернета всё время прогона.
           - 127.0.0.1:5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres"
@@ -114,7 +113,7 @@ jobs:
 
   frontend:
     name: miniapp build
-    runs-on: ${{ vars.RUNNER_LABEL || 'b24sdbot' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -131,7 +130,7 @@ jobs:
 
   secrets:
     name: gitleaks
-    runs-on: ${{ vars.RUNNER_LABEL || 'b24sdbot' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -143,7 +142,7 @@ jobs:
 
   image:
     name: docker build
-    runs-on: ${{ vars.RUNNER_LABEL || 'b24sdbot' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     # На push в main образ собирает и публикует deploy.yml — здесь только проверка,
     # что Dockerfile жив. Кеш общий, так что сборка при выкатке переиспользует слои.
     if: github.event_name == 'pull_request'
