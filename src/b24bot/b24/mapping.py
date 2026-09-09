@@ -130,3 +130,17 @@ def allowed_actions(task: dict[str, Any]) -> set[str]:
     """
     action = task.get("action") or {}
     return {k for k, v in action.items() if v is True} if isinstance(action, dict) else set()
+
+
+def forbidden_actions(task: dict[str, Any]) -> set[str]:
+    """Действия, которые портал запретил ЯВНО (`false`), а не просто не назвал.
+
+    Отсутствие ключа и `false` — разные вещи, и разница видна только здесь.
+    Блок `action` надёжен для запретов и не исчерпывающий для разрешений
+    (docs/00-portal-facts.md §9.5: при статусе 2 в нём не было `start`, хотя
+    вызов проходил). Поэтому дверь, у которой других входов нет, показывается
+    по отсутствию запрета, а не по наличию разрешения: пропавший ключ иначе
+    прячет её целиком, и человеку это выглядит как «функции нет вовсе».
+    """
+    action = task.get("action") or {}
+    return {k for k, v in action.items() if v is False} if isinstance(action, dict) else set()

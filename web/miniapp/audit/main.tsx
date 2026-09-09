@@ -79,7 +79,7 @@ const SCREENS: { name: string; node: React.ReactNode; click?: string }[] = [
   {
     name: 'Списание времени',
     node: <TaskCardScreen context={CONTEXT} taskId={233} onBack={noop} />,
-    click: '5 ч 30 мин',
+    click: 'Списать время',
   },
   {
     name: 'Меню разделов',

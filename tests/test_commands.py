@@ -95,3 +95,27 @@ def test_help_escapes_argument_placeholders() -> None:
 def test_task_number_shortcut_is_documented() -> None:
     """`/t_215` — не команда из меню, но узнать о нём человек может только из /help."""
     assert "/t_" in commands.render_help(private=False)
+
+
+# ------------------------------------------------- кнопки постоянной клавиатуры
+# Обещание то же, что у меню команд, только нарушается тише: нажатие постоянной
+# кнопки приходит обычным ТЕКСТОМ, без `callback_query`. Подпись, которой нет
+# в `PRIVATE_LABELS`, проваливается до общего ответа с подсказкой — и снаружи это
+# выглядит как «бот не реагирует на кнопки». Так уже было с «📊 Мои задачи».
+def test_every_private_button_is_understood() -> None:
+    from b24bot.bot import keyboards
+
+    labels = {b["text"] for row in keyboards.persistent_private()["keyboard"]
+              for b in row if "web_app" not in b}
+    orphans = labels - set(keyboards.PRIVATE_LABELS)
+    assert not orphans, f"кнопка нарисована, но не разбирается: {orphans}"
+
+
+def test_every_private_action_is_handled() -> None:
+    """И обратная сторона: разобранная подпись обязана доехать до ветки действия."""
+    body = HANDLERS[HANDLERS.index("async def _private_action("):]
+    body = body[:body.index("\n# ")]
+    from b24bot.bot import keyboards
+
+    for action in set(keyboards.PRIVATE_LABELS.values()):
+        assert re.search(rf'"{action}"', body), f"{action} не разбирается в _private_action"

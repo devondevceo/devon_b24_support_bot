@@ -21,12 +21,17 @@ import type { Context, Timelog } from '../types'
 type Props = {
   context: Context
   taskId: number
-  canAdd: boolean
   onClose: () => void
-  onLogged: (totalSeconds: number) => void
+  /** Карточка обновляет свою строку «Трудозатраты»; список ничего не пересчитывает. */
+  onLogged?: (totalSeconds: number) => void
 }
 
-export function TimelogSheet({ context, taskId, canAdd, onClose, onLogged }: Props) {
+/*
+ * Право на списание приходит вместе со списаниями (`can_add`), а не задаётся
+ * снаружи: лист открывается и из карточки, и прямо из списка задач, где блок
+ * `action` никто не читал. Одно место принимает решение — второго и не нужно.
+ */
+export function TimelogSheet({ context, taskId, onClose, onLogged }: Props) {
   const [data, setData] = useState<Timelog | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [busy, setBusy] = useState(false)
@@ -54,7 +59,7 @@ export function TimelogSheet({ context, taskId, canAdd, onClose, onLogged }: Pro
           startedAt ? fromLocalInput(startedAt) : undefined,
         )
         setData(fresh)
-        onLogged(fresh.total_seconds)
+        onLogged?.(fresh.total_seconds)
         setValue('')
         setComment('')
         setStartedAt('')
@@ -111,7 +116,7 @@ export function TimelogSheet({ context, taskId, canAdd, onClose, onLogged }: Pro
             </p>
           )}
 
-          {canAdd ? (
+          {data.can_add ? (
             <>
               <h3 className="section-label">Списать время</h3>
               <div className="preset-row">

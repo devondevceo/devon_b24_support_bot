@@ -53,8 +53,13 @@ const PAGE = pathToFileURL(pageFile).href
 
 const port = 9377
 const profile = mkdtempSync(join(tmpdir(), 'b24app-audit-profile-'))
+// Под root песочница Chrome не поднимается вовсе («Running as root without
+// --no-sandbox is not supported»), а стенд гоняют и в контейнере. Флаг ставится
+// только в этом случае: на машине разработчика песочница остаётся включённой.
+const ROOT_FLAGS = process.getuid?.() === 0 ? ['--no-sandbox'] : []
+
 const child = spawn(BROWSER, [
-  '--headless=new', `--remote-debugging-port=${port}`,
+  '--headless=new', ...ROOT_FLAGS, `--remote-debugging-port=${port}`,
   `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check',
   '--disable-extensions', '--force-device-scale-factor=1', 'about:blank',
 ], { stdio: 'ignore' })
