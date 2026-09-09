@@ -12,13 +12,14 @@
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
-from b24bot.b24 import errors
-from b24bot.bot import handlers
-from b24bot.domain import timelog
+from b24bot.b24 import errors, mapping
+from b24bot.bot import handlers, keyboards, texts
+from b24bot.domain import context, timelog
 
 
 # ------------------------------------------------------------ разбор времени
@@ -263,3 +264,370 @@ def test_checked_rejects_what_parse_duration_rejects() -> None:
         timelog.checked(30)
     with pytest.raises(timelog.BadDuration):
         timelog.checked(25 * 3600)
+
+
+# ------------------------------------------------------- дверь к списанию
+# Всё, что ниже, — про один урок: списание времени было сделано, но человек его
+# не находил. Кнопка карточки пряталась по ключу, которого в ответе портала могло
+# и не быть; списка задач с кнопкой не было вовсе; в личке двери не было совсем.
+def test_card_shows_the_time_button_when_the_portal_says_nothing() -> None:
+    """Отсутствие ключа — это «портал не сказал», а не «нельзя».
+
+    Блок `action` надёжен для запретов и не исчерпывающий для разрешений
+    (docs/00-portal-facts.md §9.5). У завершения и правки есть второй путь —
+    портал и приложение; у списания времени эта кнопка была единственной
+    дверью, и пропавший ключ прятал её целиком: человек видел не «нельзя»,
+    а «такой функции нет».
+    """
+    assert "⏱ Списать время" in _card_labels(allowed={"complete"}, forbidden=set())
+
+
+def test_card_hides_the_time_button_only_on_an_explicit_refusal() -> None:
+    assert "⏱ Списать время" not in _card_labels(
+        allowed={"complete", "elapsedtime.add"}, forbidden={"elapsedtime.add"})
+
+
+def test_forbidden_and_allowed_are_read_from_the_same_block() -> None:
+    """`false` и «ключа нет» обязаны различаться — на этом стоит правило выше."""
+    task = {"action": {"complete": True, "elapsedtime.add": False, "edit": None}}
+    assert mapping.allowed_actions(task) == {"complete"}
+    assert mapping.forbidden_actions(task) == {"elapsedtime.add"}
+    assert mapping.forbidden_actions({"action": {}}) == set()
+    assert mapping.forbidden_actions({}) == set()
+
+
+def _card_labels(*, allowed: set[str], forbidden: set[str]) -> list[str]:
+    tokens = {"complete": "c", "refresh": "r", "timelog": "tl", "back": "b"}
+    markup = keyboards.task_card(tokens, allowed=allowed, forbidden=forbidden,
+                                 portal_url="https://p.example/task/1/")
+    return [b["text"] for row in markup["inline_keyboard"] for b in row]
+
+
+def test_pick_puts_one_button_under_each_task() -> None:
+    """Кнопка под каждой задачей — то, о чём просили: номер наизусть не помнят."""
+    items = [("t1", "⏱ #233"), ("t2", "⏱ #234"), ("t3", "⏱ #235"), ("t4", "⏱ #236")]
+    rows = keyboards.timelog_pick(items)["inline_keyboard"]
+    assert [b["text"] for row in rows for b in row] == [label for _t, label in items]
+    assert all(b["callback_data"].startswith("tl:") for row in rows for b in row)
+    assert all(len(row) <= 3 for row in rows), "четыре в ряд на телефоне режутся"
+
+
+def test_pick_in_private_goes_to_its_own_branch() -> None:
+    """В личке ChatContext взять неоткуда, и разбор идёт до его загрузки.
+
+    Общий префикс означал бы, что кнопку из чата можно отправить в ветку,
+    которая проверяет права по теннанту, а не по привязке чата.
+    """
+    rows = keyboards.timelog_pick([("t1", "⏱ #233")], private=True)["inline_keyboard"]
+    assert rows[0][0]["callback_data"].startswith("tm:")
+
+
+def test_private_keyboard_has_a_visible_door() -> None:
+    """Списание времени — действие, а не отчёт: у него своя кнопка и своё слово."""
+    labels = [b["text"] for row in keyboards.persistent_private()["keyboard"]
+              for b in row]
+    assert "⏱ Списать время" in labels
+    assert keyboards.PRIVATE_LABELS["⏱ Списать время"] == "timelog"
+
+
+def test_the_old_report_label_still_works() -> None:
+    """Клавиатура у человека обновится только с нашим следующим ответом.
+
+    До тех пор он жмёт ту кнопку, что стоит у него на экране, и «бот не
+    реагирует» — это ровно то, чего стоит один переименованный ярлык.
+    """
+    assert keyboards.PRIVATE_LABELS["⏱ Трудозатраты"] == "timesheet"
+    assert keyboards.PRIVATE_LABELS["📈 Трудозатраты"] == "timesheet"
+
+
+def test_time_command_without_a_number_offers_the_list(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """`/time` без номера — не ошибка формата, а самый частый способ им пользоваться."""
+    seen: list[str] = []
+
+    async def pick(ctx: object, tg_user_id: int, b24_user_id: int) -> handlers.Reply:
+        seen.append("pick")
+        return handlers.Reply("список")
+
+    async def linked(tenant_id: int, tg_user_id: int) -> int:
+        return 42
+
+    monkeypatch.setattr(handlers, "_timelog_pick", pick)
+    monkeypatch.setattr(handlers.access, "linked_b24_user", linked)
+    reply = asyncio.run(handlers._time_command(_chat_ctx(), _msg(), "", 77))
+    assert seen == ["pick"]
+    assert reply.text == "список"
+
+
+def test_time_command_with_a_number_opens_that_task(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Спросили про конкретную задачу — открываем её экран, а не читаем формат."""
+    seen: list[dict[str, Any]] = []
+
+    async def screen(ctx: object, tg_user_id: int,
+                     payload: dict[str, Any]) -> handlers.Reply:
+        seen.append(payload)
+        return handlers.Reply("экран задачи")
+
+    async def linked(tenant_id: int, tg_user_id: int) -> int:
+        return 42
+
+    monkeypatch.setattr(handlers, "_timelog", screen)
+    monkeypatch.setattr(handlers.access, "linked_b24_user", linked)
+    reply = asyncio.run(handlers._time_command(_chat_ctx(), _msg(), "233", 77))
+    assert seen == [{"task_id": 233, "act": "menu"}]
+    assert reply.text == "экран задачи"
+
+
+def test_bad_duration_is_still_a_refusal_not_a_screen(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """«/time 233 полчаса» — это опечатка, и молча открывать экран нельзя."""
+    async def linked(tenant_id: int, tg_user_id: int) -> int:
+        return 42
+
+    monkeypatch.setattr(handlers.access, "linked_b24_user", linked)
+    reply = asyncio.run(handlers._time_command(_chat_ctx(), _msg(), "233 полчаса", 77))
+    assert "Не понял" in reply.text
+
+
+def test_pick_falls_back_to_all_open_tasks_and_says_so(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Пустой ответ на «списать время» читался бы как поломка.
+
+    На человека может быть не назначено ничего — но списывают время и в чужие
+    задачи, поэтому список не схлопывается, а меняет заголовок и объясняет себя.
+    """
+    reply = asyncio.run(_run_pick(monkeypatch, responsible=999))
+    assert texts.MSG_TIMELOG_PICK_NONE_MINE in reply.text
+    assert "⏱ Открытые задачи" in reply.text
+    labels = [b["text"] for row in reply.markup["inline_keyboard"] for b in row]
+    assert labels == ["⏱ #233", "⏱ #234"]
+
+
+def test_pick_shows_my_tasks_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    reply = asyncio.run(_run_pick(monkeypatch, responsible=42))
+    assert texts.MSG_TIMELOG_PICK_NONE_MINE not in reply.text
+    assert "⏱ Мои задачи" in reply.text
+
+
+def test_pick_says_when_there_is_nothing_at_all(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    reply = asyncio.run(_run_pick(monkeypatch, responsible=42, tasks=[]))
+    assert reply.markup is None
+    assert "/time" in reply.text, "путь по номеру остаётся и для закрытых задач"
+
+
+async def _run_pick(monkeypatch: pytest.MonkeyPatch, *, responsible: int,
+                    tasks: list[dict[str, Any]] | None = None) -> handlers.Reply:
+    """Прогон `/time` без номера с подменённым порталом. До базы дело не доходит."""
+    if tasks is None:
+        tasks = [{"id": 233, "title": "Лид-форма", "status": 3,
+                  "responsibleId": str(responsible)},
+                 {"id": 234, "title": "Выгрузка", "status": 2,
+                  "responsibleId": str(responsible)}]
+
+    class _Client:
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    async def client_for_user(tenant_id: int, b24_user_id: int,
+                              actor_tg_user_id: int | None = None) -> _Client:
+        return _Client()
+
+    async def fetch_open(client: object, group_ids: list[int]) -> list[dict[str, Any]]:
+        return tasks
+
+    async def domain(tenant_id: int) -> str:
+        return "devondev.bitrix24.ru"
+
+    async def token(ctx: object, tg_user_id: int, task_id: int, act: str,
+                    seconds: int | None = None) -> str:
+        return f"tok{task_id}"
+
+    monkeypatch.setattr(handlers.access, "client_for_user", client_for_user)
+    monkeypatch.setattr(handlers.views, "fetch_open", fetch_open)
+    monkeypatch.setattr(handlers, "_tenant_domain", domain)
+    monkeypatch.setattr(handlers, "_timelog_token", token)
+    return await handlers._timelog_pick(_chat_ctx(), 77, 42)
+
+
+def _chat_ctx() -> context.ChatContext:
+    return context.ChatContext(
+        chat_ref=5, chat_id=-100500, title="Поддержка", status="active",
+        tenant_id=1, is_forum=False,
+        projects=[context.ProjectRef(11, 101, "Devon SD BOT", "Линия Жизни")])
+
+
+def test_private_button_is_parsed_before_the_chat_context(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Личных чатов нет в `tg_chats`, и контекст там всегда пуст.
+
+    Разбирайся `tm` после его загрузки — кнопка отвечала бы «чат не подключён»
+    в диалоге, который сама же и завела. Та же причина, по которой до контекста
+    разбираются подтверждение задач и личный отчёт.
+    """
+    seen: list[dict[str, Any]] = []
+
+    async def consume(token: str, actor: int | None) -> dict[str, Any]:
+        return {"kind": "timelog_dm", "tenant_id": 1, "owner_tg_id": 77,
+                "chat_ref": None, "payload": {"task_id": 233, "act": "menu"}}
+
+    async def no_context(chat_id: int, thread_id: int | None = None) -> None:
+        return None
+
+    async def dm(tenant_id: int, tg_user_id: int,
+                 payload: dict[str, Any]) -> handlers.Reply:
+        seen.append(payload)
+        return handlers.Reply("экран списания")
+
+    monkeypatch.setattr(handlers, "consume_token", consume)
+    monkeypatch.setattr(handlers, "load_chat_context", no_context)
+    monkeypatch.setattr(handlers, "_dm_timelog", dm)
+
+    click = {"data": "tm:token", "from": {"id": 77},
+             "message": {"message_id": 1, "chat": {"id": 77, "type": "private"}}}
+    reply = asyncio.run(handlers.on_callback({}, click))
+    assert seen == [{"task_id": 233, "act": "menu"}]
+    assert reply is not None and reply.text == "экран списания"
+
+
+def test_chat_token_cannot_be_replayed_in_the_private_branch() -> None:
+    """Ветки проверяют доступ по-разному: чат — по привязке, личка — по теннанту.
+
+    Общий вид токена означал бы, что кнопку из чата можно отправить в ветку,
+    где проверка другая, и выглядела бы она выполненной.
+    """
+    from b24bot.bot import callbacks
+
+    assert not callbacks.accepts("tm", "timelog")
+    assert not callbacks.accepts("tl", "timelog_dm")
+    assert callbacks.accepts("tm", "timelog_dm")
+
+
+def test_private_screen_refuses_a_task_outside_the_tenant(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Граница И-3 в личке: чужая задача отвечает тем же текстом, что и любая другая."""
+    class _Client:
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    async def linked(tenant_id: int, tg_user_id: int) -> int:
+        return 42
+
+    async def client_for_user(tenant_id: int, b24_user_id: int,
+                              actor_tg_user_id: int | None = None) -> _Client:
+        return _Client()
+
+    async def read(client: object, task_id: int) -> dict[str, Any]:
+        return {"id": task_id, "title": "Чужая", "groupId": 33}
+
+    async def refuse(tenant_id: int, task_id: int,
+                     group_id_hint: int | None = None) -> None:
+        return None
+
+    async def added(*args: Any, **kw: Any) -> int:
+        raise AssertionError("списание в чужую задачу не должно доехать до портала")
+
+    monkeypatch.setattr(handlers.access, "linked_b24_user", linked)
+    monkeypatch.setattr(handlers.access, "client_for_user", client_for_user)
+    monkeypatch.setattr(handlers.task_service, "read", read)
+    monkeypatch.setattr(handlers, "authorize_task_for_tenant", refuse)
+    monkeypatch.setattr(handlers.timelog, "add", added)
+
+    reply = asyncio.run(handlers._dm_timelog(1, 77, {"task_id": 999, "act": "add",
+                                                     "seconds": 3600}))
+    assert reply.text == texts.MSG_TASK_NOT_FOUND
+
+
+def test_private_screen_logs_the_time_and_writes_the_journal(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Списание из лички — то же действие и то же имя в журнале, что из чата.
+
+    Разойдись имена, выборка «кто сколько списал» врала бы, ничем себя не выдав:
+    записи есть, они просто разные (страж `tests/test_audit_names.py`).
+    """
+    logged: list[tuple[int, int]] = []
+    audited: list[tuple[str, dict[str, Any]]] = []
+
+    class _Client:
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    async def linked(tenant_id: int, tg_user_id: int) -> int:
+        return 42
+
+    async def client_for_user(tenant_id: int, b24_user_id: int,
+                              actor_tg_user_id: int | None = None) -> _Client:
+        return _Client()
+
+    async def read(client: object, task_id: int) -> dict[str, Any]:
+        return {"id": task_id, "title": "Лид-форма", "groupId": 33,
+                "timeSpentInLogs": "3600"}
+
+    async def allow(tenant_id: int, task_id: int,
+                    group_id_hint: int | None = None) -> context.ProjectRef:
+        return context.ProjectRef(11, 33, "Devon SD BOT", "Линия Жизни")
+
+    async def add(client: object, task_id: int, seconds: int,
+                  **kw: Any) -> int:
+        logged.append((task_id, seconds))
+        return 1
+
+    async def for_task(client: object, task_id: int, total: int) -> timelog.TaskEntries:
+        return timelog.TaskEntries(entries=[], total_seconds=total, complete=True)
+
+    async def names(client: object, ids: list[int]) -> dict[int, str]:
+        return {}
+
+    async def record(tenant_id: int, action: str, **kw: Any) -> None:
+        audited.append((action, kw))
+
+    async def token(tenant_id: int, tg_user_id: int, task_id: int, act: str,
+                    seconds: int | None = None) -> str:
+        return "tok"
+
+    monkeypatch.setattr(handlers.access, "linked_b24_user", linked)
+    monkeypatch.setattr(handlers.access, "client_for_user", client_for_user)
+    monkeypatch.setattr(handlers.task_service, "read", read)
+    monkeypatch.setattr(handlers.task_service, "user_names", names)
+    monkeypatch.setattr(handlers, "authorize_task_for_tenant", allow)
+    monkeypatch.setattr(handlers.timelog, "add", add)
+    monkeypatch.setattr(handlers.timelog, "for_task", for_task)
+    monkeypatch.setattr(handlers.audit, "record", record)
+    monkeypatch.setattr(handlers, "_dm_timelog_token", token)
+
+    reply = asyncio.run(handlers._dm_timelog(1, 77, {"task_id": 233, "act": "add",
+                                                     "seconds": 3600}))
+    assert logged == [(233, 3600)]
+    assert audited and audited[0][0] == timelog.AUDIT_ACTION
+    assert "списано" in reply.text
+    labels = [b["text"] for row in reply.markup["inline_keyboard"] for b in row]
+    assert "◀️ К списку" in labels, "из лички возвращаться некуда, кроме списка"
+
+
+def test_pick_in_an_unbound_chat_names_the_real_problem(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """«Задач не видно» и «чат не привязан» — разные вещи, и второе чинится.
+
+    Область выборки задаёт только `GROUP_ID` (docs/40-security.md §1), поэтому
+    пустой список проектов не превращается в «все задачи портала» — но и молчать
+    о причине нельзя: человек ищет задачи, а чинить надо привязку.
+    """
+    async def boom(*args: Any, **kw: Any) -> None:
+        raise AssertionError("в чат без привязок ходить в портал незачем")
+
+    monkeypatch.setattr(handlers.access, "client_for_user", boom)
+    ctx = context.ChatContext(chat_ref=5, chat_id=-100500, title="Поддержка",
+                              status="active", tenant_id=1, is_forum=False,
+                              projects=[])
+    reply = asyncio.run(handlers._timelog_pick(ctx, 77, 42))
+    assert reply.text == texts.MSG_NO_PROJECT

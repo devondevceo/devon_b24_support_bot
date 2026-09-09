@@ -8,6 +8,7 @@ import { tg } from '../telegram'
 import { Icon } from '../ui/Icon'
 import { MenuSheet } from '../ui/MenuSheet'
 import { AppBar, IconButton, Pill, Refreshing, TaskSkeleton } from '../ui/parts'
+import { TimelogSheet } from './TimelogSheet'
 import {
   FILTER_SHORT,
   FILTER_TITLES,
@@ -49,6 +50,12 @@ export function TaskList({
   const [loading, setLoading] = useState(true)
   const [reload, setReload] = useState(0)
   const [pending, setPending] = useState(0)
+  /*
+   * Списание времени прямо из списка: у задачи, по которой работали, время
+   * списывают чаще, чем открывают её карточку. Лист сам читает и права, и
+   * уже сделанные списания, поэтому знать о задаче что-то ещё списку не нужно.
+   */
+  const [timelogTask, setTimelogTask] = useState<number | null>(null)
 
   // Поиск идёт в портал, поэтому не на каждую букву: полсекунды тишины —
   // и запрос. Иначе на длинном слове мы выбираем частотный лимит вхолостую.
@@ -202,12 +209,25 @@ export function TaskList({
               </h2>
               <div className="card flush">
                 {group.tasks.map((task) => (
-                  <TaskRow key={task.id} task={task} onOpen={onOpen} />
+                  <TaskRow
+                    key={task.id}
+                    task={task}
+                    onOpen={onOpen}
+                    onTimelog={setTimelogTask}
+                  />
                 ))}
               </div>
             </section>
           ))}
         </>
+      )}
+
+      {timelogTask === null ? null : (
+        <TimelogSheet
+          context={context}
+          taskId={timelogTask}
+          onClose={() => setTimelogTask(null)}
+        />
       )}
     </>
   )
@@ -285,35 +305,64 @@ function SearchBar({ value, onChange }: { value: string; onChange: (v: string) =
 
 /* ------------------------------------------------------------------ строка */
 
-function TaskRow({ task, onOpen }: { task: Task; onOpen: (id: number) => void }) {
+/*
+ * Строка списка — две кнопки в одной полосе, а не одна на всё.
+ *
+ * Кнопку в кнопку вложить нельзя, поэтому строка стала контейнером: слева
+ * открытие задачи во всю ширину, справа — списание времени. Вторая кнопка
+ * узкая и подписана только для скринридера: подпись «Списать время» у каждой
+ * из двадцати задач превратила бы список в столбец одинаковых слов.
+ */
+function TaskRow({
+  task,
+  onOpen,
+  onTimelog,
+}: {
+  task: Task
+  onOpen: (id: number) => void
+  onTimelog: (id: number) => void
+}) {
   const status = statusView(task.status, task.status_title)
   const view = task.overdue ? OVERDUE : status
   const due = deadlineView(task.deadline, task.overdue)
   const who = task.responsible.name || 'не назначен'
 
   return (
-    <button
-      type="button"
-      className="task"
-      data-depth={Math.min(task.depth, 2)}
-      data-priority={task.priority}
-      /* Скринридер получает связную фразу вместо россыпи значков. */
-      aria-label={`Задача ${task.id}. ${task.title}. ${view.title}. ${who}. ${due.text}`}
-      onClick={() => {
-        tg.press()
-        onOpen(task.id)
-      }}
-    >
-      <span className="status-dot" data-tone={view.tone} aria-hidden="true" />
-      <span className="task-title">{task.title}</span>
-      <span className="task-meta" aria-hidden="true">
-        <span className="num">#{task.id}</span>
-        <span className="who">{who}</span>
-        <Pill icon={due.icon} tone={due.tone}>
-          {due.text}
-        </Pill>
-      </span>
-    </button>
+    <div className="task-row">
+      <button
+        type="button"
+        className="task"
+        data-depth={Math.min(task.depth, 2)}
+        data-priority={task.priority}
+        /* Скринридер получает связную фразу вместо россыпи значков. */
+        aria-label={`Задача ${task.id}. ${task.title}. ${view.title}. ${who}. ${due.text}`}
+        onClick={() => {
+          tg.press()
+          onOpen(task.id)
+        }}
+      >
+        <span className="status-dot" data-tone={view.tone} aria-hidden="true" />
+        <span className="task-title">{task.title}</span>
+        <span className="task-meta" aria-hidden="true">
+          <span className="num">#{task.id}</span>
+          <span className="who">{who}</span>
+          <Pill icon={due.icon} tone={due.tone}>
+            {due.text}
+          </Pill>
+        </span>
+      </button>
+      <button
+        type="button"
+        className="task-time"
+        aria-label={`Списать время в задачу ${task.id}`}
+        onClick={() => {
+          tg.press()
+          onTimelog(task.id)
+        }}
+      >
+        <Icon name="timer" size={20} />
+      </button>
+    </div>
   )
 }
 

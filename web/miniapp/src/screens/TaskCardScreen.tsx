@@ -237,6 +237,17 @@ export function TaskCardScreen({ context, taskId, onBack }: Props) {
             Изменить
           </button>
         ) : null}
+        {/*
+          Списание времени — кнопка среди действий, а не только строка факта
+          выше. Строку читают как показание прибора, а не как дверь, и «где
+          списать время» оставалось вопросом. Показывается всегда: список
+          списаний полезен и тому, кому запись не разрешена, а само право
+          проверяет портал — лист скажет, если нельзя.
+        */}
+        <button type="button" className="btn sec" disabled={busy} onClick={() => setTimelog(true)}>
+          <Icon name="timer" size={18} />
+          Списать время
+        </button>
       </div>
 
       <Attach
@@ -261,7 +272,6 @@ export function TaskCardScreen({ context, taskId, onBack }: Props) {
         <TimelogSheet
           context={context}
           taskId={task.id}
-          canAdd={task.allowed.includes('elapsedtime.add')}
           onClose={() => setTimelog(false)}
           onLogged={(seconds) => setTask({ ...task, time_spent: seconds })}
         />

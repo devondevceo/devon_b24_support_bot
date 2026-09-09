@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 from b24bot.bot import callbacks
@@ -57,8 +58,9 @@ def persistent_private(app_url: str | None = None) -> dict[str, Any]:
     return {
         "keyboard": [
             [{"text": "📊 Мои задачи"}, {"text": "🔥 Просроченные"}],
+            [{"text": "⏱ Списать время"}, {"text": "📈 Трудозатраты"}],
             [{"text": "🔗 Мои чаты"}, {"text": "❓ Помощь"}],
-            [{"text": "🙋 Ожидают подтверждения"}, {"text": "⏱ Трудозатраты"}],
+            [{"text": "🙋 Ожидают подтверждения"}],
             *([app_row] if app_row else []),
         ],
         "resize_keyboard": True,
@@ -67,12 +69,18 @@ def persistent_private(app_url: str | None = None) -> dict[str, Any]:
     }
 
 
+# Подписи разбираются как ТЕКСТ: постоянная клавиатура шлёт обычное сообщение,
+# а не callback. Старое написание отчёта («⏱ Трудозатраты») оставлено нарочно:
+# клавиатура у человека обновляется только с нашим следующим ответом, и до тех
+# пор он жмёт ту кнопку, что стоит у него на экране.
 PRIVATE_LABELS = {
     "📊 Мои задачи": "mytasks",
     "🔥 Просроченные": "overdue",
+    "⏱ Списать время": "timelog",
+    "📈 Трудозатраты": "timesheet",
+    "⏱ Трудозатраты": "timesheet",
     "🔗 Мои чаты": "mychats",
     "🙋 Ожидают подтверждения": "pending",
-    "⏱ Трудозатраты": "timesheet",
     "❓ Помощь": "help",
 }
 
@@ -125,7 +133,8 @@ def task_list(numbers: list[tuple[str, str]], nav: list[Button] | None = None) -
 
 
 def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str,
-              app_url: str | None = None) -> dict[str, Any]:
+              app_url: str | None = None,
+              forbidden: Collection[str] = ()) -> dict[str, Any]:
     """Действия в карточке задачи.
 
     Набор строится по блоку `action` из ответа Битрикса: того, чего этому человеку
@@ -153,10 +162,18 @@ def task_card(tokens: dict[str, str], *, allowed: set[str], portal_url: str,
     if "edit" in allowed and "stage" in tokens:
         second.insert(0, cb("e", tokens["stage"], "📂 Стадия"))
     rows.append(second)
-    # Списание времени — своё право портала (`elapsedtime.add` в блоке `action`,
-    # проверено 29.08.2026), а не производная от `edit`: время можно списать и в
-    # закрытую задачу, и тому, кому правка полей не разрешена.
-    if "elapsedtime.add" in allowed and "timelog" in tokens:
+    # Списание времени — своё право портала (`elapsedtime.add` в блоке `action`),
+    # а не производная от `edit`: время можно списать и в закрытую задачу, и тому,
+    # кому правка полей не разрешена.
+    #
+    # Условие здесь ОТРИЦАТЕЛЬНОЕ, в отличие от кнопок выше, и это не небрежность.
+    # У завершения и правки есть второй путь — портал и приложение; у списания
+    # времени эта кнопка была единственной дверью, и отсутствие ключа в ответе
+    # прятало её целиком: человек видел не «нельзя», а «такой функции нет».
+    # Блок `action` надёжен для запретов и не исчерпывающий для разрешений
+    # (docs/00-portal-facts.md §9.5), поэтому дверь закрывает явный `false`,
+    # а решает всё равно портал — на самой записи.
+    if "timelog" in tokens and "elapsedtime.add" not in forbidden:
         rows.append([cb("tl", tokens["timelog"], "⏱ Списать время")])
     links: list[Button] = [url_button("🔗 Открыть в Б24", portal_url)]
     if app_url:
@@ -190,8 +207,34 @@ def edit_menu(tokens: dict[str, str], app_url: str | None = None) -> dict[str, A
     return inline(rows)
 
 
+def timelog_pick(items: list[tuple[str, str]], *,
+                 private: bool = False) -> dict[str, Any]:
+    """По кнопке списания на каждую задачу списка — то, что просили в чате.
+
+    Подпись несёт номер задачи, а не порядковый номер строки: в списке он и так
+    напечатан ссылкой, и человек жмёт то же самое, что читает. Три в ряд —
+    больше на телефоне режется.
+
+    Префикс разный, потому что разные ветки роутера: в личке ChatContext взять
+    неоткуда (личных чатов нет в `tg_chats`), и разбор идёт до его загрузки —
+    ровно как у подтверждения задач и личного отчёта. Ветвление литералами,
+    а не подстановкой: реестр префиксов сверяется с исходником (`callbacks.py`).
+    """
+    rows: Rows = []
+    row: list[Button] = []
+    for token, label in items:
+        row.append(cb("tm", token, label) if private else cb("tl", token, label))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return inline(rows)
+
+
 def timelog_menu(items: list[tuple[str, str]], back: str,
-                 app_url: str | None = None) -> dict[str, Any]:
+                 app_url: str | None = None, *,
+                 private: bool = False) -> dict[str, Any]:
     """Быстрые длительности по три в ряд плюс путь к произвольной.
 
     Свободного ввода в группе нет по той же причине, что и у правки полей: бот не
@@ -202,7 +245,7 @@ def timelog_menu(items: list[tuple[str, str]], back: str,
     rows: Rows = []
     row: list[Button] = []
     for token, label in items:
-        row.append(cb("tl", token, label))
+        row.append(cb("tm", token, label) if private else cb("tl", token, label))
         if len(row) == 3:
             rows.append(row)
             row = []
@@ -210,7 +253,10 @@ def timelog_menu(items: list[tuple[str, str]], back: str,
         rows.append(row)
     if app_url:
         rows.append([url_button("🧩 Другое время — в приложении", app_url)])
-    rows.append([cb("tl", back, "◀️ К карточке")])
+    # Назад из лички ведёт к списку задач: карточки там нет — она живёт в чате,
+    # где у задачи есть проект и права проверяются по привязке чата.
+    label = "◀️ К списку" if private else "◀️ К карточке"
+    rows.append([cb("tm", back, label) if private else cb("tl", back, label)])
     return inline(rows)
 
 

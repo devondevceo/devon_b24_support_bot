@@ -141,6 +141,12 @@ export type Timelog = {
   total_seconds: number
   /** Видны ли ВСЕ списания задачи. false — часть за окном выборки портала. */
   complete: boolean
+  /**
+   * Можно ли списывать время в эту задачу. Едет вместе со списаниями, а не
+   * берётся из карточки: лист открывается и прямо из списка задач, где
+   * карточку никто не читал.
+   */
+  can_add: boolean
   items: TimelogEntry[]
   presets: { seconds: number; label: string }[]
 }

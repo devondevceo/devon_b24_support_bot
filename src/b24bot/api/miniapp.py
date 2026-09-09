@@ -538,7 +538,7 @@ async def task_timelog(task_id: int, bundle: CtxDep) -> JSONResponse:
         entries = await timelog.for_task(client, task_id, total)
         names = await task_service.user_names(
             client, [e.user_id for e in entries.entries])
-    return JSONResponse(_timelog_body(entries, names))
+    return JSONResponse(_timelog_body(entries, names, task))
 
 
 @router.post("/tasks/{task_id}/timelog")
@@ -575,12 +575,18 @@ async def add_timelog(task_id: int, bundle: CtxDep, body: JsonBody) -> JSONRespo
         entries = await timelog.for_task(client, task_id, total)
         names = await task_service.user_names(
             client, [e.user_id for e in entries.entries])
-    return JSONResponse(_timelog_body(entries, names))
+    return JSONResponse(_timelog_body(entries, names, fresh))
 
 
-def _timelog_body(entries: timelog.TaskEntries,
-                  names: dict[int, str]) -> dict[str, Any]:
+def _timelog_body(entries: timelog.TaskEntries, names: dict[int, str],
+                  task: dict[str, Any]) -> dict[str, Any]:
     return {
+        # Форму списания показывает сам экран, поэтому право едет вместе с ним:
+        # лист открывается и из списка задач, где карточку никто не читал.
+        # Условие отрицательное — как у кнопки бота: блок `action` надёжен для
+        # запретов и не исчерпывающий для разрешений (docs/00-portal-facts.md §9.5),
+        # а пропавший ключ прятал бы единственную дверь целиком.
+        "can_add": "elapsedtime.add" not in mapping.forbidden_actions(task),
         "total_seconds": entries.total_seconds,
         # False означает «часть списаний за окном выборки портала», а не «их нет».
         # Разница видна только здесь, и молчать о ней нельзя.

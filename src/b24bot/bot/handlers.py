@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -42,6 +43,7 @@ from b24bot.domain.context import (
     ChatContext,
     ProjectRef,
     authorize_task_for_chat,
+    authorize_task_for_tenant,
     consume_token,
     issue_token,
     load_chat_context,
@@ -313,7 +315,11 @@ def time_input(arg: str, msg: dict[str, Any]) -> TimeInput:
 
 async def _time_command(ctx: ChatContext, msg: dict[str, Any], arg: str,
                         tg_user_id: int) -> Reply:
-    """`/time <номер> <время> [комментарий]` — списание времени в задачу."""
+    """`/time` — списание времени в задачу.
+
+    Без номера отвечает списком задач с кнопкой под каждой, с номером без
+    длительности — экраном этой задачи, полной формой — сразу списывает.
+    """
     if ctx.tenant_id is None:
         return Reply(texts.MSG_NOT_CLAIMED)
     b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
@@ -321,8 +327,16 @@ async def _time_command(ctx: ChatContext, msg: dict[str, Any], arg: str,
         return Reply(texts.MSG_NOT_LINKED)
 
     data = time_input(arg, msg)
-    if data.error == "usage" or data.task_id is None:
-        return Reply(texts.MSG_TIMELOG_USAGE)
+    if data.task_id is None:
+        # `/time` без номера — не ошибка, а самый частый способ им пользоваться:
+        # номер задачи наизусть не помнит никто. Отвечаем списком с кнопкой
+        # списания под каждой задачей.
+        return await _timelog_pick(ctx, tg_user_id, b24_user_id)
+    if data.seconds is None and data.error == "usage":
+        # Номер назвали, длительность нет — открываем экран задачи с быстрыми
+        # длительностями, а не выговариваем формат: спросили ровно про эту задачу.
+        return await _timelog(ctx, tg_user_id,
+                              {"task_id": data.task_id, "act": "menu"})
     if data.seconds is None:
         return Reply(texts.MSG_TIMELOG_BAD_DURATION.format(
             reason=esc_html(data.error)) + "\n\n" + texts.MSG_TIMELOG_USAGE)
@@ -992,6 +1006,9 @@ async def _render_card(ctx: ChatContext, tg_user_id: int, b24_user_id: int,
     await remember_task(ctx.tenant_id, project, task)
 
     allowed = mapping.allowed_actions(task)
+    # Явные запреты нужны отдельно от разрешений: списание времени показывается
+    # по отсутствию запрета (keyboards.task_card), а не по наличию ключа.
+    forbidden = mapping.forbidden_actions(task)
 
     tokens = {}
     for act in ("complete", "start", "pause", "refresh"):
@@ -1015,7 +1032,7 @@ async def _render_card(ctx: ChatContext, tg_user_id: int, b24_user_id: int,
                              stage_title=stage_title)
     return Reply(f"{note}\n\n{text}" if note else text,
                  markup=keyboards.task_card(
-                     tokens, allowed=allowed,
+                     tokens, allowed=allowed, forbidden=forbidden,
                      portal_url=views.portal_task_url(domain, task_id, b24_user_id),
                      app_url=app_url),
                  edit=True)
@@ -1089,6 +1106,80 @@ async def _task_action(ctx: ChatContext, tg_user_id: int, task_id: int,
 
 
 # -------------------------------------------------------------- трудозатраты
+async def _timelog_pick(ctx: ChatContext, tg_user_id: int,
+                        b24_user_id: int) -> Reply:
+    """Список задач чата, под каждой — своя кнопка списания времени.
+
+    Свои задачи вперёд: списывают время в первую очередь себе. Но если на
+    человека в этих проектах ничего не назначено, список не схлопывается в
+    пустоту — показываются все открытые, и об этом сказано текстом. Пустой ответ
+    на «списать время» читался бы как поломка, а не как «вам ничего не поручено».
+    """
+    if ctx.tenant_id is None:
+        return Reply(texts.MSG_NOT_CLAIMED)
+    group_ids = [p.b24_group_id for p in ctx.projects]
+    if not group_ids:
+        # «Задач не видно» и «чат не привязан» — разные вещи, и второе человек
+        # может починить сам. Область выборки задаёт только `GROUP_ID`, поэтому
+        # пустой список и не превращается в «все задачи портала» (views.fetch_open).
+        return Reply(texts.MSG_NO_PROJECT)
+    try:
+        client = await access.client_for_user(ctx.tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            tasks = await views.fetch_open(client, group_ids)
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24Error as exc:
+        log.warning("не удалось получить задачи для списания: %s", exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    async def token(task_id: int) -> str:
+        return await _timelog_token(ctx, tg_user_id, task_id, "menu")
+
+    return await _timelog_pick_reply(ctx.tenant_id, b24_user_id, tasks, issue=token)
+
+
+async def _timelog_pick_reply(tenant_id: int, b24_user_id: int,
+                              tasks: list[dict[str, Any]], *,
+                              issue: Callable[[int], Awaitable[str]],
+                              private: bool = False) -> Reply:
+    """Общее тело обоих списков — чата и лички.
+
+    Различий у них ровно два: откуда взялись задачи и под каким префиксом уедет
+    кнопка. Всё остальное — какие задачи считать своими, что делать, когда своих
+    нет, и как признаться в усечении — обязано быть одним: разъедься эти две
+    реализации, человек получал бы в личке и в чате разные списки на один вопрос.
+    """
+    mine = [t for t in tasks if str(t.get("responsibleId")) == str(b24_user_id)]
+    note = "" if mine else texts.MSG_TIMELOG_PICK_NONE_MINE
+    chosen = mine or tasks
+    if not chosen:
+        return Reply(texts.MSG_TIMELOG_PICK_EMPTY)
+
+    domain = await _tenant_domain(tenant_id)
+    title = "⏱ Мои задачи" if mine else "⏱ Открытые задачи"
+    text = "\n\n".join(x for x in (
+        texts.MSG_TIMELOG_PICK, note,
+        views.render_list(chosen, title=title, domain=domain,
+                          b24_user_id=b24_user_id)) if x)
+
+    # Порядок и предел — те же, что у текста списка: кнопка обязана стоять под
+    # той задачей, которую человек читает, а не под одиннадцатой из другой сортировки.
+    shown = views.flatten_for_buttons(chosen)
+    if len(chosen) > len(shown):
+        # Молчаливое усечение выглядит как баг продукта: сколько показано и
+        # сколько всего — обязательная часть ответа.
+        text += texts.MSG_TIMELOG_PICK_MORE.format(shown=len(shown),
+                                                   total=len(chosen))
+    items = [(await issue(int(t["id"])), f"⏱ #{int(t['id'])}") for t in shown]
+    # `edit` сработает только там, где есть что переписывать, — при возврате
+    # кнопкой «◀️ К списку». Команда и кнопка постоянной клавиатуры шлют обычное
+    # сообщение, и ответ на них уедет новым.
+    return Reply(text, markup=keyboards.timelog_pick(items, private=private),
+                 edit=private)
+
+
 async def _timelog_token(ctx: ChatContext, tg_user_id: int, task_id: int, act: str,
                          seconds: int | None = None) -> str:
     """Токен кнопки списания.
@@ -1497,9 +1588,11 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
         return await _link_offer(bot, tg_user_id, user)
     # Те же действия, что на постоянной клавиатуре: человек, привыкший к слешам,
     # не должен искать кнопку, а пришедший из меню Telegram — знать про кнопки.
-    slash_actions = {"status": "mine", "list": "mine",
+    # Имена действий — те же, что у подписей кнопок (`keyboards.PRIVATE_LABELS`):
+    # два названия одного и того же расходятся молча, а ветка разбора у них общая.
+    slash_actions = {"status": "mytasks", "list": "mytasks",
                      "overdue": "overdue", "mychats": "mychats",
-                     "pending": "pending"}
+                     "pending": "pending", "time": "timelog"}
     if name in slash_actions:
         return await _private_action(slash_actions[name], tg_user_id)
     return Reply(_help_text(private=True), markup=_private_kb())
@@ -1568,16 +1661,116 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
     except errors.B24Error:
         return Reply(texts.MSG_B24_UNAVAILABLE, markup=_private_kb())
 
+    if action == "timelog":
+        return await _dm_timelog_pick(tenant_id, tg_user_id, b24_user_id, tasks)
+
     if action == "overdue":
         tasks = [t for t in tasks if views.is_overdue(t)]
         title = "🔥 Просроченные"
-    else:
+    elif action == "mytasks":
         tasks = [t for t in tasks if str(t.get("responsibleId")) == str(b24_user_id)]
         title = "📊 Мои задачи"
+    else:
+        # Досюда доезжает только действие, для которого забыли ветку. Раньше
+        # такое молча показывало «Мои задачи» — то есть кнопка отвечала чужим
+        # экраном, и отличить это от задуманного было нечем. Ветку держит пустой
+        # страж `tests/test_commands.py::test_every_private_action_is_handled`.
+        log.warning("действие лички без ветки: %s", action)
+        return Reply(_help_text(private=True), markup=_private_kb())
     return Reply(views.render_list(tasks, title=title,
                                    domain=await _tenant_domain(tenant_id),
                                    b24_user_id=b24_user_id),
                  markup=_private_kb())
+
+
+# ------------------------------------------------- списание времени в личке
+# Личных чатов нет в `tg_chats` (dispatch.py), поэтому ChatContext здесь взять
+# неоткуда: у экрана свой префикс кнопок (`tm`), свой вид токена и своя проверка
+# доступа — по теннанту, а не по привязке чата. Ровно так же устроены остальные
+# личные экраны: подтверждение задач и отчёт по трудозатратам.
+async def _dm_timelog_token(tenant_id: int, tg_user_id: int, task_id: int, act: str,
+                            seconds: int | None = None) -> str:
+    """Токен кнопки списания в личке. Экран многоразовый, само списание — нет."""
+    payload: dict[str, Any] = {"task_id": task_id, "act": act}
+    if seconds is not None:
+        payload["seconds"] = seconds
+    return await issue_token("timelog_dm", tenant_id=tenant_id,
+                             owner_tg_id=tg_user_id, payload=payload,
+                             single_use=(act == "add"), ttl=timedelta(hours=12))
+
+
+async def _dm_timelog_pick(tenant_id: int, tg_user_id: int, b24_user_id: int,
+                           tasks: list[dict[str, Any]]) -> Reply:
+    """Выбор задачи кнопкой: то же, что `/time` в чате, только по всем проектам."""
+    async def token(task_id: int) -> str:
+        return await _dm_timelog_token(tenant_id, tg_user_id, task_id, "menu")
+
+    return await _timelog_pick_reply(tenant_id, b24_user_id, tasks,
+                                     issue=token, private=True)
+
+
+async def _dm_timelog(tenant_id: int, tg_user_id: int,
+                      payload: dict[str, Any]) -> Reply:
+    """Экран списаний задачи в личке и быстрое списание кнопкой."""
+    act = str(payload.get("act") or "menu")
+    if act == "list":
+        return await _private_action("timelog", tg_user_id)
+
+    b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
+    if b24_user_id is None:
+        return Reply(texts.MSG_NOT_LINKED)
+    task_id = int(payload["task_id"])
+    seconds = mapping.as_int(payload.get("seconds")) if act == "add" else None
+    if act == "add" and seconds is None:
+        return Reply(texts.MSG_DIALOG_EXPIRED)
+
+    try:
+        client = await access.client_for_user(tenant_id, b24_user_id,
+                                              actor_tg_user_id=tg_user_id)
+        async with client:
+            task = await task_service.read(client, task_id)
+            # Граница И-3 в личке: задача обязана принадлежать проекту этого
+            # теннанта, привязанному хоть к одному живому чату. Проверяется на
+            # каждом нажатии заново, а не один раз при выдаче кнопки.
+            project = await authorize_task_for_tenant(
+                tenant_id, task_id,
+                group_id_hint=mapping.as_int(task.get("groupId")))
+            if project is None:
+                return Reply(texts.MSG_TASK_NOT_FOUND)
+
+            note = ""
+            if seconds is not None:
+                await timelog.add(client, task_id, seconds)
+                await _audit_timelog(tenant_id, b24_user_id, tg_user_id, task_id,
+                                     project.id, seconds, source="bot")
+                task = await task_service.read(client, task_id)
+                note = texts.MSG_TIMELOG_DONE.format(
+                    task_id=task_id, duration=timelog.format_duration(seconds))
+
+            total = mapping.as_int(task.get("timeSpentInLogs")) or 0
+            entries = await timelog.for_task(client, task_id, total)
+            names = await task_service.user_names(
+                client, [e.user_id for e in entries.entries])
+    except NeedsReauth:
+        return Reply(texts.MSG_NEEDS_REAUTH)
+    except errors.B24AccessDenied as exc:
+        return Reply(texts.MSG_NO_RIGHTS_B24.format(reason=esc_html(exc.description)))
+    except errors.B24Error as exc:
+        log.warning("списание времени в задачу %s не удалось: %s", task_id, exc)
+        return Reply(texts.MSG_B24_UNAVAILABLE)
+
+    items = [(await _dm_timelog_token(tenant_id, tg_user_id, task_id, "add", value),
+              timelog.preset_label(value))
+             for value in timelog.PRESETS]
+    back = await _dm_timelog_token(tenant_id, tg_user_id, task_id, "list")
+    text = (views.render_timelog(task_id, entries, names,
+                                 task_title=str(task.get("title") or ""))
+            + "\n\n" + texts.MSG_TIMELOG_MENU.format(task_id=task_id)
+            + "\n" + texts.MSG_TIMELOG_HINT.format(task_id=task_id))
+    if note:
+        text = f"{note}\n\n{text}"
+    return Reply(text, markup=keyboards.timelog_menu(items, back, private=True),
+                 edit=True)
 
 
 # ------------------------------------------------------------ подтверждение задач
@@ -1711,7 +1904,9 @@ async def _link_offer(bot: dict[str, Any], tg_user_id: int,
             else texts.MSG_LINK_OFFER.format(portal=esc_html(started.portal_domain)))
     # Инлайн-кнопка вместо постоянной клавиатуры: их нельзя послать одним
     # сообщением, а ссылка тут и есть всё сообщение.
-    return Reply(text, buttons=[[keyboards.url_button("🔐 Войти в Битрикс24",
+    # Подпись называет результат, а не шаг: человек нажимает, чтобы привязать
+    # аккаунт, а вход в портал — то, что случится по дороге.
+    return Reply(text, buttons=[[keyboards.url_button("🔗 Привязать",
                                                       started.url)]])
 
 
@@ -2044,6 +2239,13 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
             return Reply(texts.MSG_DIALOG_EXPIRED)
         return await _private_timesheet(int(row["tenant_id"]), tg_user_id,
                                         payload.get("month"))
+
+    if ns == "tm":
+        # Списание времени в личке. Как и отчёт выше, живёт там, где ChatContext
+        # взять неоткуда, поэтому разбирается до его загрузки.
+        if row["tenant_id"] is None:
+            return Reply(texts.MSG_DIALOG_EXPIRED)
+        return await _dm_timelog(int(row["tenant_id"]), tg_user_id, payload)
 
     if ns == "av":
         # Кнопки подтверждения задачи живут в личке ответственного, а не в чате

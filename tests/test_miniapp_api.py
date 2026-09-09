@@ -68,7 +68,11 @@ class FakeClient:
     async def __aexit__(self, *exc: object) -> None:
         return None
 
-    async def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    # `lane` настоящий клиент принимает (лимитер разводит интерактив и фон), и
+    # подделка обязана принимать его же: иначе стенд расходится с боевой формой
+    # вызова, и тест падает там, где код верен.
+    async def call(self, method: str, params: dict[str, Any] | None = None,
+                   **_: Any) -> Any:
         self.calls.append((method, params or {}))
         return self.handler(method, params or {})
 
@@ -169,6 +173,10 @@ def default_portal(method: str, params: dict[str, Any]) -> Any:
         return {"tasks": [task_body(100), task_body(101)]}
     if method == "tasks.task.get":
         return {"task": task_body(int(params.get("taskId", 100)))}
+    # Список списаний портал отдаёт массивом. `{"ok": True}` здесь ронял бы
+    # разбор на TypeError — то есть стенд отвечал бы формой, которой не бывает.
+    if method == "task.elapseditem.getlist":
+        return []
     return {"ok": True}
 
 

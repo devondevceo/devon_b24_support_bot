@@ -157,6 +157,48 @@ def _at(year: int, month: int, day: int) -> Any:
     return datetime(year, month, day, 12, 0, tzinfo=UTC)
 
 
+# ------------------------------------------- списание: право и его отсутствие
+async def test_timelog_allows_adding_when_the_portal_says_nothing(
+        portal: FakeClient) -> None:  # noqa: F811
+    """Право едет со списаниями, и отсутствие ключа — не запрет.
+
+    Блок `action` живой задачи содержит `complete` и `edit`, а про списание
+    молчит. Пока форма пряталась по наличию ключа, у человека не было ни формы,
+    ни объяснения — «списать время» в приложении просто не существовало.
+    """
+    body = (await request("GET", f"{BASE}/tasks/100/timelog?chat_ref={CHAT_REF}",
+                          auth=init_data())).json()
+    assert body["can_add"] is True
+
+
+async def test_timelog_form_is_hidden_only_on_an_explicit_refusal(
+        portal: FakeClient) -> None:  # noqa: F811
+    def handler(method: str, params: dict[str, Any]) -> Any:
+        if method == "tasks.task.get":
+            return {"task": task_body(100, action={"edit": True,
+                                                   "elapsedtime.add": False})}
+        return [] if method == "task.elapseditem.getlist" else {"ok": True}
+
+    portal.handler = handler
+    body = (await request("GET", f"{BASE}/tasks/100/timelog?chat_ref={CHAT_REF}",
+                          auth=init_data())).json()
+    assert body["can_add"] is False
+
+
+async def test_timelog_of_a_foreign_task_is_not_found(
+        portal: FakeClient) -> None:  # noqa: F811
+    """И-3: задача чужого проекта отвечает тем же 404, что и несуществующая."""
+    def handler(method: str, params: dict[str, Any]) -> Any:
+        if method == "tasks.task.get":
+            return {"task": task_body(100, groupId="999")}
+        return [] if method == "task.elapseditem.getlist" else {"ok": True}
+
+    portal.handler = handler
+    res = await request("GET", f"{BASE}/tasks/100/timelog?chat_ref={CHAT_REF}",
+                        auth=init_data())
+    assert res.status_code == 404
+
+
 # ---------------------------------------------------------------- опросник
 def _questions(*_: object, **__: object) -> Any:
     async def call() -> list[survey.Question]:

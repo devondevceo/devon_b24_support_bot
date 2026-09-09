@@ -105,6 +105,62 @@ async def test_hint_does_not_open_a_task_of_another_chat(db: object) -> None:
                                          group_id_hint=77) is None
 
 
+# ------------------------------------------- личка: чата нет, граница осталась
+# Списание времени из личного чата с ботом не может проверяться «привязкой ЭТОГО
+# чата»: личных чатов в `tg_chats` нет вовсе (dispatch.py). Граница поэтому шире
+# на один шаг — проект теннанта, привязанный хоть к одному живому чату, — и всё
+# самое дорогое проверяется здесь: не стала ли она шире, чем задумано.
+async def test_private_door_opens_only_its_own_tenant(db: object) -> None:
+    """У обоих теннантов группа 33: перепутать их — отдать чужой портал."""
+    from b24bot.domain.context import authorize_task_for_tenant
+
+    w = await _fixture_world(db)
+    own = await authorize_task_for_tenant(w["tenant_a"], 700, group_id_hint=33)
+    assert own is not None and own.id == w["project_a"]
+
+    alien = await authorize_task_for_tenant(w["tenant_b"], 700, group_id_hint=33)
+    assert alien is not None and alien.id == w["project_b"], "у каждого своя задача"
+    assert alien.id != w["project_a"]
+
+
+async def test_private_door_needs_a_bound_chat(db: object) -> None:
+    """Проект без единой живой привязки — не наш проект.
+
+    Иначе личный экран открывал бы задачи проектов, которые теннант когда-то
+    импортировал и отвязал: в чате их не видно, а в личке было бы видно.
+    """
+    from b24bot.domain.context import authorize_task_for_tenant
+
+    w = await _fixture_world(db)
+    lone = await db.fetchval(  # type: ignore[attr-defined]
+        "INSERT INTO projects (tenant_id, client_id, b24_group_id, name, status) "
+        "VALUES ($1, $2, 88, 'Отвязанный проект', 'active') RETURNING id",
+        w["tenant_a"], w["client_a"])
+    await db.execute(  # type: ignore[attr-defined]
+        "INSERT INTO task_cache (tenant_id, b24_task_id, project_id, b24_group_id, "
+        "is_ours, title) VALUES ($1, 701, $2, 88, true, 'Задача без чата')",
+        w["tenant_a"], lone)
+
+    assert await authorize_task_for_tenant(w["tenant_a"], 701) is None
+    assert await authorize_task_for_tenant(w["tenant_a"], 701,
+                                           group_id_hint=88) is None
+
+
+async def test_private_number_scan_finds_nothing(db: object) -> None:
+    """Перебор номеров из лички — та же атака, что `/t_<id>` в чужом чате."""
+    from b24bot.domain.context import authorize_task_for_tenant
+
+    w = await _fixture_world(db)
+    for task_id in range(300, 320):
+        await db.execute(  # type: ignore[attr-defined]
+            "INSERT INTO task_cache (tenant_id, b24_task_id, project_id, "
+            "b24_group_id, is_ours, title) VALUES ($1,$2,$3,33,true,$4)",
+            w["tenant_b"], task_id, w["project_b"], f"Задача {task_id}")
+
+    for task_id in range(300, 320):
+        assert await authorize_task_for_tenant(w["tenant_a"], task_id) is None
+
+
 async def test_number_scan_finds_nothing(db: object) -> None:
     """Перебор номеров задач из чужого чата обязан молчать на всём диапазоне.
 

@@ -450,15 +450,29 @@ body {
 }
 
 /* ================================================================== задачи */
+/*
+ * Строка списка — полоса из двух кнопок: открыть задачу и списать в неё время.
+ * Кнопку в кнопку HTML вложить не даёт, поэтому разделительная линия и признак
+ * «последняя строка» переехали сюда, на контейнер.
+ */
+.task-row {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.task-row:last-child { border-bottom: 0; }
+
 .task {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: 0 var(--sp-4);
-  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
   text-align: left;
   border: 0;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  background: transparent;
   color: var(--text);
   font: inherit;
   padding: var(--sp-5) var(--sp-6);
@@ -468,8 +482,31 @@ body {
     transform var(--dur-fast) var(--ease-out);
 }
 
-.task:last-child { border-bottom: 0; }
 .task:active { background: var(--well); transform: scale(0.99); }
+
+/*
+ * Списание времени у каждой задачи: значок без подписи. Подпись «Списать
+ * время» двадцать раз подряд читалась бы как столбец одинаковых слов и
+ * отняла бы у заголовков полэкрана; для скринридера подпись есть — своя
+ * на каждую строку, с номером задачи.
+ */
+.task-time {
+  flex: 0 0 auto;
+  width: 48px;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.task-time:active { background: var(--well); color: var(--accent); }
 
 /*
  * Высокий приоритет — рейка слева, а не значок в хвосте метаданных.

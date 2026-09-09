@@ -157,6 +157,57 @@ async def authorize_task_for_chat(tenant_id: int, chat_ref: int, b24_task_id: in
     return None
 
 
+async def authorize_task_for_tenant(tenant_id: int, b24_task_id: int, *,
+                                    group_id_hint: int | None = None) -> ProjectRef | None:
+    """То же, что `authorize_task_for_chat`, но для лички: чата там нет.
+
+    Личные чаты в `tg_chats` не регистрируются (dispatch.py), поэтому «проект
+    ЭТОГО чата» в личке не определено вовсе. Граница остаётся: задача обязана
+    принадлежать проекту ЭТОГО теннанта, привязанному хоть к одному живому чату.
+    Всё остальное режет портал — ходим личным токеном человека.
+
+    Так же устроены и остальные личные экраны: список «ожидают подтверждения» и
+    отчёт по трудозатратам собираются по всему теннанту, а не по одному чату.
+    Отказ, как и в И-3, одинаковый на все причины — иначе перебор номеров задач
+    работает оракулом существования.
+    """
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT p.id, p.b24_group_id, p.name, c.name AS client_name
+              FROM task_cache tc
+              JOIN projects p ON p.id = tc.project_id AND p.status = 'active'
+              JOIN clients  c ON c.id = p.client_id
+              JOIN chat_bindings b ON b.project_id = p.id AND b.status = 'active'
+             WHERE tc.tenant_id = $1 AND tc.b24_task_id = $2 AND tc.is_ours
+             LIMIT 1
+            """, tenant_id, b24_task_id)
+    if row is not None:
+        return ProjectRef(row["id"], row["b24_group_id"], row["name"], row["client_name"])
+
+    # Кэш наполняется событиями и созданием задач, поэтому давние задачи портала
+    # в нём отсутствуют, а список берётся живьём. Без дозапроса по группе экран
+    # отвечал бы «задача не найдена» на задачу, которую сам же и показал строкой
+    # выше — эта ошибка в проекте уже случалась.
+    if group_id_hint is not None:
+        async with pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT p.id, p.b24_group_id, p.name, c.name AS client_name
+                  FROM projects p
+                  JOIN clients c ON c.id = p.client_id
+                  JOIN chat_bindings b ON b.project_id = p.id AND b.status = 'active'
+                 WHERE p.tenant_id = $1 AND p.b24_group_id = $2 AND p.status = 'active'
+                 LIMIT 1
+                """, tenant_id, group_id_hint)
+        if row is not None:
+            return ProjectRef(row["id"], row["b24_group_id"], row["name"],
+                              row["client_name"])
+
+    log.info("отказ в доступе к задаче %s в личке теннанта %s", b24_task_id, tenant_id)
+    return None
+
+
 async def remember_task(tenant_id: int, project: ProjectRef, task: dict[str, Any]) -> None:
     """Подгрузить задачу в кэш после успешной проверки доступа."""
     async with pool().acquire() as conn:
