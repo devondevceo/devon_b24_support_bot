@@ -823,3 +823,136 @@ def test_private_keyboard_still_works_next_to_free_input(
                                 "text": "📋 Карточка задачи #233"}}
     asyncio.run(handlers._private(_BOT, None, 77, {}, "⏱ Списать время", msg))
     assert called == ["timelog"]
+
+
+# ---------------------------------------- `/time` с аргументами в личке
+# Дыра, найденная попутно 10.09.2026: в личке команда разбиралась как «действие
+# постоянной клавиатуры» и молча теряла и номер, и длительность — при том что
+# список задач сам эту короткую форму и советует.
+def _run_dm_time(monkeypatch: pytest.MonkeyPatch, arg: str,
+                 msg: dict[str, Any] | None = None) -> tuple[handlers.Reply,
+                                                             list[dict[str, Any]],
+                                                             list[str]]:
+    seen: list[dict[str, Any]] = []
+    listed: list[str] = []
+
+    async def dm_timelog(tenant_id: int, tg_user_id: int,
+                         payload: dict[str, Any]) -> handlers.Reply:
+        seen.append(payload)
+        return handlers.Reply("экран")
+
+    async def action(name: str, tg_user_id: int) -> handlers.Reply:
+        listed.append(name)
+        return handlers.Reply("список")
+
+    async def tenant_of_user(tg_user_id: int) -> int:
+        return 1
+
+    monkeypatch.setattr(handlers, "_dm_timelog", dm_timelog)
+    monkeypatch.setattr(handlers, "_private_action", action)
+    monkeypatch.setattr(handlers.access, "tenant_of_user", tenant_of_user)
+    reply = asyncio.run(handlers._private(_BOT, ("time", arg), 77, {}, f"/time {arg}",
+                                          msg or {"chat": {"type": "private"}}))
+    assert reply is not None
+    return reply, seen, listed
+
+
+def test_private_time_command_logs_the_full_form(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Полная форма списывает, а не показывает список.
+
+    Команда, печатающая своё обещание («быстрее одной командой») и не
+    выполняющая его, читается как поломка бота — то же правило, что у меню
+    команд: названная и неработающая команда хуже отсутствующей.
+    """
+    _reply, seen, listed = _run_dm_time(monkeypatch, "233 1ч30м починил интеграцию")
+    assert listed == []
+    assert seen == [{"task_id": 233, "act": "add", "seconds": 5400,
+                     "comment": "починил интеграцию"}]
+
+
+def test_private_time_command_with_only_a_number_opens_that_task(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _reply, seen, _listed = _run_dm_time(monkeypatch, "233")
+    assert seen == [{"task_id": 233, "act": "menu"}]
+
+
+def test_private_time_command_without_a_number_still_lists(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Пустая форма — самый частый способ пользоваться командой, и он не изменился."""
+    _reply, seen, listed = _run_dm_time(monkeypatch, "")
+    assert seen == []
+    assert listed == ["timelog"]
+
+
+def test_private_time_command_names_a_bad_duration(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    reply, seen, _listed = _run_dm_time(monkeypatch, "233 полчасика")
+    assert seen == [], "неразобранная длительность в портал не уходит"
+    assert "полчасика" in reply.text
+
+
+def test_private_time_command_carries_the_comment_to_the_portal(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Комментарий приезжает из команды и обязан доехать до портала.
+
+    До этой правки `_dm_timelog` звал `timelog.add` вовсе без комментария —
+    у кнопки его взять неоткуда, и параметра просто не было.
+    """
+    written: list[dict[str, Any]] = []
+
+    class _Client:
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    async def linked(tenant_id: int, tg_user_id: int) -> int:
+        return 42
+
+    async def client_for_user(tenant_id: int, b24_user_id: int,
+                              actor_tg_user_id: int | None = None) -> _Client:
+        return _Client()
+
+    async def read(client: object, task_id: int) -> dict[str, Any]:
+        return {"id": task_id, "title": "Задача", "groupId": 101,
+                "timeSpentInLogs": "5400"}
+
+    async def authorize(tenant_id: int, task_id: int,
+                        group_id_hint: int | None = None) -> context.ProjectRef:
+        return context.ProjectRef(11, 101, "Devon SD BOT", "Линия Жизни")
+
+    async def add(client: object, task_id: int, seconds: int, *,
+                  comment: str = "", started_at: str | None = None) -> int:
+        written.append({"task_id": task_id, "seconds": seconds, "comment": comment})
+        return 1
+
+    async def for_task(client: object, task_id: int,
+                       total: int) -> timelog.TaskEntries:
+        return timelog.TaskEntries([], total, complete=True)
+
+    async def names(client: object, ids: list[int]) -> dict[int, str]:
+        return {}
+
+    async def record(*args: Any, **kw: Any) -> None:
+        return None
+
+    async def token(tenant_id: int, tg_user_id: int, task_id: int, act: str,
+                    seconds: int | None = None) -> str:
+        return "tok"
+
+    monkeypatch.setattr(handlers.access, "linked_b24_user", linked)
+    monkeypatch.setattr(handlers.access, "client_for_user", client_for_user)
+    monkeypatch.setattr(handlers.task_service, "read", read)
+    monkeypatch.setattr(handlers.task_service, "user_names", names)
+    monkeypatch.setattr(handlers, "authorize_task_for_tenant", authorize)
+    monkeypatch.setattr(handlers.timelog, "add", add)
+    monkeypatch.setattr(handlers.timelog, "for_task", for_task)
+    monkeypatch.setattr(handlers.audit, "record", record)
+    monkeypatch.setattr(handlers, "_dm_timelog_token", token)
+
+    asyncio.run(handlers._dm_timelog(1, 77, {"task_id": 233, "act": "add",
+                                             "seconds": 5400,
+                                             "comment": "разбор логов"}))
+    assert written == [{"task_id": 233, "seconds": 5400, "comment": "разбор логов"}]

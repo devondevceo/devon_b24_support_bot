@@ -1352,6 +1352,40 @@ async def _timelog_answer(ctx: ChatContext, msg: dict[str, Any],
                           {"task_id": task_id, "act": "add", "seconds": seconds})
 
 
+async def _dm_time_command(tg_user_id: int, arg: str,
+                           msg: dict[str, Any]) -> Reply:
+    """`/time <номер> <время> [комментарий]` в личке — те же три формы, что в чате.
+
+    Разбор аргументов общий с чатом (`time_input`): разъедься он, одна и та же
+    строка в двух местах понималась бы по-разному. Отличается только область —
+    проекты всего теннанта вместо проектов одного чата (§3.3.4 спеки).
+    """
+    data = time_input(arg, msg)
+    if data.task_id is None:
+        return await _private_action("timelog", tg_user_id)
+
+    payload: dict[str, Any] = {"task_id": data.task_id, "act": "menu"}
+    if data.seconds is not None:
+        # Автор цитаты называется в самом комментарии: без этого списание
+        # выглядит так, будто отправивший пересказал чужие слова от своего имени.
+        comment = data.comment
+        if data.quoted_author:
+            comment = f"{comment} (из Telegram, автор: {data.quoted_author})"
+        payload = {"task_id": data.task_id, "act": "add",
+                   "seconds": data.seconds, "comment": comment}
+    elif data.error != "usage":
+        # Номер назвали, а длительность не разобрали — это ошибка, и о ней надо
+        # сказать. Пустая длительность ошибкой не считается: спросили про эту
+        # задачу, значит открываем её экран, а не выговариваем формат.
+        return Reply(texts.MSG_TIMELOG_BAD_DURATION.format(
+            reason=esc_html(data.error)) + "\n\n" + texts.MSG_TIMELOG_USAGE)
+
+    tenant_id = await access.tenant_of_user(tg_user_id)
+    if tenant_id is None:
+        return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
+    return await _dm_timelog(tenant_id, tg_user_id, payload)
+
+
 async def _dm_timelog_answer(tg_user_id: int, task_id: int, text: str) -> Reply:
     """То же в личке: контекста чата нет, проверка идёт по теннанту."""
     try:
@@ -1690,6 +1724,12 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
         return await _whoami(tg_user_id)
     if name == "link":
         return await _link_offer(bot, tg_user_id, user)
+    if name == "time" and arg:
+        # `/time 233 2ч` в личке отвечал списком задач, молча потеряв и номер,
+        # и длительность, — при том что сам этот список короткую форму и
+        # советует. Команда, печатающая своё обещание и не выполняющая его,
+        # читается как поломка бота: то же правило, что у меню команд.
+        return await _dm_time_command(tg_user_id, arg, msg or {})
     # Те же действия, что на постоянной клавиатуре: человек, привыкший к слешам,
     # не должен искать кнопку, а пришедший из меню Telegram — знать про кнопки.
     # Имена действий — те же, что у подписей кнопок (`keyboards.PRIVATE_LABELS`):
@@ -1846,7 +1886,10 @@ async def _dm_timelog(tenant_id: int, tg_user_id: int,
 
             note = ""
             if seconds is not None:
-                await timelog.add(client, task_id, seconds)
+                # Комментарий приезжает только из команды: у кнопки его взять
+                # неоткуда, а свободного ввода двух полей сразу в чате нет.
+                await timelog.add(client, task_id, seconds,
+                                  comment=str(payload.get("comment") or ""))
                 await _audit_timelog(tenant_id, b24_user_id, tg_user_id, task_id,
                                      project.id, seconds, source="bot")
                 task = await task_service.read(client, task_id)
