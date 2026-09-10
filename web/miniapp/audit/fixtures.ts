@@ -160,10 +160,14 @@ const ROUTES: Record<string, unknown> = {
       { id: 187, seconds: 5400, user_id: 3, user_name: 'Мария Орлова',
         at: '2026-08-28T14:20:00+03:00', comment: '' },
     ],
+    // Ровно то, что отдаёт `timelog.PRESETS`: часы рабочего дня, от одного до
+    // восьми. Стенд меряет перенос строки, а восемь кнопок переносятся иначе,
+    // чем шесть, — разъедься список с сервером, мерили бы не тот экран.
     presets: [
-      { seconds: 900, label: '15 м' }, { seconds: 1800, label: '30 м' },
       { seconds: 3600, label: '1 ч' }, { seconds: 7200, label: '2 ч' },
-      { seconds: 14400, label: '4 ч' }, { seconds: 28800, label: '8 ч' },
+      { seconds: 10800, label: '3 ч' }, { seconds: 14400, label: '4 ч' },
+      { seconds: 18000, label: '5 ч' }, { seconds: 21600, label: '6 ч' },
+      { seconds: 25200, label: '7 ч' }, { seconds: 28800, label: '8 ч' },
     ],
   },
   '/api/miniapp/surveys': {

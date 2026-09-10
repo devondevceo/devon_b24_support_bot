@@ -133,7 +133,7 @@ async def on_message(bot: dict[str, Any], msg: dict[str, Any]) -> Reply | None:
     cmd = _command(text, bot_username)
 
     if chat.get("type") == "private":
-        return await _private(bot, cmd, tg_user_id, user, text)
+        return await _private(bot, cmd, tg_user_id, user, text, msg)
 
     if ctx is None:
         return None
@@ -148,6 +148,11 @@ async def on_message(bot: dict[str, Any], msg: dict[str, Any]) -> Reply | None:
         answered = await _survey_answer(ctx, msg, reply_to, tg_user_id)
         if answered is not None:
             return answered
+        # Ответ на приглашение «✏️ Другое» — вторая и последняя форма свободного
+        # ввода в группе. Тоже строго реплаем и тоже на своё же сообщение.
+        logged = await _timelog_answer(ctx, msg, reply_to, tg_user_id, bot)
+        if logged is not None:
+            return logged
 
     # Реплай с упоминанием бота — основной триггер создания задачи.
     if reply_to and _mentions_bot(msg, bot_username):
@@ -1203,6 +1208,8 @@ async def _timelog(ctx: ChatContext, tg_user_id: int, payload: dict[str, Any]) -
     act = str(payload.get("act") or "menu")
     if act == "back":
         return await _open_card(ctx, tg_user_id, task_id)
+    if act == "ask":
+        return _timelog_ask(task_id)
     if ctx.tenant_id is None:
         return Reply(texts.MSG_NOT_CLAIMED)
     b24_user_id = await access.linked_b24_user(ctx.tenant_id, tg_user_id)
@@ -1258,6 +1265,7 @@ async def _timelog_screen(ctx: ChatContext, tg_user_id: int, client: Any,
               timelog.preset_label(value))
              for value in timelog.PRESETS]
     back = await _timelog_token(ctx, tg_user_id, task_id, "back")
+    ask = await _timelog_token(ctx, tg_user_id, task_id, "ask")
     app_url = await miniapp.link_for_chat(ctx.tenant_id or 0, ctx.chat_ref,
                                           thread_id=ctx.thread_id, task_id=task_id)
 
@@ -1265,7 +1273,130 @@ async def _timelog_screen(ctx: ChatContext, tg_user_id: int, client: Any,
                                  task_title=str(task.get("title") or ""))
             + "\n\n" + texts.MSG_TIMELOG_MENU.format(task_id=task_id)
             + "\n" + texts.MSG_TIMELOG_HINT.format(task_id=task_id))
-    return Reply(text, markup=keyboards.timelog_menu(items, back, app_url), edit=True)
+    return Reply(text, markup=keyboards.timelog_menu(items, back, ask, app_url),
+                 edit=True)
+
+
+# ------------------------------------------- свободный ввод длительности
+# Своего состояния у этого ввода нет и не заводится: вопрос уже написан в чате,
+# а реплай приносит его текст обратно вместе с номером задачи. Опросник хранит
+# `last_message_id`, потому что у него есть сессия на одного человека; здесь
+# сессии нет — списать время в ответ на приглашение вправе любой участник, и
+# каждый своим токеном.
+_ASK_TASK = re.compile(r"Списать время в задачу\s*#(\d+)")
+
+
+def timelog_ask_task_id(text: str) -> int | None:
+    """Номер задачи из нашего приглашения «✏️ Другое», если это оно.
+
+    Разметку снимаем: из Telegram текст приходит уже без тегов, а из
+    `texts.MSG_TIMELOG_ASK` — с ними, и страж обязан ходить тем же путём,
+    что живой реплай. Разъедься фраза и это выражение — кнопка «Другое»
+    молча перестала бы принимать ответы.
+    """
+    plain = re.sub(r"<[^>]+>", "", str(text or ""))
+    found = _ASK_TASK.search(plain)
+    return int(found.group(1)) if found else None
+
+
+def _timelog_ask(task_id: int) -> Reply:
+    """Приглашение к вводу — НОВЫМ сообщением и с полем ответа.
+
+    Редактированием тут не обойтись при всём желании: `force_reply` живёт
+    только в `sendMessage`, а `editMessageText` принимает исключительно
+    инлайн-клавиатуру. Экран списаний при этом остаётся в чате нетронутым —
+    и это к лучшему: человек видит, к чему относится вопрос.
+    """
+    return Reply(texts.MSG_TIMELOG_ASK.format(task_id=task_id),
+                 markup=keyboards.force_reply(texts.MSG_TIMELOG_PLACEHOLDER))
+
+
+def _asked_timelog_task(reply_to: dict[str, Any], bot: dict[str, Any]) -> int | None:
+    """Это ответ на НАШЕ приглашение? Иначе None — сообщение не наше дело.
+
+    Автора проверяем первым: тот же текст мог напечатать и человек, а реплай
+    на чужое сообщение — обычная реплика в переписке, съедать её нельзя.
+    """
+    author = reply_to.get("from") or {}
+    if not author.get("is_bot") or int(author.get("id") or 0) != int(bot["bot_id"]):
+        return None
+    return timelog_ask_task_id(_text_of(reply_to))
+
+
+def _timelog_retry(task_id: int, reason: str) -> Reply:
+    """Не разобрали — переспрашиваем тем же полем ответа.
+
+    Приглашение повторяется целиком, вместе с номером задачи: без него следующий
+    реплай прилетел бы на сообщение, в котором номера нет, и опознать его было бы
+    нечем — то есть за опечатку человек платил бы возвратом к карточке.
+    """
+    return Reply(texts.MSG_TIMELOG_BAD_DURATION.format(reason=esc_html(reason))
+                 + "\n\n" + texts.MSG_TIMELOG_ASK.format(task_id=task_id),
+                 markup=keyboards.force_reply(texts.MSG_TIMELOG_PLACEHOLDER))
+
+
+async def _timelog_answer(ctx: ChatContext, msg: dict[str, Any],
+                          reply_to: dict[str, Any], tg_user_id: int,
+                          bot: dict[str, Any]) -> Reply | None:
+    """Ответ длительностью в группе. None означает «это не про списание»."""
+    task_id = _asked_timelog_task(reply_to, bot)
+    if task_id is None:
+        return None
+    try:
+        seconds = timelog.parse_duration(_text_of(msg))
+    except timelog.BadDuration as exc:
+        return _timelog_retry(task_id, str(exc))
+    # Дальше — общий путь с кнопкой быстрой длительности: те же проверки прав,
+    # та же запись, тот же аудит. Второй дороги к `timelog.add` не заводится.
+    return await _timelog(ctx, tg_user_id,
+                          {"task_id": task_id, "act": "add", "seconds": seconds})
+
+
+async def _dm_time_command(tg_user_id: int, arg: str,
+                           msg: dict[str, Any]) -> Reply:
+    """`/time <номер> <время> [комментарий]` в личке — те же три формы, что в чате.
+
+    Разбор аргументов общий с чатом (`time_input`): разъедься он, одна и та же
+    строка в двух местах понималась бы по-разному. Отличается только область —
+    проекты всего теннанта вместо проектов одного чата (§3.3.4 спеки).
+    """
+    data = time_input(arg, msg)
+    if data.task_id is None:
+        return await _private_action("timelog", tg_user_id)
+
+    payload: dict[str, Any] = {"task_id": data.task_id, "act": "menu"}
+    if data.seconds is not None:
+        # Автор цитаты называется в самом комментарии: без этого списание
+        # выглядит так, будто отправивший пересказал чужие слова от своего имени.
+        comment = data.comment
+        if data.quoted_author:
+            comment = f"{comment} (из Telegram, автор: {data.quoted_author})"
+        payload = {"task_id": data.task_id, "act": "add",
+                   "seconds": data.seconds, "comment": comment}
+    elif data.error != "usage":
+        # Номер назвали, а длительность не разобрали — это ошибка, и о ней надо
+        # сказать. Пустая длительность ошибкой не считается: спросили про эту
+        # задачу, значит открываем её экран, а не выговариваем формат.
+        return Reply(texts.MSG_TIMELOG_BAD_DURATION.format(
+            reason=esc_html(data.error)) + "\n\n" + texts.MSG_TIMELOG_USAGE)
+
+    tenant_id = await access.tenant_of_user(tg_user_id)
+    if tenant_id is None:
+        return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
+    return await _dm_timelog(tenant_id, tg_user_id, payload)
+
+
+async def _dm_timelog_answer(tg_user_id: int, task_id: int, text: str) -> Reply:
+    """То же в личке: контекста чата нет, проверка идёт по теннанту."""
+    try:
+        seconds = timelog.parse_duration(text)
+    except timelog.BadDuration as exc:
+        return _timelog_retry(task_id, str(exc))
+    tenant_id = await access.tenant_of_user(tg_user_id)
+    if tenant_id is None:
+        return Reply(texts.MSG_NOT_LINKED, markup=_private_kb())
+    return await _dm_timelog(tenant_id, tg_user_id,
+                             {"task_id": task_id, "act": "add", "seconds": seconds})
 
 
 async def _audit_timelog(tenant_id: int, b24_user_id: int, tg_user_id: int | None,
@@ -1556,8 +1687,15 @@ async def _ensure_menu_button(bot: dict[str, Any], tg_user_id: int) -> None:
 
 async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
                    tg_user_id: int, user: dict[str, Any],
-                   text: str = "") -> Reply | None:
+                   text: str = "", msg: dict[str, Any] | None = None) -> Reply | None:
     if cmd is None:
+        # Ответ на приглашение «✏️ Другое». Реплаем, как и в группе: собеседник
+        # тут один, но правило ввода общее, а второе правило для лички означало
+        # бы, что одно и то же сообщение в двух местах понимается по-разному.
+        reply_to = (msg or {}).get("reply_to_message") or {}
+        task_id = _asked_timelog_task(reply_to, bot) if reply_to else None
+        if task_id is not None:
+            return await _dm_timelog_answer(tg_user_id, task_id, text)
         # Постоянная клавиатура шлёт обычный ТЕКСТ, а не callback. Без разбора
         # подписей любое нажатие выглядело как «бот не реагирует».
         action = keyboards.PRIVATE_LABELS.get(text.strip())
@@ -1586,6 +1724,12 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
         return await _whoami(tg_user_id)
     if name == "link":
         return await _link_offer(bot, tg_user_id, user)
+    if name == "time" and arg:
+        # `/time 233 2ч` в личке отвечал списком задач, молча потеряв и номер,
+        # и длительность, — при том что сам этот список короткую форму и
+        # советует. Команда, печатающая своё обещание и не выполняющая его,
+        # читается как поломка бота: то же правило, что у меню команд.
+        return await _dm_time_command(tg_user_id, arg, msg or {})
     # Те же действия, что на постоянной клавиатуре: человек, привыкший к слешам,
     # не должен искать кнопку, а пришедший из меню Telegram — знать про кнопки.
     # Имена действий — те же, что у подписей кнопок (`keyboards.PRIVATE_LABELS`):
@@ -1715,6 +1859,8 @@ async def _dm_timelog(tenant_id: int, tg_user_id: int,
     act = str(payload.get("act") or "menu")
     if act == "list":
         return await _private_action("timelog", tg_user_id)
+    if act == "ask":
+        return _timelog_ask(int(payload["task_id"]))
 
     b24_user_id = await access.linked_b24_user(tenant_id, tg_user_id)
     if b24_user_id is None:
@@ -1740,7 +1886,10 @@ async def _dm_timelog(tenant_id: int, tg_user_id: int,
 
             note = ""
             if seconds is not None:
-                await timelog.add(client, task_id, seconds)
+                # Комментарий приезжает только из команды: у кнопки его взять
+                # неоткуда, а свободного ввода двух полей сразу в чате нет.
+                await timelog.add(client, task_id, seconds,
+                                  comment=str(payload.get("comment") or ""))
                 await _audit_timelog(tenant_id, b24_user_id, tg_user_id, task_id,
                                      project.id, seconds, source="bot")
                 task = await task_service.read(client, task_id)
@@ -1763,13 +1912,14 @@ async def _dm_timelog(tenant_id: int, tg_user_id: int,
               timelog.preset_label(value))
              for value in timelog.PRESETS]
     back = await _dm_timelog_token(tenant_id, tg_user_id, task_id, "list")
+    ask = await _dm_timelog_token(tenant_id, tg_user_id, task_id, "ask")
     text = (views.render_timelog(task_id, entries, names,
                                  task_title=str(task.get("title") or ""))
             + "\n\n" + texts.MSG_TIMELOG_MENU.format(task_id=task_id)
             + "\n" + texts.MSG_TIMELOG_HINT.format(task_id=task_id))
     if note:
         text = f"{note}\n\n{text}"
-    return Reply(text, markup=keyboards.timelog_menu(items, back, private=True),
+    return Reply(text, markup=keyboards.timelog_menu(items, back, ask, private=True),
                  edit=True)
 
 
