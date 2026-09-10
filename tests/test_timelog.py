@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import pytest
@@ -631,3 +632,194 @@ def test_pick_in_an_unbound_chat_names_the_real_problem(
                               projects=[])
     reply = asyncio.run(handlers._timelog_pick(ctx, 77, 42))
     assert reply.text == texts.MSG_NO_PROJECT
+
+
+# ------------------------------------------- быстрые кнопки и свободный ввод
+# 09.09.2026, по заказчику: часы рабочего дня кнопками, всё остальное — «Другое».
+# Прежний набор (15 м, 30 м, 1, 2, 4, 8 ч) не покрывал 3, 5, 6 и 7 часов, то есть
+# половину смены нельзя было списать ни одной кнопкой.
+def test_quick_buttons_are_the_hours_of_a_working_day() -> None:
+    assert [seconds // 3600 for seconds in timelog.PRESETS] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert all(seconds % 3600 == 0 for seconds in timelog.PRESETS)
+    assert [timelog.preset_label(s) for s in timelog.PRESETS] == [
+        f"{h} ч" for h in range(1, 9)]
+
+
+def test_fractional_is_hours_because_fractional_minutes_do_not_exist() -> None:
+    """Два правила на голое число, и они не спорят.
+
+    Целое — минуты: опечатка в один символ при трактовке часами завышала бы
+    списание в шестьдесят раз. Дробное — часы: списаний на полторы минуты не
+    бывает (минимум и так минута), а запятую случайно не набирают.
+    """
+    assert timelog.parse_duration("90") == 5400        # целое — минуты
+    assert timelog.parse_duration("1,5") == 5400       # дробное — часы
+    assert timelog.parse_duration("1.5") == 5400
+    assert timelog.parse_duration("0,5") == 1800
+    assert timelog.parse_duration("0,25") == 900       # четверть часа, а не 25 минут
+    with pytest.raises(timelog.BadDuration):
+        timelog.parse_duration("0,01")                 # 36 секунд — ниже минимума
+
+
+def test_menu_is_three_rows_of_three_and_the_ninth_is_free_input() -> None:
+    items = [(f"t{s}", timelog.preset_label(s)) for s in timelog.PRESETS]
+    rows = keyboards.timelog_menu(items, "back", "ask")["inline_keyboard"]
+    assert [b["text"] for b in rows[0]] == ["1 ч", "2 ч", "3 ч"]
+    assert [b["text"] for b in rows[2]] == ["7 ч", "8 ч", "✏️ Другое"]
+    assert rows[-1][0]["text"] == "◀️ К карточке"
+    assert rows[2][2]["callback_data"] == "tl:ask"
+
+
+def test_free_input_button_lives_in_its_own_branch_in_private() -> None:
+    rows = keyboards.timelog_menu([("t", "1 ч")], "back", "ask",
+                                  private=True)["inline_keyboard"]
+    assert all(b["callback_data"].startswith("tm:") for row in rows for b in row)
+
+
+def test_ask_opens_a_reply_field_with_a_new_message() -> None:
+    """`force_reply` живёт только в `sendMessage`.
+
+    `editMessageText` принимает лишь инлайн-клавиатуру, поэтому приглашение
+    обязано ехать НОВЫМ сообщением, а не подменять собой экран списаний.
+    """
+    reply = asyncio.run(handlers._timelog(_chat_ctx(), 77,
+                                          {"task_id": 233, "act": "ask"}))
+    assert reply.edit is False
+    assert reply.markup == {"force_reply": True,
+                            "input_field_placeholder": texts.MSG_TIMELOG_PLACEHOLDER}
+    assert "#233" in reply.text
+
+
+def test_the_invitation_carries_the_task_number_back() -> None:
+    """Состояния у свободного ввода нет: номер едет в тексте вопроса.
+
+    Реплай приносит текст обратно — из Telegram уже без разметки. Разъедься
+    фраза и выражение разбора, кнопка «Другое» молча перестала бы принимать
+    ответы: сообщение уходило бы, а ответ на него никто не узнавал.
+    """
+    asked = texts.MSG_TIMELOG_ASK.format(task_id=4242)
+    assert handlers.timelog_ask_task_id(asked) == 4242
+    assert handlers.timelog_ask_task_id(re.sub(r"<[^>]+>", "", asked)) == 4242
+    assert handlers.timelog_ask_task_id("просто разговор в чате") is None
+
+
+_BOT = {"username": "devon_sd_bot", "bot_id": 900, "tenant_id": 1}
+
+
+def _ask_message(task_id: int = 233, *, author: dict[str, Any] | None = None,
+                 ) -> dict[str, Any]:
+    return {"message_id": 5, "from": author or {"id": 900, "is_bot": True},
+            "text": re.sub(r"<[^>]+>", "",
+                           texts.MSG_TIMELOG_ASK.format(task_id=task_id))}
+
+
+def test_only_our_own_invitation_is_answered() -> None:
+    """Тот же текст мог напечатать и человек, а реплай на чужое сообщение —
+    обычная реплика в переписке. Съев её, бот отвечал бы в чужой разговор."""
+    assert handlers._asked_timelog_task(
+        _ask_message(author={"id": 77, "is_bot": False}), _BOT) is None
+    assert handlers._asked_timelog_task(
+        _ask_message(author={"id": 901, "is_bot": True}), _BOT) is None
+    assert handlers._asked_timelog_task(_ask_message(), _BOT) == 233
+
+
+def test_free_input_goes_through_the_same_write_path(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ответ длительностью и кнопка «1 ч» приходят в одну и ту же функцию.
+
+    Вторая дорога к `timelog.add` означала бы вторую проверку прав и второй
+    аудит — то есть два места, где их можно забыть по-разному.
+    """
+    seen: list[dict[str, Any]] = []
+
+    async def spy(ctx: object, tg_user_id: int,
+                  payload: dict[str, Any]) -> handlers.Reply:
+        seen.append(payload)
+        return handlers.Reply("ok")
+
+    monkeypatch.setattr(handlers, "_timelog", spy)
+    reply = asyncio.run(handlers._timelog_answer(
+        _chat_ctx(), _msg(text="1ч30м"), _ask_message(), 77, _BOT))
+    assert reply is not None
+    assert seen == [{"task_id": 233, "act": "add", "seconds": 5400}]
+
+
+def test_a_reply_to_something_else_is_none_not_a_refusal(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """None означает «обрабатывай дальше»: за этой веткой стоит создание задачи
+    реплаем с упоминанием, и перехватив его, мы сломали бы главный сценарий."""
+    async def boom(*args: Any, **kw: Any) -> None:
+        raise AssertionError("до списания дело доходить не должно")
+
+    monkeypatch.setattr(handlers, "_timelog", boom)
+    other = {"message_id": 7, "from": {"id": 900, "is_bot": True},
+             "text": "📋 Карточка задачи #233"}
+    assert asyncio.run(handlers._timelog_answer(
+        _chat_ctx(), _msg(text="1ч30м"), other, 77, _BOT)) is None
+
+
+def test_a_typo_asks_again_and_the_second_answer_is_recognized(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Переспрос повторяет приглашение целиком, вместе с номером задачи.
+
+    Без номера следующий реплай прилетел бы на сообщение, в котором опознавать
+    нечего, — и за опечатку человек платил бы возвратом к карточке и повторным
+    нажатием «Другое».
+    """
+    async def boom(*args: Any, **kw: Any) -> None:
+        raise AssertionError("неразобранная длительность в портал не уходит")
+
+    monkeypatch.setattr(handlers, "_timelog", boom)
+    reply = asyncio.run(handlers._timelog_answer(
+        _chat_ctx(), _msg(text="полчасика"), _ask_message(), 77, _BOT))
+    assert reply is not None
+    assert "полчасика" in reply.text
+    assert reply.markup == {"force_reply": True,
+                            "input_field_placeholder": texts.MSG_TIMELOG_PLACEHOLDER}
+    assert handlers.timelog_ask_task_id(reply.text) == 233
+
+
+def test_private_free_input_reaches_the_private_branch(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """В личке правило ввода то же самое.
+
+    Принимать там «следующее сообщение» было бы можно — собеседник один, — но
+    тогда одно и то же сообщение в двух местах понималось бы по-разному, а
+    подписи постоянной клавиатуры («45» рядом с «📊 Мои задачи») разбирались бы
+    в зависимости от того, чем закончился прошлый экран.
+    """
+    seen: list[dict[str, Any]] = []
+
+    async def spy(tenant_id: int, tg_user_id: int,
+                  payload: dict[str, Any]) -> handlers.Reply:
+        seen.append(payload)
+        return handlers.Reply("ok")
+
+    async def tenant_of_user(tg_user_id: int) -> int:
+        return 1
+
+    monkeypatch.setattr(handlers, "_dm_timelog", spy)
+    monkeypatch.setattr(handlers.access, "tenant_of_user", tenant_of_user)
+    msg = {"chat": {"id": 77, "type": "private"}, "from": {"id": 77},
+           "text": "45", "reply_to_message": _ask_message(task_id=234)}
+    reply = asyncio.run(handlers._private(_BOT, None, 77, {}, "45", msg))
+    assert reply is not None
+    assert seen == [{"task_id": 234, "act": "add", "seconds": 2700}]
+
+
+def test_private_keyboard_still_works_next_to_free_input(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Реплай на что угодно другое не должен глотать нажатие кнопки."""
+    called: list[str] = []
+
+    async def action(name: str, tg_user_id: int) -> handlers.Reply:
+        called.append(name)
+        return handlers.Reply("ok")
+
+    monkeypatch.setattr(handlers, "_private_action", action)
+    msg = {"chat": {"id": 77, "type": "private"}, "from": {"id": 77},
+           "text": "⏱ Списать время",
+           "reply_to_message": {"message_id": 9, "from": {"id": 900, "is_bot": True},
+                                "text": "📋 Карточка задачи #233"}}
+    asyncio.run(handlers._private(_BOT, None, 77, {}, "⏱ Списать время", msg))
+    assert called == ["timelog"]

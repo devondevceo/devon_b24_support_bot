@@ -141,10 +141,15 @@ export function TimelogSheet({ context, taskId, onClose, onLogged }: Props) {
                   type="text"
                   inputMode="text"
                   value={value}
-                  placeholder="1ч30м, 1:30 или 90"
+                  placeholder="1ч30м, 1:30, 45 или 1,5"
                   onChange={(e) => setValue(e.target.value)}
                 />
-                <span className="help">Голое число — минуты.</span>
+                {/* Правило то же, что в боте (`texts.MSG_TIMELOG_FORMAT`), и
+                    названо теми же словами: разбор один, значит и объяснение
+                    обязано быть одно. */}
+                <span className="help">
+                  Целое число — минуты, дробное — часы: 1,5 это полтора.
+                </span>
               </label>
 
               <label className="field">
