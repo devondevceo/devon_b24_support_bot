@@ -23,9 +23,14 @@ HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-300}
 PUBLIC_TIMEOUT=${PUBLIC_TIMEOUT:-90}   # сколько ждём, пока Traefik переключит маршрут
 DISK_MAX_PCT=${DISK_MAX_PCT:-85}
 KEEP_DUMPS=${KEEP_DUMPS:-10}
+KEEP_PREV_IMAGES=${KEEP_PREV_IMAGES:-2}   # сколько предыдущих образов держать для отката без реестра
 
 REGISTRY=${IMAGE%%/*}
 NETWORK=b24sdbot-internal
+# Своё имя в реестре — граница уборки образов. Константа, а не вывод из IMAGE:
+# ручная выкатка (docs/80-deploy.md §8.10) несёт IMAGE=b24sdbot:manual-…, и уборка
+# по такому имени пошла бы не туда. Машина общая с чужим продом, шире не заходим.
+OWN_REPO=ghcr.io/devondevceo/devon_b24_support_bot
 
 cd "$APP_DIR"
 
@@ -38,14 +43,18 @@ exec 9>"$APP_DIR/.deploy.lock"
 flock -n 9 || fail "выкатка уже идёт (.deploy.lock занят)"
 
 switched=0
+verified=0   # релиз проверен снаружи — после этого отказ уже не повод откатывать образ
 dump=""
 prev_image=""
 prev_head=""
+new_digest=""
 
 cleanup() {
   local rc=$?
   [ -n "$GHCR_USER" ] && docker logout "$REGISTRY" >/dev/null 2>&1 || true
-  if [ "$rc" -ne 0 ] && [ "$switched" -eq 1 ] && [ -n "$prev_image" ]; then
+  if [ "$rc" -ne 0 ] && [ "$verified" -eq 1 ]; then
+    log "релиз $IMAGE проверен и работает, упало то, что после проверки, — образ не откатываю"
+  elif [ "$rc" -ne 0 ] && [ "$switched" -eq 1 ] && [ -n "$prev_image" ]; then
     log "———"
     log "ОТКАТ образа на $prev_image"
     if set_image "$prev_image" && docker compose up -d --no-build "${SERVICES[@]}"; then
@@ -76,12 +85,93 @@ set_image() {
   export APP_IMAGE="$ref"
 }
 
+disk_used() { df --output=pcent "$APP_DIR" | tail -1 | tr -dc '0-9'; }
+
+# Свои старые образы. `image prune` в уборке их не видит — он берёт только висячие,
+# а у каждой выкатки свой тег sha-<12>, и такие теги копились навсегда: 14.09.2026
+# их было 26 при диске на 86%, и выкатку пришлось готовить ручной чисткой.
+#
+# Оставляем текущий и KEEP_PREV_IMAGES предыдущих — то, на что rollback.sh
+# откатывается без реестра. «Предыдущие» — по журналу выкаток, а не по дате
+# сборки: дата отвечает на вопрос «когда собран», а откату нужен другой — «что
+# здесь работало». После отката старый образ снова текущий; образ неудавшейся
+# выкатки самый свежий и не работал ни минуты; коммит, не меняющий образ (журнал,
+# документы), собирается в тот же образ с той же датой. Журнал пишет этот скрипт
+# и читает rollback.sh — других источников, понятных обоим, нет.
+#
+# Считаем образы, а не теги: у пары тегов одного образа (так на сервере лежит
+# каждый релиз со следующей за ним записью в журнал) одно место под откат,
+# и оба тега живут, пока образ нужен.
+#
+# Удаляем `docker rmi <тег>` без -f: образ, на котором стоит контейнер, docker
+# удалить откажется сам. Отказ — строка в логе, а не провал выкатки. Вызывается
+# только через `|| true`, поэтому errexit внутри не действует — каждый шаг,
+# после сбоя которого удалять нельзя, проверен явно.
+prune_own_images() {
+  local want listing repo tag id ref err removed=0 refused=0
+  local -A id_of=() keep=()
+  local -a own=() held=() extra=()
+  want=$((10#$KEEP_PREV_IMAGES + 1))
+
+  # Фильтр демона — первый рубеж, точное сравнение имени — второй: шире своего
+  # имени уборка не заходит, как бы демон ни понял фильтр.
+  listing=$(docker images --no-trunc --format '{{.Repository}} {{.Tag}} {{.ID}}' "$OWN_REPO") \
+    || { log "свои образы: docker images не ответил — ничего не удаляю"; return 1; }
+  while read -r repo tag id; do
+    [ "$repo" = "$OWN_REPO" ] && [ -n "$id" ] || continue
+    case $tag in ''|'<none>') continue ;; esac
+    id_of[$repo:$tag]=$id
+    own+=("$repo:$tag")
+  done <<< "$listing"
+
+  # Текущий — по digest запущенных контейнеров, что бы ни было записано в журнале.
+  [ -n "$new_digest" ] && keep[$new_digest]=1
+  # Журнал от свежих записей к старым: выкаченный образ, затем тот, что работал
+  # до него. Образ, которого на диске уже нет, места под откат не занимает.
+  while IFS= read -r ref; do
+    [ "${#keep[@]}" -lt "$want" ] || break
+    [ -n "$ref" ] || continue
+    id=${id_of[$ref]:-}
+    [ -n "$id" ] && keep[$id]=1
+  done < <(tac .deploy/history | cut -f2,4 | tr '\t' '\n')
+
+  for ref in "${own[@]}"; do
+    id=${id_of[$ref]}
+    if [ -n "${keep[$id]+x}" ]; then held+=("${ref#"$OWN_REPO":}"); else extra+=("$ref"); fi
+  done
+  log "образы для отката: ${#keep[@]} из $want (${held[*]:-своих тегов нет}), лишних тегов: ${#extra[@]}"
+  [ "${#extra[@]}" -gt 0 ] || return 0
+
+  # Журнал короче, чем нужно откату, — значит, неизвестно, нет ли среди лишних
+  # тегов недостающих предыдущих (журнал стёрт или сервер новый). Не удаляем
+  # ничего: через пару выкаток журнал сам дорастёт до нужной длины.
+  if [ "${#keep[@]}" -lt "$want" ]; then
+    log "журнал выкаток короче, чем нужно откату, — лишние теги не трогаю"
+    return 1
+  fi
+
+  for ref in "${extra[@]}"; do
+    if err=$(docker rmi "$ref" 2>&1 >/dev/null </dev/null); then
+      removed=$((removed + 1))
+      log "удалён $ref"
+    else
+      refused=$((refused + 1))
+      log "не удалён $ref: ${err%%$'\n'*}"
+    fi
+  done
+  log "уборка своих тегов: удалено $removed, отказов $refused"
+}
+
 trap cleanup EXIT
 
 log "выкатка $IMAGE (коммит $GIT_SHA)"
 
+# Опечатка в числе иначе всплыла бы только в уборке, уже после выкатки.
+[[ $KEEP_PREV_IMAGES =~ ^[0-9]+$ ]] \
+  || fail "KEEP_PREV_IMAGES='$KEEP_PREV_IMAGES' — нужно целое число, 0 и больше"
+
 # --- 1. место на диске ------------------------------------------------------
-used=$(df --output=pcent "$APP_DIR" | tail -1 | tr -dc '0-9')
+used=$(disk_used)
 [ "$used" -le "$DISK_MAX_PCT" ] || fail "на диске занято ${used}%, предел ${DISK_MAX_PCT}%"
 log "диск: занято ${used}%"
 
@@ -201,11 +291,21 @@ until curl -fsS --max-time 15 "$HEALTH_URL" 2>/dev/null | grep -q '"status":"ok"
 done
 log "$HEALTH_URL отвечает ok"
 
-# --- 9. уборка --------------------------------------------------------------
+# Релиз проверен снаружи. Всё ниже — учёт и уборка, и их сбой не повод откатывать
+# работающий образ: откат здесь навредил бы ровно там, где выкатка уже удалась.
+verified=1
+
+# --- 9. журнал и уборка -----------------------------------------------------
+# Журнал пишется ДО уборки: по нему уборка решает, какие образы нужны откату.
+printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$IMAGE" "$GIT_SHA" "${prev_image:-—}" >> .deploy/history
+
 # image prune БЕЗ -a: с -a он снёс бы неиспользуемые образы соседей по машине.
+# Поэтому свои старые теги — отдельным шагом и только под своим именем.
+prune_own_images || true
 docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
 docker image prune -f --filter until=168h >/dev/null 2>&1 || true
 ls -1t backups/pre-deploy-*.sql.gz 2>/dev/null | tail -n +$((KEEP_DUMPS + 1)) | xargs -r rm -f
 
-printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$IMAGE" "$GIT_SHA" "${prev_image:-—}" >> .deploy/history
+# Следующая выкатка начнётся с проверки диска — пусть запас виден уже сейчас.
+log "диск после уборки: занято $(disk_used)%, предел выкатки ${DISK_MAX_PCT}%"
 log "готово: $IMAGE"

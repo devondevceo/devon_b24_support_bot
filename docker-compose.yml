@@ -70,8 +70,9 @@ services:
   # разойтись с main, и `docker compose up -d` тихо собрал бы из неё старый код —
   # ровно та авария 16.08, когда контейнеры были healthy со вчерашним main.py.
   # Точный тег пишет в .env выкатка (APP_IMAGE), см. scripts/deploy.sh.
-  # Аварийная сборка на месте, если CI недоступен:
-  #   docker build -t "$(grep ^APP_IMAGE= .env | cut -d= -f2-)" .
+  # Выкатка без CI — docs/80-deploy.md §8.10: образ собирается под своим тегом
+  # b24sdbot:manual-…, а не под именем реестра (под ним уборка считает всё
+  # скачиваемым обратно, §8.11), и выкатывается тем же scripts/deploy.sh.
   api:
     image: ${APP_IMAGE:-ghcr.io/devondevceo/devon_b24_support_bot:latest}
     container_name: b24sdbot-api
