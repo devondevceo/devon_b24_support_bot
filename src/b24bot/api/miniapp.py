@@ -52,6 +52,12 @@ FORM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 LIST_LIMIT = 200
 COMMENTS_LIMIT = 50
 
+# Одна формулировка на все пути и та же дорога, что у бота (`MSG_NEEDS_REAUTH`):
+# `/link` из Telegram. До 14.09.2026 здесь звали только в портал — туда, где
+# человека в эту минуту нет, — хотя бот с 27.08 советовал другое.
+NEEDS_REAUTH = ("Доступ к Битрикс24 истёк. Отправьте боту /link — он даст ссылку "
+                "на вход в портал, и доступ обновится.")
+
 ACTIONS = {"complete": "tasks.task.complete", "start": "tasks.task.start",
            "pause": "tasks.task.pause", "defer": "tasks.task.defer",
            "renew": "tasks.task.renew"}
@@ -478,9 +484,7 @@ async def approval_action(approval_id: int, actor: ActorDep, body: JsonBody) -> 
     if result.outcome == "already_done":
         raise ApiError(409, "already_done", "Решение по этой задаче уже принято.")
     if result.outcome == "needs_reauth":
-        raise ApiError(403, "needs_reauth",
-                       "Доступ к Битрикс24 истёк. Откройте приложение внутри портала "
-                       "и привяжите Telegram заново.")
+        raise ApiError(403, "needs_reauth", NEEDS_REAUTH)
     if result.outcome == "b24_error":
         raise ApiError(502, "upstream_error", "Битрикс24 не ответил. Попробуйте ещё раз.")
     # forbidden, not_found — тот же однотипный отказ, что и у И-3: не раскрываем,
@@ -755,9 +759,7 @@ def portal_failure(exc: Exception) -> ApiError:
     их в каждом обработчике — способ однажды забыть.
     """
     if isinstance(exc, NeedsReauth):
-        return ApiError(403, "needs_reauth",
-                        "Доступ к Битрикс24 истёк. Откройте приложение внутри портала "
-                        "и привяжите Telegram заново.")
+        return ApiError(403, "needs_reauth", NEEDS_REAUTH)
     if isinstance(exc, errors.B24AccessDenied):
         return ApiError(403, "b24_forbidden",
                         exc.description or "Битрикс24 отказал в доступе.")
