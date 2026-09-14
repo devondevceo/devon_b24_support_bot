@@ -7,7 +7,7 @@ import { OVERDUE, statusView } from '../status'
 import { tg } from '../telegram'
 import { Icon } from '../ui/Icon'
 import { MenuSheet } from '../ui/MenuSheet'
-import { AppBar, IconButton, Pill, Refreshing, TaskSkeleton } from '../ui/parts'
+import { AppBar, IconButton, Pill, Refreshing, SearchBar, TaskSkeleton } from '../ui/parts'
 import { TimelogSheet } from './TimelogSheet'
 import {
   FILTER_SHORT,
@@ -27,6 +27,7 @@ type Props = {
   onSummary: () => void
   onTimesheet: () => void
   onAbout: () => void
+  onGuide: () => void
   onSwitchChat: (() => void) | null
 }
 
@@ -39,6 +40,7 @@ export function TaskList({
   onSummary,
   onTimesheet,
   onAbout,
+  onGuide,
   onSwitchChat,
 }: Props) {
   const [menu, setMenu] = useState(false)
@@ -148,13 +150,20 @@ export function TaskList({
               : []),
             { key: 'about', icon: 'info', title: 'О приложении',
               hint: 'кто вы в системе и что тут есть', onPick: onAbout },
+            { key: 'guide', icon: 'book', title: 'Инструкция',
+              hint: 'как пользоваться ботом и приложением', onPick: onGuide },
           ]}
         />
       ) : null}
 
       <Filters value={filter} total={data?.total ?? null} onChange={setFilter} />
 
-      <SearchBar value={query} onChange={setQuery} />
+      <SearchBar
+        value={query}
+        onChange={setQuery}
+        placeholder="Поиск по заголовку"
+        label="Поиск задач по заголовку"
+      />
 
       {error ? (
         <Failure error={error} onRetry={retry} />
@@ -277,28 +286,6 @@ function Filters({
           </button>
         ))}
       </div>
-    </div>
-  )
-}
-
-function SearchBar({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  return (
-    <div className="searchbar">
-      <Icon name="search" size={20} />
-      <input
-        type="search"
-        value={value}
-        placeholder="Поиск по заголовку"
-        aria-label="Поиск задач по заголовку"
-        autoComplete="off"
-        onChange={(e) => onChange(e.target.value)}
-      />
-      {value ? (
-        <button type="button" className="clear" aria-label="Очистить поиск"
-                onClick={() => onChange('')}>
-          <Icon name="close" size={18} />
-        </button>
-      ) : null}
     </div>
   )
 }

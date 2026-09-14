@@ -208,6 +208,9 @@ try {
       // чем смотреть, но увидеть глазами иногда нужно — и лучше тем же стендом,
       // чем пересобирая всё вручную.
       const shot = argOf('--shot', '')
+      // --shot-height <px>: длинный экран (статья инструкции) целиком, а не
+      // первые 700px. Число, а не «весь»: полотно в 10 000px снимок не прочтёт.
+      const shotHeight = Number(argOf('--shot-height', '700')) || 700
       if (shot && theme === THEMES[0] && width === WIDTHS[0]) {
         const box = await cdp.send(
           'Runtime.evaluate',
@@ -224,7 +227,7 @@ try {
                 x: r.x + window.scrollX,
                 y: r.y + window.scrollY,
                 width: r.width,
-                height: Math.min(r.height, 700),
+                height: Math.min(r.height, ${shotHeight}),
               })
             })()`,
             returnByValue: true,
@@ -233,8 +236,12 @@ try {
         )
         if (box.result.value) {
           const clip = { ...JSON.parse(box.result.value), scale: 2 }
+          // Галерея шире окна в разы: без captureBeyondViewport всё правее
+          // 1600px снималось пустым фоном — то есть снимок работал только для
+          // первых четырёх экранов из двадцати и молча врал про остальные.
           const png = await cdp.send('Page.captureScreenshot',
-                                     { format: 'png', clip }, sessionId)
+                                     { format: 'png', clip, captureBeyondViewport: true },
+                                     sessionId)
           const file = join(HERE, 'shot.png')
           writeFileSync(file, Buffer.from(png.data, 'base64'))
           console.log(`снимок: ${file}`)

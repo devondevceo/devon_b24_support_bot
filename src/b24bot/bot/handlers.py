@@ -62,8 +62,16 @@ MAX_OPTIONS = 20  # вариантов ответа на один вопрос; 
 
 
 def _help_text(*, private: bool) -> str:
-    """Помощь строится из реестра команд: список в меню Telegram и в /help — один."""
-    return texts.MSG_HELP_HEAD + "\n\n" + commands.render_help(private=private)
+    """Помощь строится из реестра команд: список в меню Telegram и в /help — один.
+
+    В личке в конце — дорога к инструкции в приложении: /help отвечает на вопрос
+    «какие есть команды», а «как этим пользоваться» по шагам живёт там. В группе
+    ту же строку несёт `MSG_APP_HINT` рядом с кнопкой приложения.
+    """
+    text = texts.MSG_HELP_HEAD + "\n\n" + commands.render_help(private=private)
+    if private and miniapp.web_app_url():
+        text += texts.MSG_HELP_GUIDE
+    return text
 
 
 class Reply:
@@ -164,6 +172,22 @@ def _task_number(arg: str) -> int | None:
     """Номер задачи из аргумента команды или из ссылки на портал."""
     text = arg.strip()
     match = re.search(r"/task/view/(\d+)", text) or re.match(r"#?(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+_CARD_SHORTCUT = re.compile(r"t_([1-9]\d{0,11})")
+
+
+def card_shortcut(name: str) -> int | None:
+    """Номер задачи из `/t_233` — формы, где номер стоит в самом имени команды.
+
+    Telegram делает такую строку ссылкой, и одно касание открывает карточку.
+    Обещана в /help с первого дня (`commands.SPECIAL_HELP`) и в сводке
+    уведомлений, у которой кнопок нет, — а разбора не было вовсе: имя `t_233`
+    не совпадало ни с одной веткой роутера, и бот молча не отвечал. Нашлось
+    14.09.2026, когда инструкция в мини-аппе стала описывать эту команду.
+    """
+    match = _CARD_SHORTCUT.fullmatch(name)
     return int(match.group(1)) if match else None
 
 
@@ -1640,6 +1664,22 @@ def _private_kb() -> dict[str, Any]:
     return keyboards.persistent_private(miniapp.web_app_url())
 
 
+def _app_offer() -> Reply:
+    """«🧩 Приложение» в личке — инлайн-кнопки вместо кнопки клавиатуры.
+
+    Кнопка `web_app` на постоянной клавиатуре открывала мини-апп без подписи
+    Telegram (так устроен сам Telegram, см. `keyboards.persistent_private`), и оно
+    отвечало «работает только внутри Telegram». Инлайн-кнопка подпись передаёт.
+
+    Привязку здесь не проверяем: не привязанному приложение само скажет, что
+    делать, а инструкция в нём открывается и без привязки.
+    """
+    app, guide = miniapp.web_app_url(), miniapp.guide_url()
+    if app is None or guide is None:
+        return Reply(texts.MSG_APP_UNAVAILABLE, markup=_private_kb())
+    return Reply(texts.MSG_APP_OFFER, markup=keyboards.app_offer(app, guide))
+
+
 async def _open_app(packed: str, tg_user_id: int) -> Reply:
     """Открыть мини-апп в контексте чата, из которого пришли по ссылке.
 
@@ -1751,6 +1791,8 @@ async def _private_action(action: str, tg_user_id: int) -> Reply:
     """
     if action == "help":
         return Reply(_help_text(private=True), markup=_private_kb())
+    if action == "app":
+        return _app_offer()
 
     tenant_id = await access.tenant_of_user(tg_user_id)
     if tenant_id is None:
@@ -2110,6 +2152,12 @@ async def _group_command(bot: dict[str, Any], ctx: ChatContext, cmd: tuple[str, 
         return Reply(texts.MSG_NOT_CLAIMED)
     if not ctx.has_binding:
         return Reply(texts.MSG_NO_PROJECT)
+
+    # `/t_233`: та же карточка, что открывает кнопка с номером под списком, и
+    # та же дверь к ней — `_open_card` с проверкой принадлежности чату (И-3).
+    card = card_shortcut(name)
+    if card is not None:
+        return await _open_card(ctx, tg_user_id, card)
 
     if name in ("task", "ask"):
         # Порядок ключей важен: {"text": arg, **msg} затирает arg исходным текстом,

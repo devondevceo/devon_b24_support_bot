@@ -50,6 +50,11 @@ export type IconName =
   | 'paperclip'
   | 'questions'
   | 'trash'
+  | 'book'
+  | 'help'
+  | 'terminal'
+  | 'shield'
+  | 'phone'
 
 /** Пути в системе координат 24×24. Заливки нет нигде — только штрих. */
 const PATHS: Record<IconName, string[]> = {
@@ -115,6 +120,24 @@ const PATHS: Record<IconName, string[]> = {
   questions: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M4.4 6h.01', 'M4.4 12h.01', 'M4.4 18h.01'],
   trash: ['M4 7h16', 'M9.5 7V5.2a1.2 1.2 0 0 1 1.2-1.2h2.6a1.2 1.2 0 0 1 1.2 1.2V7',
           'M6.5 7l.8 12a1.6 1.6 0 0 0 1.6 1.5h6.2a1.6 1.6 0 0 0 1.6-1.5l.8-12'],
+  book: [
+    'M12 7v14',
+    'M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z',
+  ],
+  help: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3', 'M12 17h.01'],
+  terminal: ['m4.5 17 6-6-6-6', 'M12.5 19h7'],
+  shield: [
+    'M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.5 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z',
+  ],
+  phone: ['M7.5 2.5h9a2 2 0 0 1 2 2v15a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-15a2 2 0 0 1 2-2z', 'M12 17.5h.01'],
+}
+
+/**
+ * Имя значка, пришедшее строкой, — например, из текста инструкции. Проверка
+ * нужна рантайму: TypeScript не видит имён внутри строк с разметкой.
+ */
+export function isIconName(value: string): value is IconName {
+  return Object.prototype.hasOwnProperty.call(PATHS, value)
 }
 
 type Props = Omit<SVGProps<SVGSVGElement>, 'name'> & {

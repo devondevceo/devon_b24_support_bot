@@ -280,6 +280,16 @@ async def link_for_chat(tenant_id: int, chat_ref: int, *, thread_id: int | None 
     return f"https://t.me/{username}?start={START_PREFIX}{packed}"
 
 
+def guide_url() -> str | None:
+    """Адрес мини-аппа, открывающегося сразу на инструкции.
+
+    `open=guide` — подсказка экрана, а не доступ: инструкция не ходит в API и
+    одинакова для всех, поэтому подписывать тут нечего.
+    """
+    base = web_app_url()
+    return f"{base}?open=guide" if base else None
+
+
 def web_app_url_for(packed: str | None = None) -> str | None:
     """Адрес страницы мини-аппа, при необходимости с контекстом чата.
 

@@ -49,24 +49,41 @@ def web_app_button(text: str, url: str) -> dict[str, Any]:
 def persistent_private(app_url: str | None = None) -> dict[str, Any]:
     """Клавиатура снизу в личке с ботом. Не исчезает после нажатия.
 
-    Кнопка `web_app` разрешена Telegram только в личке — и именно поэтому здесь она
-    несёт сам адрес мини-аппа, без короткого имени из BotFather. В группе так нельзя,
-    там работает только ссылка `t.me/<бот>/<имя>?startapp=`.
+    Кнопка приложения здесь ОБЫЧНАЯ, текстовая, а не `web_app`, — и это не
+    упрощение. Мини-апп, запущенный кнопкой постоянной клавиатуры, не получает
+    подписи Telegram вовсе: WebAppInitData «is empty if the Mini App was launched
+    from a keyboard button» (core.telegram.org/bots/webapps). Без подписи
+    приложение не знает, кто перед ним, и отвечало «работает только внутри
+    Telegram» — внутри Telegram. Поэтому нажатие приходит текстом, а в ответ
+    уходит инлайн-кнопка `web_app`: у неё подпись есть (`app_offer`).
+
+    `app_url` решает только, показывать ли кнопку: мини-апп не развёрнут —
+    звать в него незачем.
     """
-    app_row: list[dict[str, Any]] = (
-        [{"text": "🧩 Приложение", "web_app": {"url": app_url}}] if app_url else [])
     return {
         "keyboard": [
             [{"text": "📊 Мои задачи"}, {"text": "🔥 Просроченные"}],
             [{"text": "⏱ Списать время"}, {"text": "📈 Трудозатраты"}],
             [{"text": "🔗 Мои чаты"}, {"text": "❓ Помощь"}],
             [{"text": "🙋 Ожидают подтверждения"}],
-            *([app_row] if app_row else []),
+            *([[{"text": "🧩 Приложение"}]] if app_url else []),
         ],
         "resize_keyboard": True,
         "is_persistent": True,
         "input_field_placeholder": "Напишите или выберите действие",
     }
+
+
+def app_offer(app_url: str, guide_url: str) -> dict[str, Any]:
+    """Ответ на «🧩 Приложение»: само приложение и инструкция в нём.
+
+    Инлайн-кнопки `web_app`, а не кнопки клавиатуры: только такие передают
+    мини-аппу подпись Telegram (см. `persistent_private`).
+    """
+    return inline([
+        [web_app_button("🧩 Открыть приложение", app_url)],
+        [web_app_button("📖 Инструкция", guide_url)],
+    ])
 
 
 # Подписи разбираются как ТЕКСТ: постоянная клавиатура шлёт обычное сообщение,
@@ -82,6 +99,7 @@ PRIVATE_LABELS = {
     "🔗 Мои чаты": "mychats",
     "🙋 Ожидают подтверждения": "pending",
     "❓ Помощь": "help",
+    "🧩 Приложение": "app",
 }
 
 

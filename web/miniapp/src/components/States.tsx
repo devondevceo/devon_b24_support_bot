@@ -23,7 +23,8 @@ export function Empty({
   icon = 'inbox',
 }: {
   title: string
-  hint?: string
+  /** Узел, а не только строка: в подсказке бывает команда бота в `<code>`. */
+  hint?: ReactNode
   action?: ReactNode
   icon?: IconName
 }) {

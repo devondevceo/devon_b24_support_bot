@@ -856,6 +856,13 @@ select {
   font-variant-numeric: tabular-nums;
 }
 
+/* Два действия пустого экрана — столбиком и не шире текста над ними:
+   во всю ширину планшета кнопка читается как полоса, а не как кнопка. */
+.state-actions {
+  max-width: 320px;
+  margin: 0 auto;
+}
+
 /* Скелетон вместо пустого экрана: каркас списка на месте — переход в готовый
    список не двигает ничего, спиннер по центру двигал всё. */
 .skeleton {
@@ -1439,6 +1446,181 @@ code {
 }
 
 .preset-row .btn { flex: 0 0 auto; }
+
+/* ============================================================== инструкция */
+/*
+ * Своего вида у инструкции нет намеренно: те же карточки, подписи разделов и
+ * строки меню, что на остальных экранах. Это часть приложения, а не сайт
+ * внутри него, — и читать её должно быть так же привычно, как пользоваться.
+ */
+.guide-menu {
+  padding-top: var(--sp-2);
+  padding-bottom: var(--sp-2);
+}
+
+/* Выдержка из найденной статьи — не больше трёх строк: список результатов
+   должен читаться списком, а не превращаться в стену текста. */
+.guide-menu .menu-text .muted {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.guide-hit {
+  background: var(--warn-bg);
+  color: var(--text);
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+/* Первая подпись статьи стоит сразу под шапкой — без отступа раздела. */
+.guide-article > section:first-child > .section-label { margin-top: 0; }
+
+.guide-body > * { margin: 0 0 var(--sp-5); }
+.guide-body > :last-child { margin-bottom: 0; }
+
+/* У последнего термина нет нижней черты, и абзац сразу под списком читался
+   его продолжением. Лишний шаг отступа отделяет список от текста за ним. */
+.guide-body > .guide-defs:not(:last-child) { margin-bottom: var(--sp-7); }
+
+.guide-p {
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+.guide-steps,
+.guide-list,
+.guide-legend {
+  list-style: none;
+  padding: 0;
+}
+
+/* Шаги — номером в кружке: порядок здесь и есть смысл, и его видно до чтения. */
+.guide-steps { counter-reset: step; }
+
+.guide-steps > li {
+  counter-increment: step;
+  position: relative;
+  min-height: 26px;
+  padding-left: calc(26px + var(--sp-5));
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+.guide-steps > li + li { margin-top: var(--sp-5); }
+
+.guide-steps > li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-full);
+  background: var(--accent-bg);
+  color: var(--accent-text);
+  font-size: var(--fs-md);
+  font-weight: 700;
+  line-height: 26px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.guide-list > li {
+  position: relative;
+  padding-left: var(--sp-6);
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+.guide-list > li + li { margin-top: var(--sp-4); }
+
+.guide-list > li::before {
+  content: "";
+  position: absolute;
+  left: var(--sp-2);
+  top: 0.62em;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--text-2);
+}
+
+/* Термин и объяснение — друг под другом, а не в две колонки: команда вроде
+   «/time 233 1ч30м починил» в узкую левую колонку не помещается. */
+.guide-defs { margin: 0; }
+
+.guide-def {
+  padding: var(--sp-4) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.guide-def:first-child { padding-top: 0; }
+.guide-def:last-child { padding-bottom: 0; border-bottom: 0; }
+
+.guide-def dt {
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+.guide-def dd {
+  margin: var(--sp-1) 0 0;
+  color: var(--text-2);
+  line-height: 1.45;
+  overflow-wrap: break-word;
+}
+
+.guide-legend {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-3) var(--sp-5);
+}
+
+.guide-legend > li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  min-width: 0;
+  line-height: 1.4;
+}
+
+.guide-sym {
+  flex: 0 0 1.5em;
+  text-align: center;
+}
+
+/*
+ * Кнопка бота в тексте — формой кнопки, а не словом в кавычках: её ищут глазами
+ * под сообщением в чате, и узнавать надо сам предмет. Подпись дословная, с эмодзи:
+ * это цитата из чата, а не значок интерфейса (docs/55-miniapp-design.md §8).
+ * Не переносится: кнопка, разорванная посреди подписи, читается как две.
+ */
+.bot-btn {
+  padding: 1px var(--sp-3);
+  border-radius: var(--r-sm);
+  background: var(--accent-bg);
+  color: var(--accent-text);
+  font-weight: 500;
+  white-space: nowrap;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* Кнопка или поле приложения — жирным, со значком, если у элемента он есть. */
+.ui-ref {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ui-ref > svg {
+  vertical-align: -3px;
+  margin-right: 3px;
+  color: var(--text-2);
+}
+
+.guide-go { margin: 0 0 var(--sp-5); }
 
 /* ====================================================== снижение движения */
 /*

@@ -35,6 +35,8 @@ type WebApp = {
   initData: string
   initDataUnsafe: { start_param?: string; user?: { id: number } }
   version: string
+  /** 'android', 'ios', 'tdesktop'… — и 'unknown', когда страница открыта не в Telegram. */
+  platform?: string
   colorScheme: 'light' | 'dark'
   themeParams: Record<string, string>
   isExpanded: boolean
@@ -128,6 +130,20 @@ function syncMain(): void {
 
 export const tg = {
   available: Boolean(webApp?.initData),
+
+  /**
+   * Открыто в клиенте Telegram, пусть и без подписи.
+   *
+   * Подписи (`initData`) нет у мини-аппа, запущенного кнопкой нижней клавиатуры
+   * бота: так устроен Telegram — WebAppInitData «is empty if the Mini App was
+   * launched from a keyboard button». Отличить этот случай от обычного браузера
+   * нужно ради подсказки: «откройте в Telegram» тому, кто уже в Telegram, —
+   * совет, который не помогает.
+   */
+  insideTelegram(): boolean {
+    const platform = webApp?.platform ?? 'unknown'
+    return platform !== 'unknown'
+  },
 
   initData(): string {
     return webApp?.initData ?? ''

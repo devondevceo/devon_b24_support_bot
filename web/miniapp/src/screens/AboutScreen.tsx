@@ -14,7 +14,7 @@ import { Icon, type IconName } from '../ui/Icon'
 import { AppBar, Pill, TaskSkeleton } from '../ui/parts'
 import { ROLE_TITLES, type Context, type Me } from '../types'
 
-type Props = { context: Context | null; onBack: () => void }
+type Props = { context: Context | null; onBack: () => void; onGuide: () => void }
 
 /** Что умеет приложение. Список ровно тот же, что разделы `/help` бота. */
 const ABILITIES: { icon: IconName; title: string; text: string }[] = [
@@ -28,7 +28,7 @@ const ABILITIES: { icon: IconName; title: string; text: string }[] = [
   { icon: 'bell', title: 'Подтверждение', text: 'Задачи, ждущие вашего решения, — по всему теннанту, а не только в этом чате.' },
 ]
 
-export function AboutScreen({ context, onBack }: Props) {
+export function AboutScreen({ context, onBack, onGuide }: Props) {
   const [me, setMe] = useState<Me | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [reload, setReload] = useState(0)
@@ -154,6 +154,37 @@ export function AboutScreen({ context, onBack }: Props) {
           </div>
         </>
       )}
+
+      {/* Список выше — что есть; как этим пользоваться — в инструкции. Стоит
+          вне загрузки и ошибки: сюда приходят, когда что-то не работает, и
+          инструкция нужна ровно тогда, когда /me не ответил. */}
+      <div className="card guide-menu">
+        <div className="menu-list">
+          <GuideLink onGuide={onGuide} />
+        </div>
+      </div>
     </>
+  )
+}
+
+function GuideLink({ onGuide }: { onGuide: () => void }) {
+  return (
+    <button
+      type="button"
+      className="menu-item"
+      onClick={() => {
+        tg.press()
+        onGuide()
+      }}
+    >
+      <span className="menu-icon" aria-hidden="true">
+        <Icon name="book" size={20} />
+      </span>
+      <span className="menu-text">
+        <span className="menu-title">Инструкция</span>
+        <span className="muted">как пользоваться ботом и приложением</span>
+      </span>
+      <Icon name="chevronRight" size={18} />
+    </button>
   )
 }
