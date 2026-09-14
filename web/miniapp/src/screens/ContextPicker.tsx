@@ -9,12 +9,18 @@ import { api } from '../api'
 import { Empty, Failure } from '../components/States'
 import { tg } from '../telegram'
 import { Icon } from '../ui/Icon'
-import { AppBar, TaskSkeleton } from '../ui/parts'
+import { AppBar, IconButton, TaskSkeleton } from '../ui/parts'
 import type { ContextListItem } from '../types'
 
-type Props = { onPick: (chatRef: number) => void; onBack: (() => void) | null }
+type Props = {
+  onPick: (chatRef: number) => void
+  onBack: (() => void) | null
+  /** Этот экран первым видит человек, открывший приложение в личке: меню
+      разделов здесь ещё нет, и инструкция — единственная дверь к объяснениям. */
+  onGuide: () => void
+}
 
-export function ContextPicker({ onPick, onBack }: Props) {
+export function ContextPicker({ onPick, onBack, onGuide }: Props) {
   const [items, setItems] = useState<ContextListItem[] | null>(null)
   const [error, setError] = useState<unknown>(null)
   const [reload, setReload] = useState(0)
@@ -34,7 +40,11 @@ export function ContextPicker({ onPick, onBack }: Props) {
 
   return (
     <>
-      <AppBar title="Выберите чат" subtitle="Задачи показываются в разрезе чата и его проектов" />
+      <AppBar
+        title="Выберите чат"
+        subtitle="Задачи показываются в разрезе чата и его проектов"
+        actions={<IconButton icon="book" label="Инструкция" onClick={onGuide} />}
+      />
 
       {items === null ? (
         <TaskSkeleton rows={3} />

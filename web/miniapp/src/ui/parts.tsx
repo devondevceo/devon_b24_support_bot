@@ -72,6 +72,53 @@ export function IconButton({
   )
 }
 
+/* ------------------------------------------------------------------ поиск */
+
+/**
+ * Строка поиска. Общая для списка задач и инструкции: одно и то же поле,
+ * собранное дважды, однажды разошлось бы отступом под значком — а стенд
+ * ловит ровно это (проверка `overlap` в audit/audit.ts).
+ *
+ * Enter прячет клавиатуру: искать дальше нечего, а она закрывает результаты
+ * на половине экрана телефона.
+ */
+export function SearchBar({
+  value,
+  onChange,
+  placeholder,
+  label,
+}: {
+  value: string
+  onChange: (next: string) => void
+  placeholder: string
+  /** Подпись для скринридера: плейсхолдер исчезает, как только начали печатать. */
+  label: string
+}) {
+  return (
+    <div className="searchbar">
+      <Icon name="search" size={20} />
+      <input
+        type="search"
+        value={value}
+        placeholder={placeholder}
+        aria-label={label}
+        autoComplete="off"
+        enterKeyHint="search"
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur()
+        }}
+      />
+      {value ? (
+        <button type="button" className="clear" aria-label="Очистить поиск"
+                onClick={() => onChange('')}>
+          <Icon name="close" size={18} />
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
 /* ------------------------------------------------------------------ плашки */
 
 /**
