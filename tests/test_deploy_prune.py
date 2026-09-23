@@ -173,8 +173,15 @@ esac
 FAKE_CURL = """#!/usr/bin/env bash
 echo '{"status":"ok","checks":{"db":"ok","miniapp":"ok"}}'
 """
+# Занятость диска: FAKE_DF_USED, а после уборки кэша сборки — FAKE_DF_AFTER_PRUNE.
+# Освобождает место именно `builder prune`, а не время: так тест проверяет порядок —
+# что диск перемерен ПОСЛЕ уборки, а не просто спрошен дважды.
 FAKE_DF = """#!/usr/bin/env bash
-printf 'Use%%\\n %s%%\\n' 42
+used=${FAKE_DF_USED:-42}
+if [ -n "${FAKE_DF_AFTER_PRUNE:-}" ] && grep -q '^builder prune' "$FAKE_DIR/calls"; then
+  used=$FAKE_DF_AFTER_PRUNE
+fi
+printf 'Use%%\\n %s%%\\n' "$used"
 """
 FAKE_FLOCK = """#!/usr/bin/env bash
 exit 0
@@ -247,6 +254,8 @@ def deploy(
     held: tuple[str, ...] = (),
     images_fail: bool = False,
     history_is_dir: bool = False,
+    disk: int = 42,
+    disk_after_prune: int | None = None,
 ) -> Run:
     if BASH is None:
         pytest.skip("нужен bash: deploy.sh прогоняется настоящим")
@@ -292,7 +301,10 @@ def deploy(
         "FAKE_DIR": posix(fake),
         "FAKE_PULL_ID": pull_id,
         "FAKE_IMAGES_FAIL": "1" if images_fail else "",
+        "FAKE_DF_USED": str(disk),
+        "FAKE_DF_AFTER_PRUNE": "" if disk_after_prune is None else str(disk_after_prune),
     }
+    env.pop("DISK_MAX_PCT", None)
     env.pop("KEEP_PREV_IMAGES", None)
     if keep_prev is not None:
         env["KEEP_PREV_IMAGES"] = keep_prev
@@ -555,6 +567,97 @@ def test_failure_after_verification_does_not_roll_back(tmp_path: Path) -> None:
     assert f"APP_IMAGE={ref(NEW)}" in run.env_file
     assert sum(c.startswith("compose up") for c in run.calls) == 1
     assert run.removed == []
+
+
+# --- диск выше предела: сначала уборка, потом приговор -----------------------------------
+# 23.09.2026 выкатка упала на первой же проверке: 86% при пределе 85%. Уборка кэша стояла
+# только в конце выкатки — то есть до неё не доходило ровно тогда, когда она нужна.
+
+def _before(calls: list[str], prefix: str) -> list[str]:
+    """Вызовы docker до первого, начинающегося с `prefix`."""
+    for n, call in enumerate(calls):
+        if call.startswith(prefix):
+            return calls[:n]
+    return calls
+
+
+def test_full_disk_is_cleaned_before_the_verdict(tmp_path: Path) -> None:
+    """Кэш сборки и висячие образы старше недели убраны до логина и скачивания
+    образа, диск перемерен — и выкатка идёт дальше."""
+    tags = releases(3)
+    run = deploy(tmp_path, store=base_store(tags), history=journal(*map(ref, tags)),
+                 running=ref(tags[-1]), image=ref(NEW), pull_id=img_id(NEW),
+                 disk=86, disk_after_prune=80)
+
+    assert run.code == 0, run.out
+    early = _before(run.calls, "login")
+    assert "builder prune -f --filter until=168h" in early
+    assert "image prune -f --filter until=168h" in early
+    assert "диск: занято 86% при пределе 85% — убираю кэш сборки" in run.out
+    assert "диск: занято 80%" in run.out
+    assert f"готово: {ref(NEW)}" in run.out
+
+
+def test_disk_still_full_after_cleaning_stops_before_any_change(tmp_path: Path) -> None:
+    """Уборка не помогла — отказ до логина, скачивания, дампа и миграций. Число
+    в отказе — после уборки, и там же сказано, где искать, что заняло место."""
+    tags = releases(3)
+    run = deploy(tmp_path, store=base_store(tags), history=journal(*map(ref, tags)),
+                 running=ref(tags[-1]), image=ref(NEW), pull_id=img_id(NEW),
+                 disk=86, disk_after_prune=86)
+
+    assert run.code != 0
+    assert "ОШИБКА: на диске занято 86%, предел 85%: уборка кэша не помогла" in run.out
+    assert "docs/80-deploy.md §8.12" in run.out
+    assert all(c.startswith(("builder prune", "image prune", "logout"))
+               for c in run.calls), run.calls
+    assert f"APP_IMAGE={ref(tags[-1])}" in run.env_file
+    assert run.history == journal(*map(ref, tags))
+
+
+def test_disk_within_the_limit_is_not_cleaned_up_front(tmp_path: Path) -> None:
+    """Уборка до выкатки — ответ на нехватку места, а не новый шаг каждой выкатки.
+    Ровно на пределе места достаточно; уборка после выкатки идёт, как шла."""
+    tags = releases(3)
+    run = deploy(tmp_path, store=base_store(tags), history=journal(*map(ref, tags)),
+                 running=ref(tags[-1]), image=ref(NEW), pull_id=img_id(NEW), disk=85)
+
+    assert run.code == 0, run.out
+    assert not any("prune" in c for c in _before(run.calls, "compose up")), run.calls
+    assert "builder prune -f --filter until=168h" in run.calls
+    assert "диск: занято 85%" in run.out
+
+
+# --- summary прогона называет причину, а не угадывает её -------------------------------
+
+WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
+
+
+def _step(name: str) -> str:
+    """Текст шага deploy.yml: от `- name: <name>` до следующего шага."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    start = text.index(f"- name: {name}\n")
+    end = text.find("\n      - ", start + 1)
+    return text[start:] if end == -1 else text[start:end]
+
+
+def test_key_hint_only_when_ssh_delivery_failed() -> None:
+    """23.09.2026 выкатка упала на заполненном диске, а summary написало «Сервер не
+    принял ключ» — подсказка висела на любом `failure()`. Ключ проверяет доставка:
+    она первой ходит по ssh, и только её отказ бывает отказом ключа."""
+    assert "id: deliver\n" in _step("доставка compose и скриптов")
+    hint = _step("сервер отверг ключ — что делать")
+    assert "if: failure() && steps.deliver.outcome == 'failure'\n" in hint
+
+
+def test_summary_names_the_scripts_error() -> None:
+    """Причина отказа — строка «ОШИБКА:» из лога скрипта — видна в summary прогона."""
+    roll, total = _step("выкатка"), _step("итог")
+    assert "shell: bash\n" in roll, "без pipefail код возврата ssh потерялся бы в tee"
+    assert '| tee "$RUNNER_TEMP/deploy.log"' in roll
+    assert "grep -h 'ОШИБКА:' \"$RUNNER_TEMP/deploy.log\"" in total
+    # Скрипт пишет отказы ровно так — иначе summary искало бы не то.
+    assert 'fail() { log "ОШИБКА: $*"; exit 1; }' in DEPLOY.read_text(encoding="utf-8")
 
 
 # --- стражи по исходнику -----------------------------------------------------------------

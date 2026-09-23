@@ -110,6 +110,7 @@ jobs:
 
       # Никакого StrictHostKeyChecking=no: ключ сервера пришпилен секретом.
       - name: доставка compose и скриптов
+        id: deliver
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
           USER: ${{ secrets.DEPLOY_USER }}
@@ -127,7 +128,12 @@ jobs:
       # Токен реестра уходит на сервер через stdin, а не аргументом команды: аргументы
       # видны в ps любому процессу на машине, а машина общая с чужим продом.
       # GITHUB_TOKEN живёт только до конца job-а, и скрипт делает docker logout за собой.
+      #
+      # Лог скрипта копируется в файл: из него «итог» берёт строку «ОШИБКА:». Без неё
+      # причина отказа видна только в логе шага, а summary прогона молчит о ней.
+      # `shell: bash` включает pipefail — иначе код возврата ssh потерялся бы в tee.
       - name: выкатка
+        shell: bash
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
           USER: ${{ secrets.DEPLOY_USER }}
@@ -137,17 +143,23 @@ jobs:
         run: |
           printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$USER@$HOST" \
             "APP_DIR='$DIR' IMAGE='$IMAGE' GHCR_USER='${{ github.actor }}' \
-             GIT_SHA='${{ github.sha }}' bash '$DIR/scripts/deploy.sh'"
+             GIT_SHA='${{ github.sha }}' bash '$DIR/scripts/deploy.sh'" 2>&1 \
+            | tee "$RUNNER_TEMP/deploy.log"
 
       # Сервер не пустил — печатаем ровно то, что надо установить. Публичный ключ
       # секретом не является, а без него человек остаётся с «Permission denied»
       # и без единой подсказки, чей ключ и куда его класть.
+      #
+      # Только когда упала сама доставка: это первый вход по ssh. На `if: failure()`
+      # подсказка выходила при любом отказе — 23.09.2026 выкатка упала на заполненном
+      # диске, а summary написало «Сервер не принял ключ», хотя доставка по ssh прошла.
       - name: сервер отверг ключ — что делать
-        if: failure()
+        if: failure() && steps.deliver.outcome == 'failure'
         run: |
           {
-            echo "## Сервер не принял ключ выкатки"
+            echo "## Доставка по ssh не прошла"
             echo
+            echo "Если в логе шага «доставка» — \`Permission denied (publickey…)\`, сервер не принял ключ выкатки."
             echo "Добавьте эту строку в \`~/.ssh/authorized_keys\` пользователя выкатки:"
             echo
             echo '```'
@@ -169,6 +181,8 @@ jobs:
             echo "- образ: \`$IMAGE\`"
             echo "- коммит: \`${{ github.sha }}\`"
             echo "- результат: **${{ job.status }}**"
+            reason=$(grep -h 'ОШИБКА:' "$RUNNER_TEMP/deploy.log" 2>/dev/null | tail -1 || true)
+            [ -z "$reason" ] || echo "- причина: \`${reason#*ОШИБКА: }\`"
             if [ "${{ job.status }}" != "success" ]; then
               echo
               echo "Скрипт откатывает **только образ**. База остаётся на новой схеме —"
