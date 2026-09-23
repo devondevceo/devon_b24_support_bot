@@ -21,6 +21,10 @@ log = logging.getLogger(__name__)
 HIGH_RISK = frozenset({
     "role.grant", "role.revoke",
     "chat.bind", "chat.unbind",
+    # Группа стала супергруппой, и привязки переехали к новому чату сами, без
+    # человека. По последствиям это та же перепривязка: вопрос «почему проект
+    # пишет в этот чат» без этой записи не разобрать.
+    "chat.migrate",
     "bot.token.set", "bot.suspend",
     "user.map",
     "task.responsible.change", "task.complete", "task.defer",

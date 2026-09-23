@@ -12,6 +12,7 @@ from typing import Any
 from b24bot.bot import handlers
 from b24bot.crypto import box
 from b24bot.db.pool import pool, set_tenant, system_scope
+from b24bot.domain import chat_migration
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -32,11 +33,44 @@ def chat_of(update: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-async def handle(bot_ref: int, tenant_id: int | None, update: dict[str, Any]) -> None:
-    """Минимальная обработка: регистрация чата и учёт присутствия бота.
+def migration_of(update: dict[str, Any]) -> tuple[int, int] | None:
+    """(старый chat_id, новый chat_id), если апдейт — весть о том, что группа стала
+    супергруппой. Иначе None.
 
-    Сценарии создания задач появятся отдельно. Здесь только то, без чего невозможно
-    ничего дальше: узнать, в каких чатах бот вообще находится.
+    Вестей две: `migrate_to_chat_id` в старой группе и `migrate_from_chat_id` в новой
+    супергруппе. Приходят обе, в любом порядке, и каждая несёт пару целиком —
+    поэтому переезд делает первая, а вторая застаёт его сделанным
+    (domain/chat_migration.py).
+    """
+    msg = update.get("message")
+    if not isinstance(msg, dict) or not isinstance(msg.get("chat"), dict):
+        return None
+    here = _chat_id(msg["chat"].get("id"))
+    if here is None:
+        return None
+    to = _chat_id(msg.get("migrate_to_chat_id"))
+    if to is not None and to != here:
+        return here, to
+    came_from = _chat_id(msg.get("migrate_from_chat_id"))
+    if came_from is not None and came_from != here:
+        return came_from, here
+    return None
+
+
+def _chat_id(value: Any) -> int | None:
+    # bool — подкласс int, а нулевого чата не бывает.
+    if isinstance(value, bool) or not isinstance(value, int) or value == 0:
+        return None
+    return value
+
+
+async def handle(bot_ref: int, tenant_id: int | None, update: dict[str, Any]) -> None:
+    """Минимальная обработка: регистрация чата, учёт присутствия бота и переезд
+    группы в супергруппу.
+
+    Сценарии живут в `route`. Здесь только то, без чего невозможно ничего дальше:
+    узнать, в каких чатах бот вообще находится, — и не потерять чат, когда Telegram
+    выдаёт ему новый `chat_id`.
     """
     chat = chat_of(update)
     if chat is None:
@@ -56,10 +90,23 @@ async def handle(bot_ref: int, tenant_id: int | None, update: dict[str, Any]) ->
         status = str((my_member.get("new_chat_member") or {}).get("status") or "")
         left = status in ("left", "kicked")
 
+    moved = migration_of(update)
+
     # Регистрация чатов — системный слой (RLS): незаявленный чат ничей
     # (tenant_id IS NULL), а ON CONFLICT обязан видеть строку и тогда, когда
-    # чат уже заявлен, — от какого бы бота ни пришёл апдейт.
+    # чат уже заявлен, — от какого бы бота ни пришёл апдейт. Переезд тоже:
+    # строка нового чата до него бывает ничьей.
     with system_scope():
+        if moved is not None:
+            old_chat_id, new_chat_id = moved
+            await chat_migration.follow(
+                old_chat_id, new_chat_id, bot_ref=bot_ref,
+                source=chat_migration.FROM_UPDATE, title=title or None,
+                is_forum=is_forum if chat_id == new_chat_id else None)
+            if chat_id == old_chat_id:
+                # Весть из старой группы. Сама группа упразднена, и регистрировать
+                # её заново нечего: у неё уже стоит надгробие.
+                return
         await _register_chat(chat_id, bot_ref, chat_type, title, is_forum, left)
 
 
@@ -69,7 +116,13 @@ async def _register_chat(chat_id: int, bot_ref: int, chat_type: str, title: str,
         row = await conn.fetchrow(
             """
             INSERT INTO tg_chats (chat_id, tenant_id, bot_ref, type, title, is_forum, status)
-            VALUES ($1, NULL, $2, $3, $4, $5, 'unclaimed')
+            SELECT $1::bigint, NULL::bigint, $2::bigint, $3::text, $4::text, $5::boolean,
+                   'unclaimed'
+             -- Упразднённый chat_id (группа стала супергруппой) не заводится заново:
+             -- апдейт из старой группы воскресил бы её ничейной строкой рядом с
+             -- надгробием, и чат числился бы дважды.
+             WHERE NOT EXISTS (SELECT 1 FROM tg_chats d
+                                WHERE d.chat_id = $1 AND d.status = 'migrated')
             ON CONFLICT (chat_id) WHERE status <> 'migrated'
             DO UPDATE SET title = EXCLUDED.title,
                           is_forum = EXCLUDED.is_forum,
@@ -88,14 +141,18 @@ async def _register_chat(chat_id: int, bot_ref: int, chat_type: str, title: str,
             """,
             chat_id, bot_ref, chat_type, title, is_forum)
 
-        if left and row is not None:
+        if row is None:
+            log.info("апдейт из группы, ставшей супергруппой: chat_id=%s — пропущен",
+                     chat_id)
+            return
+
+        if left:
             await conn.execute("UPDATE tg_chats SET status = 'left' WHERE id = $1", row["id"])
             log.info("бот удалён из чата chat_ref=%s", row["id"])
             return
 
     log.info("апдейт: chat_ref=%s chat_id=%s type=%s forum=%s состояние=%s",
-             row["id"] if row else "?", chat_id, chat_type, is_forum,
-             row["status"] if row else "?")
+             row["id"], chat_id, chat_type, is_forum, row["status"])
 
 
 async def _bot_row(bot_ref: int) -> dict[str, Any] | None:

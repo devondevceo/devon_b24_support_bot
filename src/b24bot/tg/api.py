@@ -27,8 +27,13 @@ ALLOWED_UPDATES = ["message", "edited_message", "callback_query",
 
 
 class TelegramError(Exception):
-    def __init__(self, code: int, description: str) -> None:
+    def __init__(self, code: int, description: str, *,
+                 migrate_to_chat_id: int | None = None) -> None:
         self.code, self.description = code, description
+        # Группа стала супергруппой: вызов со старым chat_id — отправку, getChat —
+        # Telegram отвергает и сам называет новый (`ResponseParameters`). Весть о
+        # переезде помимо двух служебных сообщений (domain/chat_migration.py).
+        self.migrate_to_chat_id = migrate_to_chat_id
         super().__init__(f"Telegram {code}: {description}")
 
 
@@ -73,8 +78,17 @@ async def call(token: str, method: str, params: dict[str, Any] | None = None, *,
         desc = str(data.get("description") or "")
         if code == 401:
             raise TelegramInvalidToken(code, desc)
-        raise TelegramError(code, desc)
+        raise TelegramError(code, desc, migrate_to_chat_id=_migrated_to(data))
     return data.get("result")
+
+
+def _migrated_to(data: dict[str, Any]) -> int | None:
+    """Новый chat_id из ответа «group chat was upgraded to a supergroup chat»."""
+    params = data.get("parameters")
+    value = params.get("migrate_to_chat_id") if isinstance(params, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value == 0:
+        return None
+    return value
 
 
 async def get_me(token: str, *, proxy_base: str | None = None) -> dict[str, Any]:

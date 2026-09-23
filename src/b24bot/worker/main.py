@@ -18,7 +18,7 @@ from b24bot.core.config import get_settings
 from b24bot.core.logging import setup as log_setup
 from b24bot.crypto import box
 from b24bot.db.pool import close_pool, init_pool, pool, system_scope, tenant_scope
-from b24bot.domain import events, lifecycle, notifications, reminders, sync
+from b24bot.domain import chat_migration, events, lifecycle, notifications, reminders, sync
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
@@ -37,6 +37,10 @@ STAGE_PASS = timedelta(minutes=15)
 # деинсталлированных. Сам проход решает, кому пора (lifecycle.LICENSE_TTL);
 # час — это частота, с которой мы об этом спрашиваем базу.
 LIFECYCLE_PASS = timedelta(hours=1)
+# Обычные группы, которые могли стать супергруппой, пока бот не слышал вестей
+# (chat_migration.probe_basic_groups). Первый проход — сразу после старта:
+# выкатка и есть момент, когда накопившиеся переезды пора догнать.
+CHAT_PROBE_PASS = timedelta(hours=6)
 
 
 async def process_events() -> int:
@@ -93,6 +97,9 @@ async def send_outbox() -> int:
                                       thread_id=row["thread_id"],
                                       reply_markup=_markup(row))
             except tg.TelegramError as exc:
+                if exc.migrate_to_chat_id is not None and await _follow_migration(
+                        row, chat_id, exc.migrate_to_chat_id, [row["id"]]):
+                    continue
                 # 403 — бота выкинули из чата, повторять бессмысленно.
                 final = exc.code in (400, 403) or row["attempts"] + 1 >= MAX_ATTEMPTS
                 await _fail(row["id"], f"{exc.code}: {exc.description}"[:400],
@@ -174,6 +181,9 @@ async def _flush_group(g: Any) -> int:
             await tg.send_message(token, chat_id, text,
                                   thread_id=g["thread_id"], reply_markup=markup)
     except tg.TelegramError as exc:
+        if exc.migrate_to_chat_id is not None and await _follow_migration(
+                g, chat_id, exc.migrate_to_chat_id, [r["id"] for r in rows]):
+            return len(rows)
         final = exc.code in (400, 403) or rows[0]["attempts"] + 1 >= MAX_ATTEMPTS
         for row in rows:
             await _fail(row["id"], f"{exc.code}: {exc.description}"[:400],
@@ -184,6 +194,35 @@ async def _flush_group(g: Any) -> int:
     log.info("сводка из %d уведомлений отправлена в чат %s (%d сообщени(й))",
              len(rows), g["chat_ref"], len(texts))
     return len(rows)
+
+
+async def _follow_migration(src: Any, old_chat_id: int, new_chat_id: int,
+                            ids: list[int]) -> bool:
+    """Telegram отверг отправку: группа стала супергруппой, и назвал новый chat_id.
+
+    Та же весть, что и служебные сообщения в `dispatch.handle`, но она — вместе с
+    проверкой `chat_migration.probe_basic_groups` — застаёт и то, что служебные
+    пропустили: группы, ставшие супергруппой до 23.09.2026 (переезду бот тогда не
+    умел), и апдейты, потерянные поллером. Переезд тот же самый; после него строки
+    повторяются сразу — они уже смотрят в новый чат.
+
+    `False` — переезда нет (новый чат чужой, база не ответила): строки падают
+    обычным порядком, с ошибкой Telegram в `last_error`.
+    """
+    try:
+        await chat_migration.follow(old_chat_id, new_chat_id, bot_ref=int(src["bot_ref"]),
+                                    source=chat_migration.FROM_SEND)
+    except Exception:
+        log.exception("переезд чата %s по ответу Telegram не удался", src["chat_ref"])
+        return False
+    async with pool().acquire() as conn:
+        again = await conn.fetch(
+            "UPDATE outbox o SET state = 'pending', next_attempt_at = now() "
+            "  FROM tg_chats c "
+            " WHERE o.tenant_id = $1 AND o.id = ANY($2::bigint[]) AND o.state = 'sending' "
+            "   AND c.id = o.chat_ref AND c.chat_id = $3 RETURNING o.id",
+            src["tenant_id"], ids, new_chat_id)
+    return len(again) == len(ids)
 
 
 async def _creds(row: Any) -> tuple[str, int] | None:
@@ -269,6 +308,7 @@ async def main() -> None:
     tick = 0
     next_stage_pass = datetime.now(UTC)
     next_lifecycle_pass = datetime.now(UTC)
+    next_probe_pass = datetime.now(UTC)
     try:
         while True:
             tick += 1
@@ -287,6 +327,9 @@ async def main() -> None:
                 if datetime.now(UTC) >= next_lifecycle_pass:
                     next_lifecycle_pass = datetime.now(UTC) + LIFECYCLE_PASS
                     await lifecycle.daily_pass()
+                if datetime.now(UTC) >= next_probe_pass:
+                    next_probe_pass = datetime.now(UTC) + CHAT_PROBE_PASS
+                    await chat_migration.probe_basic_groups()
                 if tick % 100 == 0:
                     await cleanup()
                 if not done and not sent:
