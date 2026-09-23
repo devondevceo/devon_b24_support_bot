@@ -31,11 +31,19 @@ FILE_TIMEOUT = 120.0
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query",
                    "my_chat_member", "chat_member"]
 
-# Сколько ждать соединения на одном пути, прежде чем идти следующим. Короче
-# общего таймаута: закрытый путь должен стоить секунд, а не всего вызова.
-CONNECT_TIMEOUT = 6.0
-# Сколько не пробовать путь первым после того, как он не дал соединения.
-ROUTE_COOLDOWN = 300.0
+# Сколько ждать одного соединения. Короче общего таймаута: закрытый путь должен
+# стоить секунд, а не всего вызова.
+CONNECT_TIMEOUT = 3.0
+# Сколько соединений пробовать на одном пути, прежде чем идти следующим. Прямой
+# путь на боевом сервере теряет соединения вразброс: 23.09.2026 из 40 попыток раз
+# в 3 с не установилось 5, поодиночке, и следующая попытка проходила за 0.04 с.
+# Ожидание дольше не помогает (8 с — тот же отказ): соединение либо сразу есть,
+# либо его не будет, а новое проходит. Первая версия уходила на прокси после
+# ОДНОГО отказа — и на пять минут возвращала бота туда, где крупный апдейт не
+# проходит, то есть ровно в аварию, которую чинила.
+CONNECT_ATTEMPTS = 3
+# Сколько не пробовать путь первым после того, как все попытки не дали соединения.
+ROUTE_COOLDOWN = 60.0
 
 # Ошибки, при которых запрос гарантированно НЕ ушёл в Telegram: соединение не
 # установлено (TCP, TLS, SOCKS). Только после них вызов можно повторить другим
@@ -99,12 +107,13 @@ def _ordered(candidates: list[Route]) -> list[Route]:
 
 def deadline(method: str, params: dict[str, Any] | None,
              proxy_base: str | None = None) -> float:
-    """Худшее время одного `call`: на каждом пути ждали соединения, на последнем
-    ещё и ответа. Свой предел поверх клиента обязан быть ДЛИННЕЕ (bot/poller.py):
-    иначе он рубит вызов до того, как клиент узнал, что путь закрыт, и следующий
-    заход снова начнётся с закрытого.
+    """Худшее время одного `call`: на каждом пути все попытки ждали соединения,
+    на последнем ещё и ответа. Свой предел поверх клиента обязан быть ДЛИННЕЕ
+    (bot/poller.py): иначе он рубит вызов до того, как клиент узнал, что путь
+    закрыт, и следующий заход снова начнётся с закрытого.
     """
-    return CONNECT_TIMEOUT * len(routes(proxy_base)) + http_timeout_for(method, params)
+    return (CONNECT_TIMEOUT * CONNECT_ATTEMPTS * len(routes(proxy_base))
+            + http_timeout_for(method, params))
 
 
 async def _request(verb: str, path: str, *, http_timeout: float,
@@ -112,8 +121,9 @@ async def _request(verb: str, path: str, *, http_timeout: float,
                    proxy_base: str | None = None) -> httpx.Response:
     """Запрос к Telegram первым живым путём.
 
-    Следующий путь пробуется, только если на текущем не установилось соединение
-    (`_NOT_SENT`). Любая другая ошибка уходит вызывающему как есть.
+    Повтор — новым соединением, на том же пути до `CONNECT_ATTEMPTS` раз, затем
+    на следующем, и только если соединение не установилось (`_NOT_SENT`). Любая
+    другая ошибка уходит вызывающему как есть.
     """
     last: httpx.HTTPError | None = None
     for route in _ordered(routes(proxy_base)):
@@ -121,19 +131,21 @@ async def _request(verb: str, path: str, *, http_timeout: float,
         if route.sni:
             extra = {"headers": {"Host": route.sni},
                      "extensions": {"sni_hostname": route.sni}}
-        try:
-            async with _client(http_timeout, route) as http:
-                resp = await http.request(verb, route.origin + path, json=json, **extra)
-        except _NOT_SENT as exc:
-            if _down_until.get(route.name, 0.0) <= time.monotonic():
-                log.warning("Telegram: путь %s закрыт (%s) — иду следующим",
-                            route.name, type(exc).__name__)
-            _down_until[route.name] = time.monotonic() + ROUTE_COOLDOWN
-            last = exc
-            continue
-        if _down_until.pop(route.name, None) is not None:
-            log.info("Telegram: путь %s снова открыт", route.name)
-        return resp
+        for _ in range(CONNECT_ATTEMPTS):
+            try:
+                async with _client(http_timeout, route) as http:
+                    resp = await http.request(verb, route.origin + path, json=json,
+                                              **extra)
+            except _NOT_SENT as exc:
+                last = exc
+                continue
+            if _down_until.pop(route.name, None) is not None:
+                log.info("Telegram: путь %s снова открыт", route.name)
+            return resp
+        if last is not None and _down_until.get(route.name, 0.0) <= time.monotonic():
+            log.warning("Telegram: путь %s закрыт (%s, попыток %d) — иду следующим",
+                        route.name, type(last).__name__, CONNECT_ATTEMPTS)
+        _down_until[route.name] = time.monotonic() + ROUTE_COOLDOWN
     assert last is not None, "routes() всегда возвращает хотя бы один путь"
     raise last
 

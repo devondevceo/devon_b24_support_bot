@@ -15,7 +15,11 @@
    кто окажется по этому адресу.
 2. **Следующий путь — только если запрос точно не ушёл.** После таймаута
    чтения `sendMessage` мог дойти, и повтор другим путём задвоил бы сообщение.
-3. **Отказ пути запоминается:** закрытый путь стоит секунды один раз, а не на
+3. **Одиночный отказ соединения — не закрытый путь.** Прямой путь на боевом
+   сервере теряет соединения вразброс (5 из 40), а следующее проходит. Первая
+   версия уходила на прокси после одного отказа и на пять минут возвращала
+   бота в аварию: крупный апдейт снова не доходил.
+4. **Отказ пути запоминается:** закрытый путь стоит секунды один раз, а не на
    каждом вызове.
 """
 from __future__ import annotations
@@ -164,7 +168,7 @@ def test_closed_path_falls_over_within_the_same_call(
         result = asyncio.run(tg.call(TOKEN, "getMe"))
 
     assert result == {"username": "devon_sd_bot"}
-    assert len(seen[IP]) == 1 and len(seen["прокси"]) == 1
+    assert len(seen[IP]) == tg.CONNECT_ATTEMPTS and len(seen["прокси"]) == 1
     assert any(IP in r.getMessage() and "закрыт" in r.getMessage()
                for r in caplog.records)
 
@@ -178,8 +182,36 @@ def test_closed_path_is_remembered_and_not_retried_first(
     asyncio.run(tg.call(TOKEN, "getMe"))
     asyncio.run(tg.call(TOKEN, "getMe"))
 
-    assert len(seen[IP]) == 1, "второй вызов обязан начаться с исправного пути"
+    assert len(seen[IP]) == tg.CONNECT_ATTEMPTS, (
+        "второй вызов обязан начаться с исправного пути")
     assert len(seen["прокси"]) == 2
+
+
+def test_lost_connection_is_retried_on_the_same_path(
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """Одно несостоявшееся соединение — повод для нового, а не для прокси.
+
+    Живой замер 23.09: из 40 соединений с прямым адресом не установилось 5,
+    поодиночке. Уход на прокси после первого из них на пять минут возвращал
+    бота туда, где крупный апдейт не проходит.
+    """
+    _settings(monkeypatch, tg_proxy_url=PROXY)
+    lost = iter([True])
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if next(lost, False):
+            return _refused(request)
+        return _ok(request)
+
+    seen = _network(monkeypatch, {IP: flaky, "прокси": _ok})
+
+    with caplog.at_level(logging.WARNING, logger=tg.log.name):
+        result = asyncio.run(tg.call(TOKEN, "getMe"))
+
+    assert result == {"username": "devon_sd_bot"}
+    assert len(seen[IP]) == 2 and seen["прокси"] == []
+    assert IP not in tg._down_until, "путь, давший соединение, не закрыт"
+    assert not caplog.records, "потеря одного соединения — не событие для лога"
 
 
 def test_direct_route_is_tried_first_again_after_cooldown(
@@ -222,7 +254,8 @@ def test_every_path_closed_is_a_transport_error(monkeypatch: pytest.MonkeyPatch)
     # Когда закрыто всё, порядок настройки сохраняется: прямой по-прежнему первый.
     with contextlib.suppress(tg.TelegramError):
         asyncio.run(tg.call(TOKEN, "getMe"))
-    assert [len(seen[IP]), len(seen["прокси"])] == [2, 2]
+    n = tg.CONNECT_ATTEMPTS
+    assert [len(seen[IP]), len(seen["прокси"])] == [2 * n, 2 * n]
 
 
 def test_telegram_refusal_is_an_answer_not_a_closed_path(
@@ -274,7 +307,8 @@ def test_deadline_covers_every_path(monkeypatch: pytest.MonkeyPatch) -> None:
     _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=f"{IP},149.154.167.221")
     params = {"timeout": 25}
     assert tg.deadline("getUpdates", params) == (
-        3 * tg.CONNECT_TIMEOUT + tg.http_timeout_for("getUpdates", params))
+        3 * tg.CONNECT_ATTEMPTS * tg.CONNECT_TIMEOUT
+        + tg.http_timeout_for("getUpdates", params))
     assert tg.deadline("getMe", None) > tg.TIMEOUT
 
 
