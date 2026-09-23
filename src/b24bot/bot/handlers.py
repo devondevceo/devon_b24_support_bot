@@ -98,6 +98,37 @@ def _text_of(msg: dict[str, Any]) -> str:
     return str(msg.get("text") or msg.get("caption") or "")
 
 
+def topic_of(msg: dict[str, Any]) -> int | None:
+    """Тема форума, в которой написано сообщение, — или None.
+
+    `message_thread_id` в Telegram означает две разные вещи. В форуме это тема,
+    и отвечать надо в неё. В обычной супергруппе его получает ЛЮБОЙ реплай, и
+    там это всего лишь id первого сообщения в цепочке ответов: отправка с ним
+    не работает, а опросник, ключуемый им, не узнаёт ответ на свой же вопрос.
+    Различает их только `is_topic_message`. Бот брал номер как есть, и 23.09.2026
+    это выглядело как «не создал задачу через реплай на /task»: задача
+    создавалась, а ответ о ней терялся по дороге в чат.
+    """
+    if not msg.get("is_topic_message"):
+        return None
+    thread = msg.get("message_thread_id")
+    return int(thread) if thread else None
+
+
+def reply_of(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """Сообщение, на которое человек ответил, — или None, если он не отвечал.
+
+    В теме форума Telegram делает реплаем КАЖДОЕ сообщение: без явного ответа
+    `reply_to_message` указывает на служебное сообщение о создании темы. Приняв
+    его за реплай, `/task текст` искал бы задачу в пустом служебном сообщении,
+    а не в написанном тексте.
+    """
+    reply = msg.get("reply_to_message")
+    if not isinstance(reply, dict) or "forum_topic_created" in reply:
+        return None
+    return reply
+
+
 def _author(user: dict[str, Any]) -> str:
     parts = [user.get("first_name"), user.get("last_name")]
     name = " ".join(p for p in parts if p) or "без имени"
@@ -131,7 +162,7 @@ async def on_message(bot: dict[str, Any], msg: dict[str, Any]) -> Reply | None:
     if chat.get("id") is None:
         return None
     chat_id = int(chat["id"])
-    thread_id = msg.get("message_thread_id")
+    thread_id = topic_of(msg)
     user = msg.get("from") or {}
     tg_user_id = int(user.get("id") or 0)
     text = _text_of(msg)
@@ -151,7 +182,7 @@ async def on_message(bot: dict[str, Any], msg: dict[str, Any]) -> Reply | None:
 
     # Ответ на вопрос опросника. Проверяем ДО остальных правил, но принимаем
     # строго реплаем на своё же сообщение: иначе съедим обычную реплику коллеге.
-    reply_to = msg.get("reply_to_message")
+    reply_to = reply_of(msg)
     if reply_to:
         answered = await _survey_answer(ctx, msg, reply_to, tg_user_id)
         if answered is not None:
@@ -211,17 +242,17 @@ def comment_input(arg: str, msg: dict[str, Any]) -> CommentInput:
     смысла сообщения без единого слова об этом.
     """
     text = arg.split(" ", 1)[1].strip() if " " in arg else ""
-    reply_to = msg.get("reply_to_message") or {}
+    reply_to = reply_of(msg) or {}
     quoted_author = ""
     attachments = tg_files.extract(msg)
 
     if not text and reply_to:
         quoted_text = _text_of(reply_to).strip()
         quoted_files = tg_files.extract(reply_to)
-        # Пустой реплай — это не цитата. В форуме Telegram сам подставляет ответ
-        # на служебное сообщение о создании топика: сославшись на него, мы бы
-        # приписали комментарий тому, кто завёл топик, и ничего не сказали бы
-        # о содержимом.
+        # Пустой реплай — это не цитата. Реплай на стикер или опрос переносить
+        # нечего: сославшись на него, мы бы приписали комментарий его автору и
+        # ничего не сказали бы о содержимом. Служебное сообщение о создании темы
+        # форума отсекает ещё `reply_of`.
         if quoted_text or quoted_files:
             text = quoted_text
             quoted_author = _author(reply_to.get("from") or {})
@@ -334,7 +365,7 @@ def time_input(arg: str, msg: dict[str, Any]) -> TimeInput:
     comment = arg.split(None, 2)[2].strip() if len(parts) > 2 else ""
     quoted_author = ""
     if not comment:
-        reply_to = msg.get("reply_to_message") or {}
+        reply_to = reply_of(msg) or {}
         quoted = _text_of(reply_to).strip() if reply_to else ""
         if quoted:
             comment = quoted
@@ -574,8 +605,10 @@ async def _survey_answer(ctx: ChatContext, msg: dict[str, Any],
     """Ответ на вопрос. None означает «это не про опросник, обрабатывай дальше»."""
     if ctx.tenant_id is None:
         return None
-    session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
-                                      tg_user_id)
+    # Тема — из контекста, как и при заведении сессии (`_survey_begin`). Номер
+    # цепочки ответов обычной группы сюда не попадает: у реплая на вопрос он
+    # равен id вопроса, а сессия заведена без темы.
+    session = await survey.active_for(ctx.chat_ref, ctx.thread_id, tg_user_id)
     if session is None:
         return None
     if session.last_message_id != reply_to.get("message_id"):
@@ -1732,7 +1765,7 @@ async def _private(bot: dict[str, Any], cmd: tuple[str, str] | None,
         # Ответ на приглашение «✏️ Другое». Реплаем, как и в группе: собеседник
         # тут один, но правило ввода общее, а второе правило для лички означало
         # бы, что одно и то же сообщение в двух местах понимается по-разному.
-        reply_to = (msg or {}).get("reply_to_message") or {}
+        reply_to = reply_of(msg or {}) or {}
         task_id = _asked_timelog_task(reply_to, bot) if reply_to else None
         if task_id is not None:
             return await _dm_timelog_answer(tg_user_id, task_id, text)
@@ -2162,7 +2195,7 @@ async def _group_command(bot: dict[str, Any], ctx: ChatContext, cmd: tuple[str, 
     if name in ("task", "ask"):
         # Порядок ключей важен: {"text": arg, **msg} затирает arg исходным текстом,
         # и команда «/task» уезжает в заголовок задачи. Проверено на живой задаче.
-        source = msg.get("reply_to_message")
+        source = reply_of(msg)
         if source is None and arg and name == "task":
             source = {**msg, "text": arg, "caption": None}
         if source is None:
@@ -2179,8 +2212,7 @@ async def _group_command(bot: dict[str, Any], ctx: ChatContext, cmd: tuple[str, 
     if name == "discussion":
         return await _discussion(ctx, arg, tg_user_id)
     if name == "cancel":
-        session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
-                                          tg_user_id)
+        session = await survey.active_for(ctx.chat_ref, ctx.thread_id, tg_user_id)
         if session is None:
             return None
         await survey.finish(session.id, "cancelled")
@@ -2454,7 +2486,7 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
             return Reply(texts.MSG_DIALOG_EXPIRED)
         return await _approval_vote(int(row["tenant_id"]), tg_user_id, payload)
 
-    ctx = await load_chat_context(chat_id, msg.get("message_thread_id"))
+    ctx = await load_chat_context(chat_id, topic_of(msg))
     if ctx is None:
         return Reply(texts.MSG_NOT_CLAIMED)
 
@@ -2470,16 +2502,14 @@ async def on_callback(bot: dict[str, Any], cb: dict[str, Any]) -> Reply | None:
     if ns == "s":
         return await _survey_begin(ctx, tg_user_id, int(payload["template_id"]))
     if ns == "k":
-        session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
-                                          tg_user_id)
+        session = await survey.active_for(ctx.chat_ref, ctx.thread_id, tg_user_id)
         if session is None:
             return Reply(texts.MSG_DIALOG_EXPIRED)
         items = await survey.questions(tenant_id, session.template_id)
         await survey.skip(session)
         return await _survey_next(ctx, session, items, tg_user_id)
     if ns == "p":
-        session = await survey.active_for(ctx.chat_ref, msg.get("message_thread_id"),
-                                          tg_user_id)
+        session = await survey.active_for(ctx.chat_ref, ctx.thread_id, tg_user_id)
         if session is None:
             return Reply(texts.MSG_DIALOG_EXPIRED)
         items = await survey.questions(tenant_id, session.template_id)

@@ -164,7 +164,9 @@ async def route(bot_ref: int, update: dict[str, Any]) -> None:
             reply = await handlers.on_callback(bot, cb)
             msg = cb.get("message") or {}
             target_chat = (msg.get("chat") or {}).get("id")
-            target_thread = msg.get("message_thread_id")
+            # Только тема форума. Номер цепочки ответов обычной группы Telegram
+            # при отправке отвергает, и ответ терялся бы с одной строкой в логе.
+            target_thread = handlers.topic_of(msg)
             edit_message_id = msg.get("message_id")
             with contextlib.suppress(tg.TelegramError):
                 await tg.call(bot["token"], "answerCallbackQuery",
@@ -173,7 +175,7 @@ async def route(bot_ref: int, update: dict[str, Any]) -> None:
             msg = update["message"]
             reply = await handlers.on_message(bot, msg)
             target_chat = (msg.get("chat") or {}).get("id")
-            target_thread = msg.get("message_thread_id")
+            target_thread = handlers.topic_of(msg)
     except Exception:
         log.exception("сценарий упал на апдейте %s", update.get("update_id"))
         return
