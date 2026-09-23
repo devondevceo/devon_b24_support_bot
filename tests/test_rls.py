@@ -203,7 +203,7 @@ async def test_entry_points_declare_scopes() -> None:
     from b24bot.api import app_ui, tg_webhook
     from b24bot.api import b24 as b24_api
     from b24bot.bot import dispatch, poller
-    from b24bot.domain import linking, miniapp
+    from b24bot.domain import chat_migration, linking, miniapp
     from b24bot.worker import main as worker
 
     for fn, needle in [
@@ -216,6 +216,9 @@ async def test_entry_points_declare_scopes() -> None:
         (tg_webhook.receive, "system_scope"),
         (dispatch.route, "set_tenant"),
         (dispatch.handle, "system_scope"),
+        # Переезд группы в супергруппу: строка нового чата до него бывает ничьей.
+        (chat_migration.follow, "system_scope"),
+        (chat_migration.probe_basic_groups, "system_scope"),
         (poller.PollerRegistry.sync, "system_scope"),
         (linking.complete, "set_tenant"),
         (miniapp.authenticate, "system_scope"),
