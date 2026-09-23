@@ -43,8 +43,11 @@ def test_hard_limit_is_longer_than_the_long_poll_itself() -> None:
     Та же ошибка с другой стороны уже была в HTTP-клиенте: таймаут короче
     `getUpdates` превращал long polling в серию таймаутов.
     """
-    assert poller_mod.POLL_HARD_LIMIT > poller_mod.POLL_TIMEOUT
-    assert poller_mod.STALL_AFTER > poller_mod.POLL_HARD_LIMIT
+    params = {"timeout": poller_mod.POLL_TIMEOUT}
+    limit = tg.deadline("getUpdates", params) + poller_mod.HARD_MARGIN
+    assert tg.http_timeout_for("getUpdates", params) > poller_mod.POLL_TIMEOUT
+    assert limit > tg.http_timeout_for("getUpdates", params)
+    assert limit < poller_mod.STALL_AFTER
 
 
 @pytest.mark.asyncio
@@ -75,7 +78,8 @@ async def test_hung_long_poll_does_not_wedge_the_loop(
 
     До правки этот тест висел бы вечно — ровно как боевой поллер.
     """
-    monkeypatch.setattr(poller_mod, "POLL_HARD_LIMIT", 0.05)
+    monkeypatch.setattr(tg, "deadline", lambda *a, **k: 0.0)
+    monkeypatch.setattr(poller_mod, "HARD_MARGIN", 0.05)
     monkeypatch.setattr(poller_mod, "ERROR_SLEEP", 0.01)
 
     attempts = 0
