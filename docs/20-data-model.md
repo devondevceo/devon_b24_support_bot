@@ -157,7 +157,13 @@ CREATE TABLE tg_bots (
   status          TEXT        NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending','active','error','suspended')),
   last_check_at   TIMESTAMPTZ,
-  last_error      TEXT,
+  last_error      TEXT,                         -- почему status = error/suspended
+  -- Слышит ли поллер Telegram (миграция 0021). heard_at — последний ответ на
+  -- getUpdates (поллер пишет не чаще раза в минуту; NULL — ещё не отвечал после
+  -- миграции). poll_error — почему ответов нет дольше DEAF_AFTER, NULL — слышит.
+  -- Не last_check_at/last_error: те про «бот выключен», а это про «включён, но глух».
+  heard_at        TIMESTAMPTZ,
+  poll_error      TEXT,
   -- короткое имя мини-аппа из BotFather (`/newapp`), миграция 0010.
   -- NULL = не заведено: из группы мини-апп открывается через личку бота.
   miniapp_short_name TEXT

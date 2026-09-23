@@ -56,16 +56,16 @@ async def test_registry_pulse_stops_when_polling_stalls() -> None:
     """
     reg = PollerRegistry()
     reg._pollers[1] = _poller()
-    assert reg.polling() is True
+    assert reg.hearing() is True
 
     reg._pollers[1] = _poller(idle=poller_mod.STALL_AFTER + 1)
-    assert reg.polling() is False
+    assert reg.hearing() is False
 
 
 @pytest.mark.asyncio
 async def test_empty_registry_counts_as_healthy() -> None:
     """Ботов нет — опрашивать нечего, и краснеть тоже не за что."""
-    assert PollerRegistry().polling() is True
+    assert PollerRegistry().hearing() is True
 
 
 @pytest.mark.asyncio
@@ -142,6 +142,6 @@ async def test_long_polling_is_retried_by_the_clock_not_by_luck() -> None:
 async def test_timeout_counts_as_a_completed_lap() -> None:
     """Сеть молчит — цикл всё равно жив, и сторож не должен его переподнимать."""
     p = _poller(idle=poller_mod.STALL_AFTER + 5)
-    assert PollerRegistry().polling() is True  # пустой реестр
+    assert PollerRegistry().hearing() is True  # пустой реестр
     p._on_timeout()
     assert p.idle_for() < 1.0
