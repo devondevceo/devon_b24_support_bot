@@ -125,7 +125,7 @@ def _telegram_answers(monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]) -> 
 
     monkeypatch.setattr(
         tg, "_client",
-        lambda timeout: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        lambda timeout, route: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
 
 
 def test_telegram_names_the_new_chat_in_its_refusal(

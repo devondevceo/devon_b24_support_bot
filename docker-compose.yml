@@ -133,7 +133,8 @@ services:
 
   # Приём апдейтов Telegram. Long polling, а не вебхук: проверено, что серверы
   # Telegram не могут достучаться до этого хоста, а хост — до api.telegram.org.
-  # Исходящие вызовы идут через SOCKS5 (TG_PROXY_URL).
+  # Исходящие вызовы — прямым адресом Telegram (TG_API_IPS), SOCKS5 (TG_PROXY_URL)
+  # запасным: прокси обрывает ответы крупнее ~11 КБ (docs/10-architecture.md §2).
   bot:
     image: ${APP_IMAGE:-ghcr.io/devondevceo/devon_b24_support_bot:latest}
     container_name: b24sdbot-bot

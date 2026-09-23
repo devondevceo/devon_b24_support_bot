@@ -1,14 +1,18 @@
 """Минимальный клиент Telegram Bot API.
 
 Инвариант И-4: хост только `api.telegram.org` (или явно настроенный прокси теннанта),
-никогда из входящих данных.
+никогда из входящих данных. Прямой путь по IP этого не меняет: в TLS называется
+`api.telegram.org`, и сертификат проверяется по этому имени (`Route`).
 
 Полноценный слой бота на aiogram придёт отдельно; здесь ровно то, что нужно для
 подключения бота теннанта: проверить токен, узнать бота, поставить и снять вебхук.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -22,8 +26,116 @@ TIMEOUT = 20.0
 # превышать, иначе клиент рвёт связь раньше ответа Telegram и цикл вырождается в
 # бесконечную серию таймаутов.
 POLL_HTTP_MARGIN = 15.0
+# Скачивание файла до 20 МБ (tg/files.py).
+FILE_TIMEOUT = 120.0
 ALLOWED_UPDATES = ["message", "edited_message", "callback_query",
                    "my_chat_member", "chat_member"]
+
+# Сколько ждать соединения на одном пути, прежде чем идти следующим. Короче
+# общего таймаута: закрытый путь должен стоить секунд, а не всего вызова.
+CONNECT_TIMEOUT = 6.0
+# Сколько не пробовать путь первым после того, как он не дал соединения.
+ROUTE_COOLDOWN = 300.0
+
+# Ошибки, при которых запрос гарантированно НЕ ушёл в Telegram: соединение не
+# установлено (TCP, TLS, SOCKS). Только после них вызов можно повторить другим
+# путём. После таймаута чтения — нельзя: `sendMessage` мог дойти, и повтор
+# отправил бы сообщение второй раз.
+_NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError)
+
+
+@dataclass(frozen=True)
+class Route:
+    """Один путь до api.telegram.org.
+
+    Зачем их несколько — живая авария 23.09.2026 (docs/10-architecture.md §2).
+    Прокси, через который ходил бот, замораживает любое соединение после ~16 КБ
+    входящих данных: TLS-рукопожатие съедает 5.5 КБ, и ответ крупнее ~11 КБ не
+    доходит никогда. Апдейт с реплаем на карточку задачи весит 14.7 КБ — он встал
+    первым в очереди, и бот пять часов не видел ни одного нажатия. Прямой путь по
+    IP при этом отдаёт те же ответы за 0.2 с, а DNS-адрес `api.telegram.org`
+    с сервера закрыт. Поэтому: прямые адреса первыми, прокси — запасным.
+    """
+    name: str              # для лога и учёта отказов; без логина и пароля прокси
+    origin: str            # https://149.154.167.220 или https://api.telegram.org
+    proxy: str | None = None
+    sni: str | None = None  # имя для TLS, когда в адресе стоит IP
+
+
+# Путь → момент, до которого он не пробуется первым. Общее на процесс: отказ,
+# увиденный одним вызовом, экономит время всем следующим.
+_down_until: dict[str, float] = {}
+
+
+def routes(proxy_base: str | None = None) -> list[Route]:
+    """Пути в порядке предпочтения. Только из настроек, никогда из входящих данных."""
+    s = get_settings()
+    if proxy_base:
+        return [Route("base", proxy_base.rstrip("/"), s.tg_proxy)]
+    out = [Route(ip, f"https://{_url_host(ip)}", sni=TELEGRAM_HOST)
+           for ip in s.tg_direct_ips]
+    # Настроенный прокси означает, что адрес из DNS с этого хоста закрыт: пробовать
+    # его — только тратить время. Без прокси DNS-адрес и есть обычный путь.
+    if s.tg_proxy:
+        out.append(Route("прокси", f"https://{TELEGRAM_HOST}", proxy=s.tg_proxy))
+    else:
+        out.append(Route(TELEGRAM_HOST, f"https://{TELEGRAM_HOST}"))
+    return out
+
+
+def _url_host(ip: str) -> str:
+    return f"[{ip}]" if ipaddress.ip_address(ip).version == 6 else ip
+
+
+def _ordered(candidates: list[Route]) -> list[Route]:
+    """Сначала пути без недавнего отказа, в порядке настройки; остальные — после.
+
+    Отказавшие не выбрасываются: если закрыто всё, пробовать всё равно надо.
+    """
+    now = time.monotonic()
+    fresh = [r for r in candidates if _down_until.get(r.name, 0.0) <= now]
+    return fresh + [r for r in candidates if r not in fresh]
+
+
+def deadline(method: str, params: dict[str, Any] | None,
+             proxy_base: str | None = None) -> float:
+    """Худшее время одного `call`: на каждом пути ждали соединения, на последнем
+    ещё и ответа. Свой предел поверх клиента обязан быть ДЛИННЕЕ (bot/poller.py):
+    иначе он рубит вызов до того, как клиент узнал, что путь закрыт, и следующий
+    заход снова начнётся с закрытого.
+    """
+    return CONNECT_TIMEOUT * len(routes(proxy_base)) + http_timeout_for(method, params)
+
+
+async def _request(verb: str, path: str, *, http_timeout: float,
+                   json: dict[str, Any] | None = None,
+                   proxy_base: str | None = None) -> httpx.Response:
+    """Запрос к Telegram первым живым путём.
+
+    Следующий путь пробуется, только если на текущем не установилось соединение
+    (`_NOT_SENT`). Любая другая ошибка уходит вызывающему как есть.
+    """
+    last: httpx.HTTPError | None = None
+    for route in _ordered(routes(proxy_base)):
+        extra: dict[str, Any] = {}
+        if route.sni:
+            extra = {"headers": {"Host": route.sni},
+                     "extensions": {"sni_hostname": route.sni}}
+        try:
+            async with _client(http_timeout, route) as http:
+                resp = await http.request(verb, route.origin + path, json=json, **extra)
+        except _NOT_SENT as exc:
+            if _down_until.get(route.name, 0.0) <= time.monotonic():
+                log.warning("Telegram: путь %s закрыт (%s) — иду следующим",
+                            route.name, type(exc).__name__)
+            _down_until[route.name] = time.monotonic() + ROUTE_COOLDOWN
+            last = exc
+            continue
+        if _down_until.pop(route.name, None) is not None:
+            log.info("Telegram: путь %s снова открыт", route.name)
+        return resp
+    assert last is not None, "routes() всегда возвращает хотя бы один путь"
+    raise last
 
 
 class TelegramError(Exception):
@@ -41,17 +153,14 @@ class TelegramInvalidToken(TelegramError):
     """401 — токен не тот или отозван в BotFather."""
 
 
-def _base(token: str, proxy_base: str | None = None) -> str:
-    host = proxy_base.rstrip("/") if proxy_base else f"https://{TELEGRAM_HOST}"
-    return f"{host}/bot{token}/"
-
-
-def _client(timeout: float) -> httpx.AsyncClient:
+def _client(timeout: float, route: Route) -> httpx.AsyncClient:
     """Единственное место, где создаётся HTTP-клиент к Telegram.
 
     Прокси берётся из настроек, а не из входящих данных (И-4).
     """
-    return httpx.AsyncClient(timeout=timeout, proxy=get_settings().tg_proxy)
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout, connect=min(timeout, CONNECT_TIMEOUT)),
+        proxy=route.proxy)
 
 
 def http_timeout_for(method: str, params: dict[str, Any] | None) -> float:
@@ -61,17 +170,22 @@ def http_timeout_for(method: str, params: dict[str, Any] | None) -> float:
     return TIMEOUT
 
 
+def _transport_error(exc: Exception) -> TelegramError:
+    # У таймаутов httpx пустой str(), поэтому имя класса обязательно:
+    # без него в логе остаётся бесполезное «транспорт: ».
+    detail = f"{type(exc).__name__}: {exc}".strip().rstrip(":")
+    return TelegramError(0, f"транспорт: {detail[:150]}")
+
+
 async def call(token: str, method: str, params: dict[str, Any] | None = None, *,
                proxy_base: str | None = None) -> Any:
-    async with _client(http_timeout_for(method, params)) as http:
-        try:
-            resp = await http.post(_base(token, proxy_base) + method, json=params or {})
-            data = resp.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            # У таймаутов httpx пустой str(), поэтому имя класса обязательно:
-            # без него в логе остаётся бесполезное «транспорт: ».
-            detail = f"{type(exc).__name__}: {exc}".strip().rstrip(":")
-            raise TelegramError(0, f"транспорт: {detail[:150]}") from exc
+    try:
+        resp = await _request("POST", f"/bot{token}/{method}",
+                              http_timeout=http_timeout_for(method, params),
+                              json=params or {}, proxy_base=proxy_base)
+        data = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise _transport_error(exc) from exc
 
     if not data.get("ok"):
         code = int(data.get("error_code") or resp.status_code)
@@ -80,6 +194,23 @@ async def call(token: str, method: str, params: dict[str, Any] | None = None, *,
             raise TelegramInvalidToken(code, desc)
         raise TelegramError(code, desc, migrate_to_chat_id=_migrated_to(data))
     return data.get("result")
+
+
+async def download_file(token: str, file_path: str) -> bytes:
+    """Файл по `file_path` из `getFile` — теми же путями, что и вызовы API.
+
+    Через прокси файл не скачивался вовсе: замерзание после ~16 КБ бьёт по любой
+    фотографии, а не только по крупным апдейтам.
+    """
+    try:
+        resp = await _request("GET", f"/file/bot{token}/{file_path}",
+                              http_timeout=FILE_TIMEOUT)
+    except httpx.HTTPError as exc:
+        raise _transport_error(exc) from exc
+    if resp.status_code != 200:
+        # Без адреса: в нём токен.
+        raise TelegramError(resp.status_code, "файл не скачан")
+    return resp.content
 
 
 def _migrated_to(data: dict[str, Any]) -> int | None:

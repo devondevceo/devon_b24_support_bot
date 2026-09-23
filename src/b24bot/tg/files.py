@@ -10,9 +10,6 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
-from b24bot.core.config import TELEGRAM_HOST, get_settings
 from b24bot.core.text import safe_filename
 from b24bot.tg import api as tg
 
@@ -96,8 +93,4 @@ async def download(token: str, att: Attachment) -> bytes:
     if not path:
         raise FileTooBig(att.name, size)
 
-    url = f"https://{TELEGRAM_HOST}/file/bot{token}/{path}"
-    async with httpx.AsyncClient(timeout=120, proxy=get_settings().tg_proxy) as http:
-        resp = await http.get(url)
-        resp.raise_for_status()
-        return resp.content
+    return await tg.download_file(token, path)

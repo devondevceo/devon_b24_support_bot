@@ -7,7 +7,8 @@
     ноль запросов на `/tg/`.
 
 То есть фильтрация двусторонняя, и вебхук на этом хосте нежизнеспособен. Исходящие
-вызовы идут через SOCKS5 (тот же прокси, что у mclick), приём — long polling.
+вызовы идут прямым адресом Telegram, а SOCKS5 — запасной путь (`tg.Route`); приём —
+long polling.
 Обработчик вебхука в коде остаётся: он заработает без единой правки, если сервис
 переедет на хост с прямым доступом.
 """
@@ -17,6 +18,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from typing import Any
 
 from b24bot.bot import commands, dispatch
 from b24bot.core import heartbeat
@@ -36,11 +38,16 @@ REFRESH_BOTS_EVERY = 30.0  # как часто перечитываем спис
 # запрос завис навсегда, поллер простоял 11 дней, Telegram копил апдейты, а
 # контейнер всё это время числился `healthy`. Библиотечный таймаут — обещание
 # библиотеки; этот — наше, и обойти его нечем.
-POLL_HARD_LIMIT = POLL_TIMEOUT + 20.0
+#
+# Предел — запас поверх худшего времени вызова клиента (`tg.deadline`), а не
+# число: клиент перебирает пути к Telegram, и предел короче их суммы обрывал бы
+# заход раньше, чем клиент узнает, что путь закрыт. Так и было 23.09.2026 на
+# коротком опросе: предел 20 с совпадал с таймаутом клиента, и обрывал всегда он.
+HARD_MARGIN = 5.0
 # Сколько цикл может не завершать оборот, прежде чем считать его зависшим.
 # Оборот — это getUpdates плюс обработка; при исправной сети он занимает секунды,
-# при неисправной — упирается в POLL_HARD_LIMIT и ERROR_SLEEP.
-STALL_AFTER = POLL_HARD_LIMIT * 3
+# при неисправной — упирается в предел захода и ERROR_SLEEP.
+STALL_AFTER = 135.0
 
 # Отступление на короткий опрос. На боевом хосте 08.09.2026 нашлось, что через
 # этот SOCKS5-прокси удержание соединения на 25 секунд не доживает до ответа:
@@ -111,18 +118,18 @@ class BotPoller:
         await self._publish_commands()
 
         while not self._stop.is_set():
-            wait = self._poll_timeout()
-            limit = wait + (POLL_HARD_LIMIT - POLL_TIMEOUT)
+            params: dict[str, Any] = {
+                "offset": self._offset + 1,
+                "timeout": self._poll_timeout(),
+                "allowed_updates": tg.ALLOWED_UPDATES,
+            }
+            limit = tg.deadline("getUpdates", params) + HARD_MARGIN
             try:
                 # Свой предел поверх клиентского: библиотечный таймаут однажды
                 # уже не сработал, и цена этого — молчащий бот, неотличимый
                 # снаружи от исправного.
                 async with asyncio.timeout(limit):
-                    updates = await tg.call(self._token, "getUpdates", {
-                        "offset": self._offset + 1,
-                        "timeout": wait,
-                        "allowed_updates": tg.ALLOWED_UPDATES,
-                    })
+                    updates = await tg.call(self._token, "getUpdates", params)
             except tg.TelegramInvalidToken as exc:
                 log.error("токен бота @%s отвергнут (%s) — поллер остановлен",
                           self.username, exc.description)

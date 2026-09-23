@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 from functools import lru_cache
 
 from pydantic import Field, field_validator
@@ -35,10 +36,19 @@ class Settings(BaseSettings):
     # того, как адрес приёма кода прописан обработчиком приложения на портале.
     b24_oauth_redirect: bool = False
 
-    # api.telegram.org недоступен с сервера напрямую (проверено 16.08.2026: таймаут).
-    # Исходящие вызовы к Telegram идут через SOCKS5. Входящие вебхуки прокси НЕ требуют:
-    # Telegram сам стучится на наш публичный домен.
+    # api.telegram.org по адресу из DNS с сервера недоступен (проверено 16.08.2026:
+    # таймаут). Прокси — запасной путь к Telegram, первый — прямые адреса ниже.
+    # Входящие вебхуки прокси НЕ требуют: Telegram сам стучится на наш домен.
     tg_proxy_url: str = ""
+
+    # Прямые адреса api.telegram.org — первый путь к Telegram (tg/api.py, `Route`).
+    # 23.09.2026 на боевом сервере: DNS отдаёт 149.154.166.110 — таймаут, а
+    # 149.154.167.220 отвечает за 0.2 с и отдаёт хоть 47 КБ, тогда как прокси
+    # замораживает соединение после ~16 КБ, и крупный апдейт не доходил никогда.
+    # Через запятую; пусто — прямых адресов нет. В TLS всегда называется
+    # api.telegram.org, так что чужой адрес не пройдёт проверку сертификата и
+    # токен туда не уйдёт.
+    tg_api_ips: str = "149.154.167.220"
 
     # Короткое имя мини-аппа из BotFather (`/newapp`). Ссылка вида
     # t.me/<бот>/<имя>?startapp=… — единственный способ открыть мини-апп из группы:
@@ -64,6 +74,20 @@ class Settings(BaseSettings):
         if len(raw) != 32:
             raise ValueError("MASTER_KEY должен быть 32 байтами в base64url")
         return v
+
+    @field_validator("tg_api_ips")
+    @classmethod
+    def _check_tg_api_ips(cls, v: str) -> str:
+        # Только адреса: имя хоста здесь означало бы второй источник DNS, а весь
+        # смысл настройки в том, что DNS с этого хоста ведёт в закрытый адрес.
+        for item in v.split(","):
+            if item.strip():
+                ipaddress.ip_address(item.strip())
+        return v
+
+    @property
+    def tg_direct_ips(self) -> tuple[str, ...]:
+        return tuple(i.strip() for i in self.tg_api_ips.split(",") if i.strip())
 
     @property
     def master_key_bytes(self) -> bytes:
