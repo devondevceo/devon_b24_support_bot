@@ -352,3 +352,108 @@ def test_health_error_text_from_telegram_is_escaped_by_caller() -> None:
     _, _, detail = app_ui._health(_bot(status="error", last_error=EVIL), 1, 1)
     assert detail == EVIL
     assert_no_injection(ui.banner(esc_html(detail), "err"))
+
+
+# ------------------------------------------ приём: бот слышит Telegram или нет
+DEAF = "На боте установлен вебхук, и Telegram не отдаёт сообщения опросом"
+
+
+def test_health_deaf_bot_is_not_working_even_when_active() -> None:
+    """23.09.2026: `status='active'` и «Интеграция работает» при молчащем боте.
+
+    Статус говорит «токен однажды приняли», а не «сообщения забираются».
+    """
+    kind, title, detail = app_ui._health(
+        _bot(poll_error=DEAF, heard_ago=1800.0, poll_checked_ago=20.0), 3, 2)
+    assert kind == "err"
+    assert "не получает" in title
+    assert DEAF in detail
+    assert "30 мин назад" in detail
+
+
+def test_health_silent_bot_service_is_seen_by_its_report_alone() -> None:
+    """Служба бота не работает — причину писать некому, говорит возраст отчёта.
+
+    Причины в базе при этом нет вовсе: служба умерла, пока всё было в порядке.
+    """
+    kind, title, detail = app_ui._health(
+        _bot(heard_ago=7300.0, poll_checked_ago=7200.0, poll_error=None), 3, 2)
+    assert kind == "err"
+    assert "не получает" in title
+    assert "Служба бота" in detail
+    assert "2 ч назад" in detail
+
+
+def test_health_stale_report_outranks_a_stale_reason() -> None:
+    """Служба умерла глухой: причина в базе устарела, правда — «служба не работает»."""
+    _, _, detail = app_ui._health(
+        _bot(poll_error=DEAF, heard_ago=9000.0, poll_checked_ago=7200.0), 3, 2)
+    assert "Служба бота" in detail
+
+
+def test_health_fresh_report_is_fine() -> None:
+    kind, _, _ = app_ui._health(
+        _bot(heard_ago=40.0, poll_checked_ago=30.0, poll_error=None), 3, 2)
+    assert kind == "ok"
+
+
+def test_health_quiet_chat_is_fine() -> None:
+    """Тихий чат — не глухота: отчёт свежий, причины нет, очередь пуста."""
+    kind, _, _ = app_ui._health(_bot(heard_ago=20.0, poll_checked_ago=20.0,
+                                     poll_error=None, queue_pending=0), 3, 2)
+    assert kind == "ok"
+
+
+def test_health_no_report_yet_is_not_an_alarm() -> None:
+    """NULL — «служба ещё не отчиталась», а не сбой: иначе минута после выкатки
+    с миграцией 0022 начиналась бы с красного экрана."""
+    kind, _, _ = app_ui._health(
+        _bot(heard_ago=None, poll_checked_ago=None, poll_error=None), 3, 2)
+    assert kind == "ok"
+
+
+def test_health_deafness_outranks_privacy_but_not_suspension() -> None:
+    """Порядок проверок — порядок поломок: выключенный бот, потом глухой, потом privacy."""
+    _, title, _ = app_ui._health(_bot(privacy_mode_off=False, poll_error=DEAF), 3, 2)
+    assert "не получает" in title
+    _, title, _ = app_ui._health(
+        _bot(status="suspended", last_error="чужой вебхук", poll_error=DEAF), 3, 2)
+    assert "приостановлен" in title
+
+
+def test_health_webhook_mode_has_no_poller_to_hear() -> None:
+    kind, _, _ = app_ui._health(
+        _bot(mode="webhook", heard_ago=99999.0, poll_checked_ago=99999.0), 3, 2)
+    assert kind == "ok"
+
+
+def _panel_bot(**over: object) -> dict[str, object]:
+    return _bot(**{"last_check_at": None, "heard_ago": None, "poll_error": None,
+                   "poll_checked_ago": None, "queue_pending": None, **over})
+
+
+def test_bot_panel_says_deaf_instead_of_working() -> None:
+    html = app_ui._bot_panel(
+        _panel_bot(poll_error=DEAF, heard_ago=1800.0, poll_checked_ago=30.0),
+        True, "s", "bot")
+    assert "не получает сообщения" in html
+    assert "работает" not in html, "«работает» рядом с «не получает» — та самая неправда"
+    assert "30 мин назад" in html
+
+
+def test_bot_panel_shows_the_queue_telegram_holds() -> None:
+    """Очередь Telegram — единственное число, которое отличает тихий чат от глухого бота."""
+    html = app_ui._bot_panel(_panel_bot(heard_ago=10.0, poll_checked_ago=10.0,
+                                        queue_pending=19), True, "s", "bot")
+    assert "Ждут разбора в Telegram" in html
+    assert ">19<" in html
+    unknown = app_ui._bot_panel(_panel_bot(), True, "s", "bot")
+    assert "Ждут разбора в Telegram" in unknown, "строка есть и тогда, когда не знаем"
+
+
+def test_bot_panel_escapes_the_poller_reason() -> None:
+    """Причину пишет поллер, но в ней бывает описание Telegram и текст транспорта."""
+    html = app_ui._bot_panel(
+        _panel_bot(poll_error=EVIL, heard_ago=900.0, poll_checked_ago=30.0),
+        True, "s", "bot")
+    assert_no_injection(html)

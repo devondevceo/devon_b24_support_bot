@@ -159,7 +159,19 @@ CREATE TABLE tg_bots (
   status          TEXT        NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending','active','error','suspended')),
   last_check_at   TIMESTAMPTZ,
-  last_error      TEXT,
+  last_error      TEXT,                         -- почему status = error/suspended
+  -- Отчёт поллера о приёме (миграция 0022, bot/reception.py), одной строкой раз в
+  -- минуту. heard_at — последний ответ Telegram на getUpdates (NULL — не отвечал с
+  -- подключения бота); poll_error — что не так словами: глухота, стоящая очередь,
+  -- вторая копия бота (NULL — в порядке); queue_pending — pending_update_count из
+  -- getWebhookInfo (NULL — не узнать); poll_checked_at — когда служба бота
+  -- отчиталась, а при подключении — с какого момента обязана. Старая отметка —
+  -- служба не работает. Не last_check_at/last_error: те про «бот выключен», а это
+  -- про «включён, но не слышит».
+  heard_at        TIMESTAMPTZ,
+  poll_error      TEXT,
+  queue_pending   INTEGER CHECK (queue_pending >= 0),
+  poll_checked_at TIMESTAMPTZ,
   -- короткое имя мини-аппа из BotFather (`/newapp`), миграция 0010.
   -- NULL = не заведено: из группы мини-апп открывается через личку бота.
   miniapp_short_name TEXT
