@@ -11,17 +11,21 @@
 long polling.
 Обработчик вебхука в коде остаётся: он заработает без единой правки, если сервис
 переедет на хост с прямым доступом.
+
+Слышит ли бот Telegram на самом деле — отдельный вопрос, и отвечает на него
+`bot/reception.py`: пульс процесса ставится по ответам Telegram и по его очереди,
+а не по обороту цикла.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
-import re
 import time
 from typing import Any
 
 from b24bot.bot import commands, dispatch
+from b24bot.bot.reception import Problem, Reception, is_webhook_conflict
 from b24bot.core import heartbeat
 from b24bot.core.config import get_settings
 from b24bot.crypto import box
@@ -29,6 +33,11 @@ from b24bot.db.pool import pool, system_scope, tenant_scope
 from b24bot.tg import api as tg
 
 log = logging.getLogger(__name__)
+
+# Часы и сон цикла. Монотонные часы — одни на весь приём (оборот, глухота, очередь);
+# тесты подменяют оба и прогоняют часы работы за миллисекунды.
+clock = time.monotonic
+_sleep = asyncio.sleep
 
 POLL_TIMEOUT = 25          # сколько Telegram держит соединение, секунд
 IDLE_SLEEP = 1.0           # пауза после пустого ответа
@@ -65,43 +74,28 @@ FALLBACK_AFTER = 3         # столько таймаутов подряд оз
 SHORT_POLL_SLEEP = 2.0     # пауза между короткими запросами
 RETRY_LONG_EVERY = 900.0   # как часто пробовать вернуться к длинному опросу
 
-# Сколько поллер может не получать ОТВЕТА Telegram, прежде чем считаться глухим.
-#
-# Оборот цикла и ответ Telegram — разные события. 23.09.2026 бот не отвечал ни на
-# одну команду, а зелёным было всё: контейнер `healthy`, `/health` — `ok`, экран в
-# Битриксе — «Интеграция работает». Оборотом засчитывался и 409 от Telegram, и отказ
-# прокси, и таймаут, то есть цикл, в котором не прошёл ни один `getUpdates`, числился
-# живым. Сторож 08.09 ловил зависший цикл, а этот цикл не висел — он честно крутился
-# вхолостую.
-#
-# Предел длиннее отступления на короткий опрос (FALLBACK_AFTER заходов по
-# пределу захода плюс паузы — около 200 с): сеть, где длинный опрос не живёт, а
-# короткий живёт, глухотой не считается — бот в ней работает.
-DEAF_AFTER = 300.0
-# Как часто отмечать в базе, что Telegram отвечает (`tg_bots.heard_at`). Отметку
-# читает экран приложения, где счёт идёт на минуты; чаще — лишняя запись в базу на
-# каждый короткий опрос.
-HEARD_MARK_EVERY = 60.0
+# Как часто спрашивать очередь Telegram и отчитываться о приёме в `tg_bots`. Экран
+# считает на минуты; чаще — лишний вызов и лишняя запись на каждый короткий опрос.
+CHECK_EVERY = 60.0
+# Как часто повторять в логе сбой приёма, который всё ещё длится. Первая строка —
+# сразу; дальше — чтобы `docker logs --since 1h` показал сбой, начавшийся утром.
+# Стоящая очередь при отвечающем Telegram других строк в логе не оставляет вовсе.
+RELOG_EVERY = 900.0
 
-# Логин и пароль прокси в тексте ошибки транспорта. Причина глухоты уходит на экран
-# администратора теннанта, а исключение httpx вправе процитировать адрес целиком.
-_CREDENTIALS = re.compile(r"(\w+://)[^/\s@]+@")
-
-# Состояние приёма в `tg_bots` (миграция 0022). `status` поллер трогает только в
-# одном случае — чужой вебхук, то есть токен у третьих лиц.
-_SQL_HEARD = "UPDATE tg_bots SET heard_at = now(), poll_error = NULL WHERE id = $1"
-_SQL_DEAF = "UPDATE tg_bots SET poll_error = $2 WHERE id = $1"
+# Отчёт о приёме в `tg_bots` (миграция 0022), раз в CHECK_EVERY.
+# heard_at — момент последнего ответа Telegram, пересчитанный из монотонных часов:
+# до первого ответа не трогаем, «Telegram ответил при старте» было бы неправдой.
+_SQL_RECEPTION = """
+    UPDATE tg_bots
+       SET heard_at = CASE WHEN $2::float8 IS NULL THEN heard_at
+                           ELSE now() - make_interval(secs => $2::float8) END,
+           poll_error = $3, queue_pending = $4, poll_checked_at = now()
+     WHERE id = $1
+"""
+# `status` поллер трогает только в одном случае — чужой вебхук, то есть токен у
+# третьих лиц.
 _SQL_SUSPEND = ("UPDATE tg_bots SET status = 'suspended', last_error = $2, "
                 "last_check_at = now() WHERE id = $1")
-
-
-def is_webhook_conflict(exc: tg.TelegramError) -> bool:
-    """409, который означает вебхук на боте, а не второй экземпляр опроса.
-
-    Telegram отвечает так в двух случаях: на `getUpdates`, пока вебхук стоит, и
-    обрывая уже висящий long poll в момент `setWebhook`. Лечится одинаково.
-    """
-    return exc.code == 409 and "webhook" in exc.description.lower()
 
 
 def is_own_webhook(url: str) -> bool:
@@ -109,34 +103,11 @@ def is_own_webhook(url: str) -> bool:
     return url.startswith(get_settings().public_base_url.rstrip("/") + "/tg/")
 
 
-def describe_failure(exc: BaseException) -> str:
-    """Почему заход в getUpdates не удался — человеческим языком.
-
-    Текст уходит в `tg_bots.poll_error` и показывается администратору на экране
-    приложения, поэтому в нём нет ни токена (его нет и в описаниях Telegram), ни
-    логина с паролем прокси.
-    """
-    if isinstance(exc, TimeoutError):
-        return ("Telegram не ответил на запрос новых сообщений за отведённое время — "
-                "обычно это прокси, через который сервер ходит в Telegram")
-    if isinstance(exc, tg.TelegramError):
-        if is_webhook_conflict(exc):
-            return "на боте установлен вебхук, и Telegram не отдаёт сообщения опросом (409)"
-        if exc.code == 409:
-            return ("этого бота опрашивает ещё один процесс с тем же токеном (409): "
-                    "сообщения уходят туда")
-        if exc.code == 0:
-            detail = _CREDENTIALS.sub(r"\1", exc.description)
-            return f"нет связи с Telegram через прокси ({detail})"
-        return f"Telegram отвечает ошибкой {exc.code}: {exc.description}"
-    return f"сбой опроса: {type(exc).__name__}"
-
-
 class BotPoller:
     """Один цикл на одного бота теннанта."""
 
     def __init__(self, bot_ref: int, tenant_id: int, bot_id: int, username: str,
-                 token: str, offset: int) -> None:
+                 token: str, offset: int, reception: Reception | None = None) -> None:
         self.bot_ref = bot_ref
         self.tenant_id = tenant_id
         self.bot_id = bot_id
@@ -146,33 +117,31 @@ class BotPoller:
         self._stop = asyncio.Event()
         # Время последнего ЗАВЕРШЁННОГО оборота цикла — по нему сторож ловит
         # зависший цикл. Жив ли приём, отсюда не видно: оборот завершает и
-        # неудачный заход.
-        self._polled_at = time.monotonic()
-        # Когда Telegram в последний раз ОТВЕТИЛ на getUpdates (пустой список —
-        # тоже ответ). Пульс процесса считается по нему. Старт засчитан за ответ:
-        # у свежего цикла есть DEAF_AFTER на первый заход, иначе каждая выкатка
-        # начиналась бы с красного healthcheck.
-        self._heard_at = time.monotonic()
-        self._heard_marked_at: float | None = None
-        # Причина глухоты, уже записанная в `poll_error`: одно и то же не пишется
-        # в базу каждые пять секунд.
-        self._reported: str | None = None
+        # неудачный заход. Это видно по `reception`.
+        self._polled_at = clock()
+        # Приём живёт в реестре и переживает перезапуск цикла (bot/reception.py).
+        self.reception = reception if reception is not None else Reception(clock())
         # Опрос начинает с длинного и отступает на короткий, только увидев,
         # что длинный на этой сети не доживает до ответа.
         self._short_poll = False
         self._timeouts = 0
-        self._long_retry_at = time.monotonic() + RETRY_LONG_EVERY
+        self._long_retry_at = clock() + RETRY_LONG_EVERY
 
     def stop(self) -> None:
         self._stop.set()
 
     def idle_for(self) -> float:
         """Сколько секунд цикл не завершал оборот."""
-        return time.monotonic() - self._polled_at
+        return clock() - self._polled_at
 
     def deaf_for(self) -> float:
         """Сколько секунд Telegram не отвечал на getUpdates."""
-        return time.monotonic() - self._heard_at
+        return self.reception.deaf_for(clock())
+
+    def healthy(self) -> bool:
+        """Цикл не завис и приём в порядке — то, за что ставится пульс процесса."""
+        return (self.idle_for() <= STALL_AFTER
+                and self.reception.problem(clock()) is None)
 
     async def _publish_commands(self) -> None:
         """Меню слеш-команд. Своё на личку, на группы и на админов группы.
@@ -220,44 +189,50 @@ class BotPoller:
                 log.warning("getUpdates @%s не ответил за %.0f с — обрываю заход",
                             self.username, limit)
                 self._on_timeout()
-                await self._on_failure(exc)
-                await asyncio.sleep(ERROR_SLEEP)
+                await self._after_failure(exc)
                 continue
             except tg.TelegramError as exc:
                 log.warning("getUpdates @%s: %s", self.username, exc)
                 if is_webhook_conflict(exc):
                     if await self._clear_webhook():
-                        self._polled_at = time.monotonic()
+                        self._polled_at = clock()
                         continue  # вебхук снят — следующий заход сразу
                     if self._stop.is_set():
                         return    # вебхук чужой: бот приостановлен
                 if exc.code == 0 and "timeout" in exc.description.lower():
                     self._on_timeout()
                 else:
-                    self._polled_at = time.monotonic()
-                await self._on_failure(exc)
-                await asyncio.sleep(ERROR_SLEEP)
+                    self._polled_at = clock()
+                await self._after_failure(exc)
                 continue
 
             self._on_success()
-            await self._mark_heard()
+            if updates:
+                await self._handle(updates)
+            await self._check_reception()
             if not updates:
-                await asyncio.sleep(SHORT_POLL_SLEEP if self._short_poll else IDLE_SLEEP)
-                continue
+                await _sleep(SHORT_POLL_SLEEP if self._short_poll else IDLE_SLEEP)
 
-            for update in updates:
-                update_id = int(update.get("update_id") or 0)
-                try:
-                    await dispatch.handle(self.bot_ref, self.tenant_id, update)
-                    await dispatch.route(self.bot_ref, update)
-                except Exception:
-                    # Апдейт, который валит обработку, не должен зациклить поллер:
-                    # сдвигаем offset и идём дальше, разбираемся по логам.
-                    log.exception("ошибка обработки апдейта %s", update_id)
-                self._offset = max(self._offset, update_id)
+    async def _handle(self, updates: list[dict[str, Any]]) -> None:
+        for update in updates:
+            update_id = int(update.get("update_id") or 0)
+            try:
+                await dispatch.handle(self.bot_ref, self.tenant_id, update)
+                await dispatch.route(self.bot_ref, update)
+            except Exception:
+                # Апдейт, который валит обработку, не должен зациклить поллер:
+                # сдвигаем offset и идём дальше, разбираемся по логам.
+                log.exception("ошибка обработки апдейта %s", update_id)
+            self._offset = max(self._offset, update_id)
 
-            await self._save_offset()
-            self._polled_at = time.monotonic()
+        await self._save_offset()
+        self._polled_at = clock()
+
+    async def _after_failure(self, exc: BaseException) -> None:
+        """Заход не удался: запомнить почему, отчитаться, если пора, и переждать."""
+        self.reception.failed(exc, clock())
+        await self._check_reception()
+        await _sleep(ERROR_SLEEP)
 
     # ------------------------------------------------------- подстройка опроса
     def _poll_timeout(self) -> float:
@@ -266,63 +241,95 @@ class BotPoller:
         Возврат к длинному опросу пробуется по времени, а не по числу удач:
         короткий опрос успешен всегда, и по удачам мы не вернулись бы никогда.
         """
-        if self._short_poll and time.monotonic() >= self._long_retry_at:
+        if self._short_poll and clock() >= self._long_retry_at:
             self._short_poll = False
             log.info("пробую вернуться к длинному опросу @%s", self.username)
         return 0.0 if self._short_poll else float(POLL_TIMEOUT)
 
     def _on_timeout(self) -> None:
         """Заход не дожил до ответа. Оборот засчитан: цикл жив, сеть — нет."""
-        self._polled_at = time.monotonic()
+        self._polled_at = clock()
         self._timeouts += 1
         if not self._short_poll and self._timeouts >= FALLBACK_AFTER:
             self._short_poll = True
-            self._long_retry_at = time.monotonic() + RETRY_LONG_EVERY
+            self._long_retry_at = clock() + RETRY_LONG_EVERY
             log.warning(
                 "длинный опрос @%s не доживает до ответа (%d таймаута подряд) — "
                 "перехожу на короткие запросы", self.username, self._timeouts)
 
     def _on_success(self) -> None:
-        self._polled_at = self._heard_at = time.monotonic()
+        self._polled_at = clock()
+        self.reception.answered(self._polled_at)
         if self._timeouts and not self._short_poll:
             log.info("длинный опрос @%s снова работает", self.username)
         self._timeouts = 0
         if self._short_poll:
             # Короткий опрос работает — следующую попытку длинного отложим,
             # чтобы не дёргать сеть впустую каждый оборот.
-            self._long_retry_at = max(self._long_retry_at,
-                                      time.monotonic() + SHORT_POLL_SLEEP)
+            self._long_retry_at = max(self._long_retry_at, clock() + SHORT_POLL_SLEEP)
 
-    # ------------------------------------------------ глухота: видно снаружи
-    async def _on_failure(self, exc: BaseException) -> None:
-        """Заход не удался. Человеку — только когда глухота стала фактом.
+    # ------------------------------------------------ приём: видно снаружи
+    async def _check_reception(self) -> None:
+        """Раз в CHECK_EVERY: спросить очередь Telegram и отчитаться о приёме.
 
-        Единичный сбой — норма сети, и писать о нём в базу значило бы пугать
-        экран приложения каждой вспышкой. DEAF_AFTER без единого ответа — это бот,
-        который не видит команд, и узнать об этом должен человек на экране, а не
-        только тот, кто читает `docker logs`.
+        Отчёт — одна строка `tg_bots` на минуту: её читает экран приложения, и по
+        возрасту `poll_checked_at` он видит, что служба бота вообще работает.
+        Диагностика не имеет права уронить опрос: любой её сбой — строка в логе.
         """
-        reason = describe_failure(exc)
-        if self.deaf_for() < DEAF_AFTER or reason == self._reported:
+        rec = self.reception
+        if clock() < rec.next_check:
             return
-        if self._reported is None:
-            log.error("бот @%s не получает апдейты %.0f с: %s",
-                      self.username, self.deaf_for(), reason)
-        if await self._write_state(_SQL_DEAF, reason[:500]):
-            self._reported = reason
+        rec.next_check = clock() + CHECK_EVERY
+        try:
+            pending = await self._queue_depth()
+            now = clock()
+            rec.observe_queue(pending, self._offset, now)
+            problem = rec.problem(now)
+            self._log_problem(problem, now)
+            await self._write_reception(problem, now)
+        except Exception:
+            log.exception("проверка приёма @%s не удалась", self.username)
+        self._polled_at = clock()
 
-    async def _mark_heard(self) -> None:
-        """Telegram ответил. В базу — не чаще HEARD_MARK_EVERY, после глухоты — сразу."""
-        now = time.monotonic()
-        if (self._reported is None and self._heard_marked_at is not None
-                and now - self._heard_marked_at < HEARD_MARK_EVERY):
+    async def _queue_depth(self) -> int | None:
+        """Сколько апдейтов Telegram держит для бота. None — не удалось узнать.
+
+        `getWebhookInfo` — вызов только на чтение: getUpdates он не прерывает и
+        ничего не подтверждает, а ответ у него в сотни байт, так что проходит и там,
+        где крупный апдейт застревает. Предел свой, как у захода.
+        """
+        limit = tg.deadline("getWebhookInfo", None) + HARD_MARGIN
+        try:
+            async with asyncio.timeout(limit):
+                info = await tg.get_webhook_info(self._token)
+        except (TimeoutError, tg.TelegramError) as exc:
+            log.warning("очередь @%s не узнать: %s", self.username,
+                        str(exc) or type(exc).__name__)
+            return None
+        value = info.get("pending_update_count")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    def _log_problem(self, problem: Problem | None, now: float) -> None:
+        """Сбой — в лог, когда начался и раз в RELOG_EVERY, пока длится; конец — тоже."""
+        rec = self.reception
+        kind = problem.kind if problem else None
+        if kind == rec.reported and (kind is None or now - rec.reported_at < RELOG_EVERY):
             return
-        if not await self._write_state(_SQL_HEARD):
-            return
-        if self._reported is not None:
-            log.info("бот @%s снова получает апдейты", self.username)
-        self._heard_marked_at = now
-        self._reported = None
+        if problem is None:
+            log.info("приём @%s снова в порядке", self.username)
+        else:
+            log.error("приём @%s: %s (последний ответ Telegram %.0f с назад, "
+                      "в очереди Telegram %s)", self.username, problem.text,
+                      rec.deaf_for(now), "?" if rec.pending is None else rec.pending)
+        rec.reported, rec.reported_at = kind, now
+
+    async def _write_reception(self, problem: Problem | None, now: float) -> None:
+        rec = self.reception
+        heard_ago = None if rec.answered_at is None else max(0.0, now - rec.answered_at)
+        await self._write_state(_SQL_RECEPTION, heard_ago,
+                                problem.text[:500] if problem else None, rec.pending)
 
     async def _write_state(self, sql: str, *args: object) -> bool:
         """Отметка о приёме в `tg_bots`. Недоступная база опрос не останавливает."""
@@ -410,6 +417,10 @@ class PollerRegistry:
         # сохранении, даже того же токена (случайный nonce), — и это к лучшему:
         # переподнятый цикл при старте снимает вебхук.
         self._tokens: dict[int, str] = {}
+        # Состояние приёма на бота. Переподнятый сторожем цикл получает прежнее:
+        # это тот же бот, и отсчёт глухоты и стоящей очереди не начинается заново.
+        # Новый токен — новое: его приём ещё никто не проверял.
+        self._receptions: dict[int, Reception] = {}
 
     async def sync(self) -> None:
         # Реестр ботов кросс-теннантен по построению — системный скоуп (RLS).
@@ -447,14 +458,20 @@ class PollerRegistry:
                 self._tasks.pop(bot_ref).cancel()
                 self._pollers.pop(bot_ref, None)
                 self._tokens.pop(bot_ref, None)
+                if row is None or replaced:
+                    self._receptions.pop(bot_ref, None)
 
         for r in rows:
             if r["id"] in self._tasks:
                 continue
             token = box.decrypt(
                 r["token"], box.aad("tg_bots", "token", r["tenant_id"], r["bot_id"]))
+            reception = self._receptions.get(r["id"])
+            if reception is None:
+                reception = self._receptions[r["id"]] = Reception(clock())
             poller = BotPoller(r["id"], r["tenant_id"], r["bot_id"],
-                               r["username"], token, int(r["update_offset"] or 0))
+                               r["username"], token, int(r["update_offset"] or 0),
+                               reception=reception)
             self._pollers[r["id"]] = poller
             self._tokens[r["id"]] = r["token"]
             task = asyncio.create_task(poller.run())
@@ -464,20 +481,18 @@ class PollerRegistry:
             self._tasks[r["id"]] = task
 
     def hearing(self) -> bool:
-        """Идёт ли приём: каждый цикл оборачивается И получает ответы Telegram.
+        """Идёт ли приём: каждый цикл оборачивается И Telegram отдаёт ему апдейты.
 
         Пустой реестр — это тоже «идёт»: ботов просто нет.
 
-        Пульс раньше ставил супервизор за сам факт своего оборота, и 08.09.2026
-        это стоило одиннадцати дней молчания: цикл опроса висел, супервизор
-        исправно бился, контейнер числился `healthy`. После той правки пульс
-        считался по обороту цикла — и 23.09.2026 контейнер снова был `healthy`
-        при боте, который не отвечал ни на одну команду: оборотом засчитывался и
-        неудачный заход. Здоровье процесса — это не «цикл крутится», а «Telegram
-        отдаёт апдейты».
+        Дважды это правило было слабее, и оба раза контейнер был `healthy` при
+        молчащем боте. 08.09.2026 пульс ставил супервизор за свой оборот — цикл
+        опроса висел одиннадцать дней. 23.09.2026 — за оборот цикла, а оборотом
+        засчитывался и оборванный заход: восемь часов ни одного апдейта. Здоровье
+        процесса — это не «цикл крутится», а «Telegram отвечает, очередь пустеет,
+        никто чужой её не забирает» (bot/reception.py).
         """
-        return all(p.idle_for() <= STALL_AFTER and p.deaf_for() <= DEAF_AFTER
-                   for p in self._pollers.values())
+        return all(p.healthy() for p in self._pollers.values())
 
     async def run_forever(self) -> None:
         while True:
@@ -486,11 +501,10 @@ class PollerRegistry:
             except Exception:
                 log.exception("не удалось обновить список ботов")
             else:
-                # Пульс — только когда Telegram отвечает. Зависший цикл `sync()`
+                # Пульс — только когда приём в порядке. Зависший цикл `sync()`
                 # переподнимет сам; глухой переподнимать бесполезно — причина
-                # снаружи (прокси, вебхук, второй экземпляр) и записана в
-                # `tg_bots.poll_error`. Healthcheck обязан покраснеть, а не
-                # покрывать тишину.
+                # снаружи и записана в `tg_bots.poll_error`. Healthcheck обязан
+                # покраснеть, а не покрывать тишину.
                 if self.hearing():
                     heartbeat.beat("bot")
             await asyncio.sleep(REFRESH_BOTS_EVERY)

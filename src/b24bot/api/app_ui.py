@@ -23,6 +23,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
 from b24bot.api import ui_kit as ui
+from b24bot.bot import reception
 from b24bot.core.config import get_settings, is_trusted_portal_domain
 from b24bot.core.text import esc_attr, esc_html
 from b24bot.crypto import box
@@ -127,49 +128,14 @@ def _head_html(title: str, sub_html: str) -> str:
             f"</div></header>")
 
 
-# Сколько поллер может не отмечать ответ Telegram (`tg_bots.heard_at`), прежде чем
-# экран назовёт это сбоем. Отметка ставится раз в минуту; запас — на перезапуск
-# контейнера при выкатке и на глухоту короче `poller.DEAF_AFTER`, о которой
-# поллер скажет сам, записав причину.
-HEARD_STALE_AFTER = 600
-
-
-def ago_text(seconds: float) -> str:
-    """«3 мин назад» — для отметок, которые человек сверяет с тем, что видел в чате."""
-    minutes = int(seconds // 60)
-    if minutes < 1:
-        return "меньше минуты назад"
-    if minutes < 60:
-        return f"{minutes} мин назад"
-    hours = minutes // 60
-    if hours < 48:
-        return f"{hours} ч назад"
-    return f"{hours // 24} дн. назад"
-
-
-def deafness(bot: asyncpg.Record | dict[str, Any] | None) -> str | None:
-    """Почему бот не забирает сообщения из Telegram — или None, если забирает.
-
-    23.09.2026 бот не отвечал ни на одну команду, а этот экран писал «Интеграция
-    работает»: здоровьем считалось `status='active'`, то есть «токен однажды
-    приняли». Жив ли приём, отсюда не было видно никак.
-
-    Источников два, и нужны оба. `poll_error` пишет сам поллер, когда Telegram не
-    отвечает ему дольше `DEAF_AFTER`, — это ответ «почему». Но если не работает
-    сам процесс бота, писать некому, и тогда говорит возраст отметки `heard_at`.
-    NULL в ней — «ещё не отмечался после миграции 0022», а не сбой.
-    """
-    if bot is None or bot["mode"] != "polling" or bot["status"] not in ("active", "pending"):
-        return None
-    ago = bot.get("heard_ago")
-    reason = bot.get("poll_error")
-    if reason:
-        last = f" Последний ответ Telegram — {ago_text(ago)}." if ago is not None else ""
-        return f"{reason}.{last}"
-    if ago is not None and ago > HEARD_STALE_AFTER:
-        return (f"Процесс бота последний раз отметил ответ Telegram {ago_text(ago)}: "
-                "сообщения из чатов не забираются, и команды остаются без ответа.")
-    return None
+# Строка бота для экрана. Возраст отметок приёма считает база — теми же часами,
+# которыми поллер их ставит; что из них следует, решает `reception.on_screen`.
+_BOT_SELECT = (
+    "SELECT bot_id, username, status, mode, privacy_mode_off, last_check_at, "
+    "last_error, miniapp_short_name, poll_error, queue_pending, "
+    "extract(epoch FROM now() - heard_at)::float8 AS heard_ago, "
+    "extract(epoch FROM now() - poll_checked_at)::float8 AS poll_checked_ago "
+    "FROM tg_bots WHERE tenant_id = $1")
 
 
 def _health(bot: asyncpg.Record | None, chats: int, bindings: int) -> tuple[str, str, str]:
@@ -191,7 +157,9 @@ def _health(bot: asyncpg.Record | None, chats: int, bindings: int) -> tuple[str,
     if bot["status"] == "error":
         return ("err", "Ошибка подключения",
                 bot["last_error"] or "Telegram вернул ошибку при последней проверке.")
-    deaf = deafness(bot)
+    # `status='active'` значит лишь «токен однажды приняли». 23.09.2026 здесь было
+    # «Интеграция работает» при боте, который восемь часов не забирал сообщений.
+    deaf = reception.on_screen(bot)
     if deaf:
         return ("err", "Бот не получает сообщения", deaf)
     if bot["privacy_mode_off"] is False:
@@ -253,12 +221,7 @@ async def render_home(tenant: asyncpg.Record, b24_user_id: int, is_admin: bool,
     active = safe_tab(active_tab)
 
     async with pool().acquire() as conn:
-        bot = await conn.fetchrow(
-            "SELECT bot_id, username, status, mode, privacy_mode_off, last_check_at, "
-            "last_error, miniapp_short_name, poll_error, "
-            "extract(epoch FROM now() - heard_at)::float8 AS heard_ago "
-            "FROM tg_bots WHERE tenant_id = $1",
-            tenant["id"])
+        bot = await conn.fetchrow(_BOT_SELECT, tenant["id"])
         counts = await conn.fetchrow(
             "SELECT (SELECT count(*) FROM clients WHERE tenant_id = $1) AS clients, "
             "       (SELECT count(*) FROM projects WHERE tenant_id = $1 "
@@ -930,7 +893,7 @@ def _bot_panel(bot: asyncpg.Record | None, is_admin: bool, session: str,
         False: ui.badge("включён — бот не видит сообщений", "err"),
         None: ui.badge("не проверено", "warn"),
     }[privacy]
-    deaf = deafness(bot)
+    deaf = reception.on_screen(bot)
     status_html = {
         "active": ui.badge("работает", "ok"),
         "pending": ui.badge("подключается", "warn"),
@@ -942,14 +905,18 @@ def _bot_panel(bot: asyncpg.Record | None, is_admin: bool, session: str,
         # из-за которого 23.09.2026 экран был зелёным при молчащем боте.
         status_html = ui.badge("не получает сообщения", "err")
 
-    heard_ago = bot.get("heard_ago")
+    # Две строки приёма — ответ на вопрос «бот забирает сообщения?», который до
+    # 23.09.2026 отсюда было не узнать: последний ответ Telegram и его очередь.
+    heard_ago, pending = bot.get("heard_ago"), bot.get("queue_pending")
     rows = (ui.field("Бот", f"<code>@{esc_html(bot['username'])}</code>")
             + ui.field("Состояние", status_html)
             + ui.field("Режим приёма", esc_html(
-                "long polling через прокси" if bot["mode"] == "polling" else "вебхук"))
+                "long polling" if bot["mode"] == "polling" else "вебхук"))
             + ui.field("Privacy mode", privacy_html)
             + ui.field("Последний ответ Telegram", esc_html(
-                ago_text(heard_ago) if heard_ago is not None else "—"))
+                reception.ago(heard_ago) if heard_ago is not None else "—"))
+            + ui.field("Ждут разбора в Telegram", esc_html(
+                str(pending) if pending is not None else "—"))
             + ui.field("Последняя проверка", esc_html(
                 bot["last_check_at"].strftime("%d.%m.%Y %H:%M")
                 if bot["last_check_at"] else "—")))
@@ -1225,14 +1192,20 @@ async def _connect_bot(tenant: asyncpg.Record, token: str) -> tuple[str, str]:
         row = await conn.fetchrow(
             """
             INSERT INTO tg_bots (tenant_id, bot_id, username, token, token_kid,
-                                 webhook_secret, webhook_secret_kid, status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
+                                 webhook_secret, webhook_secret_kid, status,
+                                 poll_checked_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,'pending', now())
             ON CONFLICT (tenant_id) DO UPDATE
               SET bot_id = EXCLUDED.bot_id, username = EXCLUDED.username,
                   token = EXCLUDED.token, token_kid = EXCLUDED.token_kid,
                   webhook_secret = EXCLUDED.webhook_secret,
                   webhook_secret_kid = EXCLUDED.webhook_secret_kid,
-                  status = 'pending', last_error = NULL, updated_at = now()
+                  status = 'pending', last_error = NULL, updated_at = now(),
+                  -- Приём нового токена ещё никто не проверял: прежние отметки
+                  -- относятся к прежнему боту. С этой минуты служба бота обязана
+                  -- отчитаться, иначе экран скажет, что она не работает.
+                  heard_at = NULL, poll_error = NULL, queue_pending = NULL,
+                  poll_checked_at = now()
             RETURNING webhook_id, mode
             """,
             tenant["id"], bot_id, username, enc_token, box.kid_of(enc_token),
@@ -1332,18 +1305,25 @@ async def _recheck_bot(tenant: asyncpg.Record) -> tuple[str, str]:
     privacy = await _probe_privacy(token)
     app_note = await _register_miniapp(token)
     async with pool().acquire() as conn:
+        # Возврат из error/suspended — новое наблюдение: причина и отметка службы
+        # бота относятся к выключенному боту, и экран сразу после включения кричал
+        # бы «служба не отчитывалась три дня». У работающего бота отметку не
+        # трогаем: иначе нажатие «Проверить» прятало бы неработающую службу.
         await conn.execute(
             "UPDATE tg_bots SET status='active', privacy_mode_off=$2, last_check_at=now(), "
-            "last_error=NULL WHERE tenant_id=$1", tenant["id"], privacy)
-        state = await conn.fetchrow(
-            "SELECT mode, status, poll_error, "
-            "extract(epoch FROM now() - heard_at)::float8 AS heard_ago "
-            "FROM tg_bots WHERE tenant_id = $1", tenant["id"])
+            "last_error=NULL, "
+            "poll_error = CASE WHEN status IN ('active','pending') THEN poll_error END, "
+            "queue_pending = CASE WHEN status IN ('active','pending') "
+            "THEN queue_pending END, "
+            "poll_checked_at = CASE WHEN status IN ('active','pending') "
+            "THEN poll_checked_at ELSE now() END "
+            "WHERE tenant_id=$1", tenant["id"], privacy)
+        state = await conn.fetchrow(_BOT_SELECT, tenant["id"])
 
     # Telegram ответил НА ПРОВЕРКУ — это ещё не значит, что бот забирает сообщения:
     # проверка ходит из другого процесса. Молчащий поллер виден только по его
-    # собственной отметке, и «в порядке» рядом с ней было бы той самой неправдой.
-    deaf = deafness(state)
+    # собственному отчёту, и «в порядке» рядом с ним было бы той самой неправдой.
+    deaf = reception.on_screen(state)
     if deaf:
         return (f"Telegram отвечает на проверку, но бот не забирает сообщения: "
                 f"{esc_html(deaf)} Ждут разбора в Telegram: {pending}.", "err")
