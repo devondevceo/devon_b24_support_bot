@@ -64,9 +64,17 @@ POST /b24/placement    → x-frame-options ОТСУТСТВУЕТ,
 test: ["CMD", "python", "-m", "b24bot.core.heartbeat", "worker", "120"]
 ```
 
-Пульс бота ставит **супервизор** (`PollerRegistry.run_forever`, оборот раз в 30 с),
-а не сам поллер: поллер законно висит в `getUpdates` до 25 секунд, и его молчание —
-норма, а не сбой. Предел бота 180 с, воркера — 120 с.
+Пульс бота пишет супервизор (`PollerRegistry.run_forever`, оборот раз в 30 с), но
+**только пока каждый поллер получает ответы Telegram** (`PollerRegistry.hearing()`):
+последний успешный `getUpdates` не старше `DEAF_AFTER` (300 с) и цикл не завис дольше
+`STALL_AFTER`. Предел бота 180 с, воркера — 120 с.
+
+Дважды это правило было сформулировано слабее, и оба раза контейнер был `healthy`
+при молчащем боте. 08.09 пульс ставился за оборот супервизора — одиннадцать дней
+тишины. 23.09 — за оборот цикла опроса, а оборотом засчитывались и 409 от Telegram,
+и отказ прокси, и таймаут: бот не отвечал ни на одну команду. `healthy` у бота
+теперь значит одно: Telegram отдаёт ему апдейты. Причина глухоты — в
+`tg_bots.poll_error` и на экране приложения, см. «Бот молчит» ниже.
 
 Файл пульса свой на каждый процесс: образ один, контейнера три, и общий файл означал бы,
 что живой бот «лечит» мёртвого воркера. Ошибка записи пульса проглатывается — диагностика
@@ -837,3 +845,139 @@ postgres, а он — **суперпользователь кластера, к�
 Финальный шаг (отдельной миграцией, после обкатки): убрать эскейп `app.rls` из
 политики, чтобы enforce перестал быть опцией соединения. До него RLS — второй
 рубеж для кода приложения, но не для произвольного подключения к базе.
+
+## 10. Бот молчит: причина за две проверки (23.09.2026)
+
+Бот не отвечает на команды, а контейнер `healthy` и `/health` — `ok`. До релиза с
+миграцией `0022` так выглядела любая глухота приёма: пульс засчитывал оборот цикла, и
+цикл, в котором не прошёл ни один `getUpdates`, числился живым. Теперь глухой бот
+краснеет сам (`PollerRegistry.hearing()`, §«Третья ошибка» выше), а причина видна на
+вкладке «Бот» приложения и в `tg_bots.poll_error`. Две проверки ниже называют её и на
+образе без `0022`. Выполнять на сервере (`ssh -i ~/.ssh/id_ed25519_new root@91.142.94.189`).
+
+**1. Что говорит лог бота за последние шесть часов** — по строке на класс событий.
+Секунды в «не ответил за N с» оставлены намеренно: 40–45 с — это длинный опрос, 20 с —
+короткий.
+
+```bash
+cd /opt/b24sdbot && docker logs b24sdbot-bot --since 6h 2>&1 | LC_ALL=C.UTF-8 grep -oE 'getUpdates @[^ ]+: Telegram [0-9]+: .{0,48}|не ответил за [0-9]+ с|апдейт:|поллер [^ :"]+|токен бота [^"]{0,40}|не удалось отправить ответ|сценарий упал|ошибка обработки апдейта|меню команд [^ :"]+|перехожу на короткие|пробую вернуться|длинный опрос [^ ]+ снова|не получает апдейты|снят вебхук|приостановлен' | sort | uniq -c | sort -rn
+```
+
+**2. Контрольный опыт: кто забирает сообщения.** Лог отвечает не на всё: если длинные
+запросы нашего бота вязнут в прокси и не доходят до Telegram, бот опрашивает очередь
+короткими запросами, а такой запрос чужой длинный опрос не прерывает (сервер Bot API
+обрывает ожидающий `getUpdates` только тогда, когда новый сам встаёт ждать, —
+`telegram-bot-api/Client.cpp`, `do_get_updates`). Вторая копия бота с тем же токеном в
+этом случае забирает каждое сообщение первой, **а в нашем логе нет ни одного 409** —
+только таймауты. «Сообщения не доходят» и «их забирает кто-то ещё» различает одно:
+остановить свой бот, написать ему и посмотреть, осталось ли сообщение в очереди.
+
+```bash
+cd /opt/b24sdbot && docker compose stop bot
+# теперь написать боту в личку /start и подождать секунд десять
+docker compose run --rm --no-deps -T bot python - <<'PY'
+import asyncio
+import time
+
+import asyncpg
+
+from b24bot.core.config import get_settings
+from b24bot.crypto import box
+from b24bot.tg import api as tg
+
+
+async def timed(token, method, params, limit):
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(limit):
+            result = await tg.call(token, method, params)
+    except Exception as exc:
+        return time.monotonic() - started, None, f"{type(exc).__name__} {exc}".strip()
+    return time.monotonic() - started, result, None
+
+
+def about(updates):
+    if not updates:
+        return "пусто"
+    ids = [u["update_id"] for u in updates]
+    kinds = set()
+    for u in updates:
+        for key, node in u.items():
+            if key != "update_id":
+                chat = (node.get("message") or node).get("chat") or {}
+                kinds.add(f"{key}/{chat.get('type', '?')}")
+    return f"{len(ids)} шт., update_id {min(ids)}..{max(ids)}, {', '.join(sorted(kinds))}"
+
+
+async def main():
+    conn = await asyncpg.connect(get_settings().asyncpg_dsn)
+    bots = await conn.fetch(
+        "SELECT b.tenant_id, b.bot_id, b.username, b.token, b.status, b.update_offset, "
+        "b.last_error, t.status AS tenant FROM tg_bots b JOIN tenants t ON t.id = b.tenant_id")
+    await conn.close()
+    for b in bots:
+        token = box.decrypt(b["token"], box.aad("tg_bots", "token", b["tenant_id"],
+                                                b["bot_id"]))
+        offset = int(b["update_offset"] or 0) + 1
+        print(f"@{b['username']} | бот {b['status']} | теннант {b['tenant']} | "
+              f"offset в базе {offset - 1} | ошибка: {b['last_error']}")
+        took, info, err = await timed(token, "getWebhookInfo", None, 30)
+        if err:
+            print(f"  getWebhookInfo {took:.1f} с: {err} - Telegram через прокси не отвечает")
+            continue
+        url = info.get("url") or ""
+        print(f"  getWebhookInfo {took:.1f} с | вебхук:",
+              url.split("/tg/")[0] + "/tg/..." if url else "нет",
+              "| ждут разбора:", info.get("pending_update_count"))
+        took, peek, err = await timed(token, "getUpdates", {"timeout": 0, "limit": 100}, 30)
+        print(f"  без offset {took:.1f} с:", err or about(peek))
+        if peek and max(u["update_id"] for u in peek) < offset:
+            print("  ВСЕ ждущие апдейты ниже offset из базы: поллер их не видит")
+            continue
+        took, got, err = await timed(token, "getUpdates",
+                                     {"offset": offset, "timeout": 0, "limit": 100}, 30)
+        print(f"  с offset {offset} {took:.1f} с:", err or about(got))
+        took, got, err = await timed(token, "getUpdates",
+                                     {"offset": offset, "timeout": 15, "limit": 100}, 35)
+        print(f"  длинный опрос (до 15 с) {took:.1f} с:", err or about(got))
+
+asyncio.run(main())
+PY
+docker compose start bot
+```
+
+Проба ничего не стирает: `getUpdates` без `offset` апдейтов не подтверждает, а с
+`offset` из базы подтверждает ровно то же, что подтвердил бы сам поллер. Токен не
+печатается, адрес вебхука — только до `/tg/`, из апдейтов — только номера и вид чата.
+
+**Как читать.** Первая подходящая строка сверху и есть причина:
+
+| Что видно | Причина | Что делать |
+|---|---|---|
+| Проба после `/start`: `ждут разбора: 0` и `без offset: пусто`; в долгом опросе может быть `409 … terminated by other getUpdates`. Или в логе `Telegram 409: … terminated by other getUpdates` | **Вторая копия бота** с тем же токеном забирает сообщения первой | Найти на этом сервере (ниже); если здесь её нет — отозвать токен, это отключит все копии разом |
+| `вебхук: https://b24sdbot.devondev.ru/tg/…` или в логе `409 … webhook` | Вебхук поставила вкладка «Бот» приложения при сохранении токена (до релиза `0022` она ставила его всегда); пока он висит, Telegram не отдаёт опросом ни одного апдейта | С релиза `0022` лечится само. На старом образе — `docker compose restart bot`: поллер снимает вебхук при старте |
+| `вебхук:` на **чужой** домен | Токен у третьих лиц, переписка чатов уходит туда | Отозвать токен (ниже). С `0022` поллер сам переводит бота в `suspended` |
+| `getWebhookInfo … Telegram через прокси не отвечает` или в логе `Telegram 0: транспорт: ConnectError` | Прокси (`TG_PROXY_URL`) не пускает к `api.telegram.org`: он общий с mclick, его могли сменить или отключить | Проверить `TG_PROXY_URL` в `.env` и прокси у mclick; после правки — `docker compose up -d --force-recreate bot worker api` |
+| `ВСЕ ждущие апдейты ниже offset из базы` | `update_offset` в базе впереди нумерации Telegram | `docker compose exec -T postgres psql -U b24sdbot -d b24sdbot -c "UPDATE tg_bots SET update_offset = <первый update_id − 1>"`, затем `docker compose start bot` |
+| `ждут разбора: 1` и сообщение видно и `без offset`, и `с offset` | Второй копии нет, сообщение ждёт нас | После `docker compose start bot` поллер заберёт его на первом же заходе. Не ответил за минуту — снова шаг 1 |
+| `длинный опрос (до 15 с)` кончается `TimeoutError` / `ReadTimeout` | Прокси рвёт долгие соединения (известно с 08.09); поллер сам уходит на короткий опрос | Само по себе не поломка, но в этом режиме вторая копия в логе не видна — только пробой выше |
+| `токен бота … отвергнут` или `401` в пробе | Токен отозван или перевыпущен в `@BotFather` | Ввести действующий токен на вкладке «Бот» (и на старом образе — `restart bot`) |
+| В пробе `бот error`/`suspended` или `теннант` не `active` | Опрос не запущен: реестр поллеров берёт только `active`/`pending` у бота и `active` у теннанта | Причина — в `ошибка:`. `error` снимает «Проверить подключение» на вкладке «Бот», если Telegram отвечает |
+| В логе `апдейт:` есть и `не удалось отправить ответ` | Апдейты приходят, ответы не уходят | Текст причины: `docker logs b24sdbot-bot --since 6h 2>&1 \| grep 'не удалось отправить'` |
+
+**Где искать вторую копию.** На этом сервере — два места:
+
+```bash
+docker ps -a --no-trunc --format '{{.Names}}\t{{.Status}}\t{{.Command}}' | grep -iE 'poller|b24bot'
+ps -eo pid,etime,args | grep -E 'b24bot|poller' | grep -v grep
+```
+
+Кроме `b24sdbot-bot` (и `b24sdbot-api`/`worker` с их командами) там быть нечему: лишний
+контейнер — `docker rm -f <имя>`, лишний процесс — `kill <pid>`. Копию вне этого сервера
+(ноутбук разработчика, старый стенд, чужой сервис, которому дали токен) отсюда не
+увидеть, и Telegram не говорит, кто опрашивает бота. Надёжный путь один — **отозвать
+токен**: `@BotFather` → `/mybots` → бот → *API Token* → *Revoke current token*, новый
+токен — на вкладку «Бот» приложения («Заменить бота другим»). До релиза `0022` после
+этого обязательно `docker compose restart bot`: старая вкладка ставит вебхук, а
+запущенный поллер держит прежний токен в памяти. Все остальные копии получат 401 и
+замолчат.

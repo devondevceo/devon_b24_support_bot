@@ -352,3 +352,81 @@ def test_health_error_text_from_telegram_is_escaped_by_caller() -> None:
     _, _, detail = app_ui._health(_bot(status="error", last_error=EVIL), 1, 1)
     assert detail == EVIL
     assert_no_injection(ui.banner(esc_html(detail), "err"))
+
+
+# ------------------------------------------ приём: бот слышит Telegram или нет
+DEAF = "на боте установлен вебхук, и Telegram не отдаёт сообщения опросом (409)"
+
+
+def test_health_deaf_bot_is_not_working_even_when_active() -> None:
+    """23.09.2026: `status='active'` и «Интеграция работает» при молчащем боте.
+
+    Статус говорит «токен однажды приняли», а не «сообщения забираются».
+    """
+    kind, title, detail = app_ui._health(
+        _bot(poll_error=DEAF, heard_ago=1800.0), 3, 2)
+    assert kind == "err"
+    assert "не получает" in title
+    assert DEAF in detail
+    assert "30 мин назад" in detail
+
+
+def test_health_silent_bot_process_is_seen_by_its_mark_alone() -> None:
+    """Процесс бота мёртв — причину писать некому, говорит возраст отметки."""
+    kind, title, detail = app_ui._health(_bot(heard_ago=7200.0), 3, 2)
+    assert kind == "err"
+    assert "не получает" in title
+    assert "2 ч назад" in detail
+
+
+def test_health_fresh_mark_is_fine() -> None:
+    kind, _, _ = app_ui._health(_bot(heard_ago=40.0), 3, 2)
+    assert kind == "ok"
+
+
+def test_health_no_mark_yet_is_not_an_alarm() -> None:
+    """NULL — «ещё не отмечался после миграции 0022», а не сбой: иначе каждая
+    выкатка начиналась бы с красного экрана."""
+    kind, _, _ = app_ui._health(_bot(heard_ago=None, poll_error=None), 3, 2)
+    assert kind == "ok"
+
+
+def test_health_deafness_outranks_privacy_but_not_suspension() -> None:
+    """Порядок проверок — порядок поломок: выключенный бот, потом глухой, потом privacy."""
+    _, title, _ = app_ui._health(_bot(privacy_mode_off=False, poll_error=DEAF), 3, 2)
+    assert "не получает" in title
+    _, title, _ = app_ui._health(
+        _bot(status="suspended", last_error="чужой вебхук", poll_error=DEAF), 3, 2)
+    assert "приостановлен" in title
+
+
+def test_health_webhook_mode_has_no_poller_to_hear() -> None:
+    kind, _, _ = app_ui._health(_bot(mode="webhook", heard_ago=99999.0), 3, 2)
+    assert kind == "ok"
+
+
+@pytest.mark.parametrize(("seconds", "text"), [
+    (20.0, "меньше минуты назад"), (600.0, "10 мин назад"),
+    (7200.0, "2 ч назад"), (3 * 86400.0, "3 дн. назад"),
+])
+def test_ago_text(seconds: float, text: str) -> None:
+    assert app_ui.ago_text(seconds) == text
+
+
+def _panel_bot(**over: object) -> dict[str, object]:
+    return _bot(**{"last_check_at": None, "heard_ago": None, "poll_error": None, **over})
+
+
+def test_bot_panel_says_deaf_instead_of_working() -> None:
+    html = app_ui._bot_panel(_panel_bot(poll_error=DEAF, heard_ago=1800.0),
+                             True, "s", "bot")
+    assert "не получает сообщения" in html
+    assert "работает" not in html, "«работает» рядом с «не получает» — та самая неправда"
+    assert "30 мин назад" in html
+
+
+def test_bot_panel_escapes_the_poller_reason() -> None:
+    """Причину пишет поллер, но в ней бывает описание Telegram и текст транспорта."""
+    html = app_ui._bot_panel(_panel_bot(poll_error=EVIL, heard_ago=900.0),
+                             True, "s", "bot")
+    assert_no_injection(html)
