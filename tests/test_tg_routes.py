@@ -1,4 +1,4 @@
-"""Пути до Telegram: прямой адрес первым, прокси — запасным.
+"""Пути до Telegram: по умолчанию только прокси; прямой адрес — по настройке.
 
 Живая авария 23.09.2026. Бот пять часов не видел ни одного нажатия кнопки при
 зелёном всём. Прокси, через который он ходил к Telegram, замораживает любое
@@ -21,6 +21,10 @@
    бота в аварию: крупный апдейт снова не доходил.
 4. **Отказ пути запоминается:** закрытый путь стоит секунды один раз, а не на
    каждом вызове.
+
+С 01.10.2026 прямой адрес не соединяется вовсе, и 12.10 он выключен: по
+умолчанию `TG_API_IPS` пуст, и при заданном прокси путь один. Механизм остался —
+адрес включается настройкой, — поэтому тесты прямого пути задают его явно.
 """
 from __future__ import annotations
 
@@ -88,7 +92,7 @@ def _frozen(request: httpx.Request) -> httpx.Response:
 # ------------------------------------------------------------------ порядок
 def test_direct_address_goes_first_and_proxy_is_the_fallback(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     names = [r.name for r in tg.routes()]
     assert names == [IP, "прокси"]
 
@@ -104,7 +108,7 @@ def test_proxy_route_name_carries_no_credentials(
 def test_without_proxy_the_dns_address_is_the_fallback(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """Без прокси адрес из DNS и есть обычный путь — на другом хосте он открыт."""
-    _settings(monkeypatch)
+    _settings(monkeypatch, tg_api_ips=IP)
     routes = tg.routes()
     assert [r.name for r in routes] == [IP, TELEGRAM_HOST]
     assert routes[-1].origin == f"https://{TELEGRAM_HOST}" and routes[-1].sni is None
@@ -117,6 +121,48 @@ def test_proxy_configured_means_dns_address_is_not_tried(
     assert [r.name for r in tg.routes()] == ["прокси"]
 
 
+# ------------------------------------------------ по умолчанию — только прокси
+def test_no_direct_address_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """С 01.10.2026 прямой адрес не соединяется: раз в минуту вызов ждал его 9 с.
+
+    Страж умолчания, а не настройки сервера: в боевом `.env` строки `TG_API_IPS`
+    нет, и путь к Telegram определяет ровно это значение.
+    """
+    monkeypatch.delenv("TG_API_IPS", raising=False)
+    assert Settings(**BASE, _env_file=None).tg_direct_ips == ()
+
+
+def test_by_default_the_proxy_is_the_only_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    _settings(monkeypatch, tg_proxy_url=PROXY)
+    assert [r.name for r in tg.routes()] == ["прокси"]
+    seen = _network(monkeypatch, {"прокси": _ok})
+
+    asyncio.run(tg.call(TOKEN, "getMe"))
+
+    [request] = seen["прокси"]
+    assert request.url.host == TELEGRAM_HOST and "sni_hostname" not in request.extensions
+    # Предел поллера больше не включает ожидание закрытого прямого пути.
+    assert tg.deadline("getMe", None) == (
+        tg.CONNECT_ATTEMPTS * tg.CONNECT_TIMEOUT + tg.TIMEOUT)
+
+
+def test_only_path_closed_does_not_promise_another(
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """Прокси не пускает — в логе не «иду следующим»: следующего пути нет."""
+    _settings(monkeypatch, tg_proxy_url=PROXY)
+    seen = _network(monkeypatch, {"прокси": _refused})
+
+    with (caplog.at_level(logging.WARNING, logger=tg.log.name),
+          pytest.raises(tg.TelegramError) as caught):
+        asyncio.run(tg.call(TOKEN, "getMe"))
+
+    assert caught.value.code == 0 and "ConnectTimeout" in caught.value.description
+    assert len(seen["прокси"]) == tg.CONNECT_ATTEMPTS
+    [record] = caplog.records
+    assert "других путей нет" in record.getMessage()
+    assert "следующим" not in record.getMessage()
+
+
 # ------------------------------------------------------- прямой путь по IP
 def test_direct_route_names_telegram_in_tls_and_in_host(
         monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,7 +172,7 @@ def test_direct_route_names_telegram_in_tls_and_in_host(
     проверку не пройдёт, и токен до него не дойдёт. На боевом сервере
     проверено и обратное: неверное имя даёт CERTIFICATE_VERIFY_FAILED.
     """
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     seen = _network(monkeypatch, {IP: _ok, "прокси": _ok})
 
     asyncio.run(tg.call(TOKEN, "getMe"))
@@ -161,7 +207,7 @@ def test_direct_addresses_are_parsed_from_a_list() -> None:
 def test_closed_path_falls_over_within_the_same_call(
         monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     """Соединение не установилось — запрос не ушёл, повтор другим путём безопасен."""
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     seen = _network(monkeypatch, {IP: _refused, "прокси": _ok})
 
     with caplog.at_level(logging.WARNING, logger=tg.log.name):
@@ -176,7 +222,7 @@ def test_closed_path_falls_over_within_the_same_call(
 def test_closed_path_is_remembered_and_not_retried_first(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """Закрытый путь стоит секунды один раз, а не на каждом вызове."""
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     seen = _network(monkeypatch, {IP: _refused, "прокси": _ok})
 
     asyncio.run(tg.call(TOKEN, "getMe"))
@@ -195,7 +241,7 @@ def test_lost_connection_is_retried_on_the_same_path(
     поодиночке. Уход на прокси после первого из них на пять минут возвращал
     бота туда, где крупный апдейт не проходит.
     """
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     lost = iter([True])
 
     def flaky(request: httpx.Request) -> httpx.Response:
@@ -217,7 +263,7 @@ def test_lost_connection_is_retried_on_the_same_path(
 def test_direct_route_is_tried_first_again_after_cooldown(
         monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     """Прямой путь починили — возвращаемся на него сами, без перезапуска."""
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     seen = _network(monkeypatch, {IP: _ok, "прокси": _ok})
     tg._down_until[IP] = 0.0  # отказ был, но срок его давно истёк
 
@@ -232,7 +278,7 @@ def test_direct_route_is_tried_first_again_after_cooldown(
 def test_read_timeout_is_not_repeated_on_another_path(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """После таймаута чтения запрос мог дойти: `sendMessage` повтором задвоился бы."""
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     seen = _network(monkeypatch, {IP: _frozen, "прокси": _ok})
 
     with pytest.raises(tg.TelegramError) as caught:
@@ -244,7 +290,7 @@ def test_read_timeout_is_not_repeated_on_another_path(
 
 def test_every_path_closed_is_a_transport_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Закрыто всё — внятная ошибка транспорта, а не молчание или AssertionError."""
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     seen = _network(monkeypatch, {IP: _refused, "прокси": _refused})
 
     with pytest.raises(tg.TelegramError) as caught:
@@ -261,7 +307,7 @@ def test_every_path_closed_is_a_transport_error(monkeypatch: pytest.MonkeyPatch)
 def test_telegram_refusal_is_an_answer_not_a_closed_path(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """Ответ Telegram с ошибкой — это ответ: путь исправен, повторять нечего."""
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     seen = _network(monkeypatch, {
         IP: lambda r: httpx.Response(400, json={"ok": False, "error_code": 400,
                                                 "description": "Bad Request"}),
@@ -276,7 +322,7 @@ def test_telegram_refusal_is_an_answer_not_a_closed_path(
 # -------------------------------------------------------------------- файлы
 def test_files_download_by_the_same_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     """Через прокси не скачивалась ни одна фотография: замерзание бьёт и сюда."""
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     seen = _network(monkeypatch, {IP: lambda r: httpx.Response(200, content=b"x" * 47088),
                                   "прокси": _ok})
 
@@ -291,7 +337,7 @@ def test_files_download_by_the_same_paths(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_failed_download_does_not_carry_the_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """Токен лежит в адресе файла — в текст ошибки адрес попасть не должен (И-7)."""
-    _settings(monkeypatch, tg_proxy_url=PROXY)
+    _settings(monkeypatch, tg_proxy_url=PROXY, tg_api_ips=IP)
     _network(monkeypatch, {IP: lambda r: httpx.Response(404, text="Not Found"),
                            "прокси": _ok})
 

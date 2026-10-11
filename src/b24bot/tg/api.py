@@ -1,8 +1,9 @@
 """Минимальный клиент Telegram Bot API.
 
 Инвариант И-4: хост только `api.telegram.org` (или явно настроенный прокси теннанта),
-никогда из входящих данных. Прямой путь по IP этого не меняет: в TLS называется
-`api.telegram.org`, и сертификат проверяется по этому имени (`Route`).
+никогда из входящих данных. Прямой путь по IP (с 12.10.2026 выключен, включается
+`TG_API_IPS`) этого не меняет: в TLS называется `api.telegram.org`, и сертификат
+проверяется по этому имени (`Route`).
 
 Полноценный слой бота на aiogram придёт отдельно; здесь ровно то, что нужно для
 подключения бота теннанта: проверить токен, узнать бота, поставить и снять вебхук.
@@ -63,6 +64,10 @@ class Route:
     первым в очереди, и бот пять часов не видел ни одного нажатия. Прямой путь по
     IP при этом отдаёт те же ответы за 0.2 с, а DNS-адрес `api.telegram.org`
     с сервера закрыт. Поэтому: прямые адреса первыми, прокси — запасным.
+
+    С 01.10.2026 прямой адрес не соединяется вовсе, и 12.10 он убран из
+    настроек по умолчанию: на боевом сервере путь один — прокси. Порог прокси
+    при этом никуда не делся (замер 12.10: ответ в десятки КБ не доходит).
     """
     name: str              # для лога и учёта отказов; без логина и пароля прокси
     origin: str            # https://149.154.167.220 или https://api.telegram.org
@@ -126,7 +131,8 @@ async def _request(verb: str, path: str, *, http_timeout: float,
     другая ошибка уходит вызывающему как есть.
     """
     last: httpx.HTTPError | None = None
-    for route in _ordered(routes(proxy_base)):
+    ordered = _ordered(routes(proxy_base))
+    for i, route in enumerate(ordered):
         extra: dict[str, Any] = {}
         if route.sni:
             extra = {"headers": {"Host": route.sni},
@@ -143,8 +149,11 @@ async def _request(verb: str, path: str, *, http_timeout: float,
                 log.info("Telegram: путь %s снова открыт", route.name)
             return resp
         if last is not None and _down_until.get(route.name, 0.0) <= time.monotonic():
-            log.warning("Telegram: путь %s закрыт (%s, попыток %d) — иду следующим",
-                        route.name, type(last).__name__, CONNECT_ATTEMPTS)
+            # «Иду следующим» при единственном пути — неправда, которую читают
+            # при разборе аварии: ищут в логе второй путь, а его нет.
+            log.warning("Telegram: путь %s закрыт (%s, попыток %d) — %s",
+                        route.name, type(last).__name__, CONNECT_ATTEMPTS,
+                        "иду следующим" if i + 1 < len(ordered) else "других путей нет")
         _down_until[route.name] = time.monotonic() + ROUTE_COOLDOWN
     assert last is not None, "routes() всегда возвращает хотя бы один путь"
     raise last
